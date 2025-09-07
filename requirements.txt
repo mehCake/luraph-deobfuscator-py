@@ -1,0 +1,14 @@
+# Core dependencies for Lua deobfuscator
+
+# Regular expressions and text processing
+regex==2023.10.3
+
+# Logging and utilities (built-in modules used)
+# argparse - built-in
+# logging - built-in
+# pathlib - built-in
+# re - built-in
+# sys - built-in
+# typing - built-in
+# collections - built-in
+
