@@ -1,151 +1,80 @@
-Advanced Lua Deobfuscator
+Advanced Lua Deobfuscator (Python)
 
-A comprehensive Python-based tool for deobfuscating Lua code, with specialized support for various obfuscation methods including Luraph, string obfuscation, and generic pattern-based obfuscation.
+Description:
+Advanced Lua Deobfuscator normalizes numbers, strings, and Luraph-specific obfuscation in Lua code. Supports both command-line and interactive mode.
 
-Features
+Requirements
 
-Multi-Method Support: Supports Luraph, generic string obfuscation, and pattern-based deobfuscation.
+Python 3.10+
 
-Intelligent Analysis: Automatically detects obfuscation methods and complexity.
+Only standard library modules (no extra pip installs required)
 
-Comprehensive Transformations: Over 20 different deobfuscation techniques.
-
-Modular Architecture: Clean, extensible codebase with separate modules.
-
-Command-Line & Interactive Interface: Works with CLI options or prompts for input.
-
-Detailed Logging: Verbose output for debugging and analysis.
+If building an EXE, make sure the pathlib backport is not installed, as it conflicts with PyInstaller.
 
 Installation
 
-Clone or download this repository.
+Clone the repository:
 
-Ensure Python 3.6+ is installed.
-
-Remove any obsolete pathlib package if installed:
-
-python -m pip uninstall pathlib
+git clone C:\Users\mende\luraph-deobfuscator-py
+cd luraph-deobfuscator-py
 
 
-Install PyInstaller to build the EXE (optional):
+Optionally, create an EXE:
 
-python -m pip install pyinstaller
+pip uninstall pathlib      # Remove incompatible backport if installed
+pyinstaller --onefile --name "LuaDeobfuscator" main.py
+
+
+The EXE will be generated in dist/LuaDeobfuscator.exe.
 
 Usage
-1️⃣ Command-Line (CLI) Mode
-
-Run directly with Python:
-
-# Basic deobfuscation
-python main.py --file obfuscated.lua
-
-# Specify output file
-python main.py --file obfuscated.lua --output clean.lua
-
-# Use Luraph-specific normalization
-python main.py --file obfuscated.lua --method luraph
-
-# Enable verbose logging
-python main.py --file obfuscated.lua --verbose
-
-# Analyze only
-python main.py --file obfuscated.lua --analyze
+1. Command-Line Interface (CLI)
+python main.py --file obfuscated.lua --output deobfuscated.lua --verbose --method luraph --analyze
 
 
-Short options:
+Arguments:
 
--f   --file      Input Lua file
--o   --output    Output file (default: adds _deobfuscated)
--m   --method    Normalization method (default/luraph)
--v   --verbose   Enable detailed logging
---analyze        Analyze only, no modifications
+Option	Shortcut	Description
+--file	-f	Path to input Lua file (required)
+--output	-o	Output Lua file (default: _deobfuscated.lua)
+--verbose	-v	Enable verbose logging
+--analyze		Analyze only, do not modify the code
+--method		Normalization method: default or luraph (default: default)
 
-2️⃣ Interactive Mode
+Example:
 
-If you run the EXE without any arguments:
+python main.py -f obfuscated.lua -o output.lua -v --method luraph
 
-LuaDeobfuscator.exe
+2. Interactive Mode (EXE or Python)
 
+If you run without --file, the program opens interactive prompts:
 
-The program will prompt you step by step:
-
-Enter path to Lua file:
-Enter output file path (leave blank for default):
-Normalization method (default/luraph) [default]:
-Analyze only? (y/N):
-Enable verbose logging? (y/N):
+python main.py
 
 
-After entering the options, the tool will process the file and display results in the console.
+or after building the EXE:
 
-3️⃣ Building an EXE
-
-To create a standalone executable:
-
-pyinstaller --onefile --name "LuaDeobfuscator" --console main.py
+dist\LuaDeobfuscator.exe
 
 
---onefile → produces a single EXE.
+You’ll be prompted for:
 
---name → sets the executable name.
+Input Lua file path
 
---console → keeps the terminal open for interactive prompts and logs.
+Output file path (optional)
 
-The resulting EXE will be in:
+Normalization method (default / luraph)
 
-dist/LuaDeobfuscator.exe
+Analyze-only mode (y/N)
 
-4️⃣ Project Structure
-lua-deobfuscator/
-├── main.py                # Main entry point
-├── README.md              # This file
-└── src/
-    ├── hex_number_normalizer.py  # Core normalization logic
-    ├── patterns.py                # Pattern detection and matching
-    └── transformations.py         # Transformation functions
+Verbose logging (y/N)
 
-5️⃣ How It Works
+The program will keep running until you complete the prompts and generate the output.
 
-Analysis Phase: Detects obfuscation method, complexity, and patterns.
+Notes
 
-Transformation Phase: Applies string decoding, variable restoration, control flow simplification, dead code removal, and other transformations.
+EXE mode is ideal for interactive use since it prevents the program from closing immediately.
 
-Optimization Phase: Formats and normalizes the final Lua code.
+CLI mode is recommended for automation and batch processing.
 
-6️⃣ Supported Obfuscation Methods
-
-Luraph: Removes padding, dummy arithmetic, and obfuscation patterns.
-
-Generic String Obfuscation: Base64/hex decoding, escape sequence processing, character code conversion.
-
-Pattern-Based: Regex-based pattern detection and automated replacement.
-
-7️⃣ Examples
-Analyze a file
-python main.py --file suspicious.lua --analyze --verbose
-
-Deobfuscate a file with Luraph method
-python main.py --file obfuscated.lua --output clean.lua --method luraph --verbose
-
-Interactive EXE usage
-LuaDeobfuscator.exe
-
-8️⃣ Troubleshooting
-
-"Required file not found" → check file path and permissions.
-
-"Syntax error in output" → try a different method or use --analyze.
-
-EXE closes immediately → ensure --console is used when building with PyInstaller or run from a terminal.
-
-9️⃣ Contributing
-
-Add patterns in src/patterns.py.
-
-Implement transformations in src/transformations.py.
-
-Update detection logic in src/hex_number_normalizer.py.
-
-10️⃣ License
-
-This tool is for educational and research purposes only. Respect original authors’ intentions when deobfuscating code.
+Luraph-specific normalizations remove dummy functions and unnecessary empty string concatenations.
