@@ -1,80 +1,151 @@
-Advanced Lua Deobfuscator (Python)
+Advanced Lua Deobfuscator
 
-Description:
-Advanced Lua Deobfuscator normalizes numbers, strings, and Luraph-specific obfuscation in Lua code. Supports both command-line and interactive mode.
+A comprehensive Python-based tool for deobfuscating Lua code, with specialized support for various obfuscation methods including Luraph, string obfuscation, and generic pattern-based obfuscation.
 
-Requirements
+Features
 
-Python 3.10+
+Multi-Method Support: Supports Luraph, generic string obfuscation, and pattern-based deobfuscation.
 
-Only standard library modules (no extra pip installs required)
+Intelligent Analysis: Automatically detects obfuscation methods and complexity.
 
-If building an EXE, make sure the pathlib backport is not installed, as it conflicts with PyInstaller.
+Comprehensive Transformations: Over 20 different deobfuscation techniques.
+
+Modular Architecture: Clean, extensible codebase with separate modules.
+
+Command-Line & Interactive Interface: Works with CLI options or prompts for input.
+
+Detailed Logging: Verbose output for debugging and analysis.
 
 Installation
 
-Clone the repository:
+Clone or download this repository.
 
-git clone C:\Users\mende\luraph-deobfuscator-py
-cd luraph-deobfuscator-py
+Ensure Python 3.6+ is installed.
 
+Remove any obsolete pathlib package if installed:
 
-Optionally, create an EXE:
-
-pip uninstall pathlib      # Remove incompatible backport if installed
-pyinstaller --onefile --name "LuaDeobfuscator" main.py
+python -m pip uninstall pathlib
 
 
-The EXE will be generated in dist/LuaDeobfuscator.exe.
+Install PyInstaller to build the EXE (optional):
+
+python -m pip install pyinstaller
 
 Usage
-1. Command-Line Interface (CLI)
-python main.py --file obfuscated.lua --output deobfuscated.lua --verbose --method luraph --analyze
+1️⃣ Command-Line (CLI) Mode
+
+Run directly with Python:
+
+# Basic deobfuscation
+python main.py --file obfuscated.lua
+
+# Specify output file
+python main.py --file obfuscated.lua --output clean.lua
+
+# Use Luraph-specific normalization
+python main.py --file obfuscated.lua --method luraph
+
+# Enable verbose logging
+python main.py --file obfuscated.lua --verbose
+
+# Analyze only
+python main.py --file obfuscated.lua --analyze
 
 
-Arguments:
+Short options:
 
-Option	Shortcut	Description
---file	-f	Path to input Lua file (required)
---output	-o	Output Lua file (default: _deobfuscated.lua)
---verbose	-v	Enable verbose logging
---analyze		Analyze only, do not modify the code
---method		Normalization method: default or luraph (default: default)
+-f   --file      Input Lua file
+-o   --output    Output file (default: adds _deobfuscated)
+-m   --method    Normalization method (default/luraph)
+-v   --verbose   Enable detailed logging
+--analyze        Analyze only, no modifications
 
-Example:
+2️⃣ Interactive Mode
 
-python main.py -f obfuscated.lua -o output.lua -v --method luraph
+If you run the EXE without any arguments:
 
-2. Interactive Mode (EXE or Python)
-
-If you run without --file, the program opens interactive prompts:
-
-python main.py
+LuaDeobfuscator.exe
 
 
-or after building the EXE:
+The program will prompt you step by step:
 
-dist\LuaDeobfuscator.exe
+Enter path to Lua file:
+Enter output file path (leave blank for default):
+Normalization method (default/luraph) [default]:
+Analyze only? (y/N):
+Enable verbose logging? (y/N):
 
 
-You’ll be prompted for:
+After entering the options, the tool will process the file and display results in the console.
 
-Input Lua file path
+3️⃣ Building an EXE
 
-Output file path (optional)
+To create a standalone executable:
 
-Normalization method (default / luraph)
+pyinstaller --onefile --name "LuaDeobfuscator" --console main.py
 
-Analyze-only mode (y/N)
 
-Verbose logging (y/N)
+--onefile → produces a single EXE.
 
-The program will keep running until you complete the prompts and generate the output.
+--name → sets the executable name.
 
-Notes
+--console → keeps the terminal open for interactive prompts and logs.
 
-EXE mode is ideal for interactive use since it prevents the program from closing immediately.
+The resulting EXE will be in:
 
-CLI mode is recommended for automation and batch processing.
+dist/LuaDeobfuscator.exe
 
-Luraph-specific normalizations remove dummy functions and unnecessary empty string concatenations.
+4️⃣ Project Structure
+lua-deobfuscator/
+├── main.py                # Main entry point
+├── README.md              # This file
+└── src/
+    ├── hex_number_normalizer.py  # Core normalization logic
+    ├── patterns.py                # Pattern detection and matching
+    └── transformations.py         # Transformation functions
+
+5️⃣ How It Works
+
+Analysis Phase: Detects obfuscation method, complexity, and patterns.
+
+Transformation Phase: Applies string decoding, variable restoration, control flow simplification, dead code removal, and other transformations.
+
+Optimization Phase: Formats and normalizes the final Lua code.
+
+6️⃣ Supported Obfuscation Methods
+
+Luraph: Removes padding, dummy arithmetic, and obfuscation patterns.
+
+Generic String Obfuscation: Base64/hex decoding, escape sequence processing, character code conversion.
+
+Pattern-Based: Regex-based pattern detection and automated replacement.
+
+7️⃣ Examples
+Analyze a file
+python main.py --file suspicious.lua --analyze --verbose
+
+Deobfuscate a file with Luraph method
+python main.py --file obfuscated.lua --output clean.lua --method luraph --verbose
+
+Interactive EXE usage
+LuaDeobfuscator.exe
+
+8️⃣ Troubleshooting
+
+"Required file not found" → check file path and permissions.
+
+"Syntax error in output" → try a different method or use --analyze.
+
+EXE closes immediately → ensure --console is used when building with PyInstaller or run from a terminal.
+
+9️⃣ Contributing
+
+Add patterns in src/patterns.py.
+
+Implement transformations in src/transformations.py.
+
+Update detection logic in src/hex_number_normalizer.py.
+
+10️⃣ License
+
+This tool is for educational and research purposes only. Respect original authors’ intentions when deobfuscating code.
