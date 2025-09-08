@@ -1,0 +1,57 @@
+{
+  "analysis": {
+    "max_sequence_length": 5,
+    "min_pattern_frequency": 3,
+    "enable_vm_simulation": true,
+    "enable_pattern_analysis": true,
+    "enable_constant_reconstruction": true,
+    "timeout_seconds": 300,
+    "max_iterations": 1000,
+    "deep_analysis": false
+  },
+  "output": {
+    "default_format": "json",
+    "include_raw_data": false,
+    "include_statistics": true,
+    "pretty_print": true,
+    "max_output_size": 10485760,
+    "compress_output": false
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "deobfuscator.log",
+    "console_output": true,
+    "detailed_errors": true,
+    "performance_metrics": false
+  },
+  "patterns": {
+    "opcode_patterns": {
+      "min_length": 2,
+      "max_length": 10,
+      "case_sensitive": false
+    },
+    "string_patterns": {
+      "min_string_length": 3,
+      "max_string_length": 1000,
+      "extract_unicode": true
+    },
+    "numeric_patterns": {
+      "include_hex": true,
+      "include_binary": true,
+      "include_calculations": true
+    }
+  },
+  "vm_simulation": {
+    "max_stack_size": 1000,
+    "max_execution_steps": 10000,
+    "enable_function_calls": true,
+    "enable_table_operations": true,
+    "safe_mode": true
+  },
+  "security": {
+    "max_file_size": 52428800,
+    "allowed_extensions": [".lua", ".luac", ".txt"],
+    "scan_for_malware": false,
+    "sandbox_execution": true
+  }
+}
