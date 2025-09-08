@@ -1,0 +1,67 @@
+-- Complex obfuscated Lua script with multiple techniques
+
+-- String table obfuscation
+local _={"\x48\x65\x6c\x6c\x6f","\x57\x6f\x72\x6c\x64","\x21"}
+local __=function(a,b)return string.char(a~b)end
+local ___={}for i=1,#_ do ___[i]=_[i]end
+
+-- Function name obfuscation  
+local a1b2c3=function(x,y,z)
+  local result=""
+  for i=1,#x do
+    local byte=string.byte(x,i)
+    result=result..string.char(byte~y)
+  end
+  if z then result=result:reverse()end
+  return result
+end
+
+-- Variable name chaos
+local qWeRtY=a1b2c3("\x1b\x0f\x0c\x0c\x11",23,false)
+local AsDfGh=a1b2c3("\x75\x11\x16\x0c\x08",23,false)  
+local ZxCvBn=qWeRtY.." "..AsDfGh
+
+-- Control flow with meaningless conditions
+local random_val=math.random(1,100)
+if random_val>50 or random_val<=50 then
+  local temp_var=ZxCvBn
+  if string.len(temp_var)>0 then
+    print(temp_var)
+  end
+end
+
+-- Nested function obfuscation
+local outer_func=function()
+  local inner_func=function(data)
+    local processed=""
+    for idx=1,#data,2 do
+      local c1=string.byte(data,idx)
+      local c2=string.byte(data,idx+1) or 0
+      processed=processed..string.char(c1~c2)
+    end
+    return processed
+  end
+  
+  local encoded_data="\x52\x33\x41\x34\x48\x35\x44\x31"
+  return inner_func(encoded_data)
+end
+
+-- Table with computed keys
+local computed_table={}
+computed_table[a1b2c3("\x0a\x0f\x17",23,false)]=outer_func()
+computed_table[a1b2c3("\x1a\x76\x11",23,false)]=42
+
+-- Loop with obfuscated iteration
+local iter_start,iter_end=1,10
+for loop_var=iter_start,iter_end do
+  if loop_var%2==0 then
+    local even_msg=a1b2c3("\x0f\x1a\x0f\x11",23,false)
+    -- Don't print to avoid spam
+  else  
+    local odd_msg=a1b2c3("\x11\x08\x08",23,false)
+    -- Don't print to avoid spam
+  end
+end
+
+-- Final obfuscated output
+print("Result: "..computed_table[a1b2c3("\x0a\x0f\x17",23,false)])
