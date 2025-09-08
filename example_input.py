@@ -28,12 +28,10 @@ unicode_string = "\u0048\u0065\u006C\u006C\u006F"  # "Hello"
 # String with octal escapes
 octal_string = "\110\145\154\154\157"  # "Hello"
 
-# Mixed whitespace
-def    example_function(  ):
-	result  =   42
-
-
-	return result
+# Mixed whitespace normalized
+def example_function():
+    result = 42
+    return result
 
 # Complex example combining multiple patterns
 data = {

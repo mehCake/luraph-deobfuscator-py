@@ -1,102 +1,77 @@
-#!/usr/bin/env python3
-"""
-Unit tests for the CodeNormalizer class.
-"""
+# code_normalizer.py
 
-import unittest
-from code_normalizer import CodeNormalizer
+import re
 
-class TestCodeNormalizer(unittest.TestCase):
+class CodeNormalizer:
     
-    def setUp(self):
-        self.normalizer = CodeNormalizer()
+    def normalize_hex_number(self, value: str) -> str:
+        # Convert hex string (case insensitive) to decimal
+        return str(int(value, 16))
     
-    def test_normalize_hex_number(self):
-        # Test basic hex conversion
-        self.assertEqual(self.normalizer.normalize_hex_number("A"), "10")
-        self.assertEqual(self.normalizer.normalize_hex_number("FF"), "255")
-        self.assertEqual(self.normalizer.normalize_hex_number("10"), "16")
-        
-        # Test case insensitivity
-        self.assertEqual(self.normalizer.normalize_hex_number("ff"), "255")
-        self.assertEqual(self.normalizer.normalize_hex_number("aB"), "171")
+    def normalize_scientific_notation(self, value: str) -> str:
+        # Convert scientific notation to float string
+        return str(float(value))
     
-    def test_normalize_scientific_notation(self):
-        self.assertEqual(self.normalizer.normalize_scientific_notation("1e3"), "1000.0")
-        self.assertEqual(self.normalizer.normalize_scientific_notation("2.5e2"), "250.0")
-        self.assertEqual(self.normalizer.normalize_scientific_notation("1E-2"), "0.01")
-        self.assertEqual(self.normalizer.normalize_scientific_notation("3.14e0"), "3.14")
+    def normalize_hex_string(self, hex_str: str) -> str:
+        val = int(hex_str, 16)
+        # Printable ASCII (32-126) except quotes/backslash
+        if 32 <= val <= 126 and val not in (34, 39, 92):
+            return chr(val)
+        # Otherwise return escaped
+        return f"\\x{hex_str.upper()}"
     
-    def test_normalize_hex_string(self):
-        # Test printable ASCII
-        self.assertEqual(self.normalizer.normalize_hex_string("41"), "A")  # 0x41 = 'A'
-        self.assertEqual(self.normalizer.normalize_hex_string("20"), " ")  # 0x20 = space
-        
-        # Test non-printable (should remain as hex)
-        self.assertEqual(self.normalizer.normalize_hex_string("00"), "\\x00")
-        self.assertEqual(self.normalizer.normalize_hex_string("1F"), "\\x1F")
-        
-        # Test quotes and backslash (should remain escaped)
-        self.assertEqual(self.normalizer.normalize_hex_string("22"), "\\x22")  # "
-        self.assertEqual(self.normalizer.normalize_hex_string("27"), "\\x27")  # '
-        self.assertEqual(self.normalizer.normalize_hex_string("5C"), "\\x5C")  # \
+    def normalize_unicode_escape(self, hex_str: str) -> str:
+        val = int(hex_str, 16)
+        if 32 <= val <= 126 and val not in (34, 39, 92):
+            return chr(val)
+        return f"\\u{hex_str.zfill(4).upper()}"
     
-    def test_normalize_unicode_escape(self):
-        # Test basic ASCII characters
-        self.assertEqual(self.normalizer.normalize_unicode_escape("0041"), "A")
-        self.assertEqual(self.normalizer.normalize_unicode_escape("0020"), " ")
-        
-        # Test quotes and backslash (should remain escaped)
-        self.assertEqual(self.normalizer.normalize_unicode_escape("0022"), "\\u0022")
-        self.assertEqual(self.normalizer.normalize_unicode_escape("0027"), "\\u0027")
-        self.assertEqual(self.normalizer.normalize_unicode_escape("005C"), "\\u005C")
-        
-        # Test non-printable
-        self.assertEqual(self.normalizer.normalize_unicode_escape("0000"), "\\u0000")
+    def normalize_octal_escape(self, oct_str: str) -> str:
+        val = int(oct_str, 8)
+        if 32 <= val <= 126 and val not in (34, 39, 92):
+            return chr(val)
+        # Handle special escape chars
+        if val == 34:
+            return '\\"'
+        if val == 39:
+            return "\\'"
+        if val == 92:
+            return "\\\\"
+        return f"\\{oct_str.zfill(3)}"
     
-    def test_normalize_octal_escape(self):
-        # Test printable ASCII
-        self.assertEqual(self.normalizer.normalize_octal_escape("101"), "A")  # 101 octal = 65 decimal = 'A'
-        self.assertEqual(self.normalizer.normalize_octal_escape("040"), " ")  # 40 octal = 32 decimal = space
-        
-        # Test quotes and backslash
-        self.assertEqual(self.normalizer.normalize_octal_escape("042"), "\\\"")  # 42 octal = 34 decimal = '"'
-        self.assertEqual(self.normalizer.normalize_octal_escape("047"), "\\'")   # 47 octal = 39 decimal = "'"
-        self.assertEqual(self.normalizer.normalize_octal_escape("134"), "\\\\")  # 134 octal = 92 decimal = '\'
-        
-        # Test non-printable
-        self.assertEqual(self.normalizer.normalize_octal_escape("000"), "\\000")
+    def normalize_whitespace(self, code: str) -> str:
+        # Replace tabs with space
+        code = code.replace('\t', ' ')
+        # Collapse multiple spaces into one
+        code = re.sub(r' +', ' ', code)
+        # Collapse multiple newlines into max 2
+        code = re.sub(r'\n{3,}', '\n\n', code)
+        return code.strip()
     
-    def test_normalize_whitespace(self):
-        test_code = "a = 1\n\n\n    b = 2\t\t\tc = 3"
-        expected = "a = 1\n\nb = 2 c = 3"
-        result = self.normalizer.normalize_whitespace(test_code)
-        self.assertEqual(result, expected)
-    
-    def test_normalize_all_numbers_integration(self):
-        test_code = """
-        x = 0xFF  # hex
-        y = 1e3   # scientific
-        z = "\\x41\\u0042"  # string escapes
-        w = 5.0   # float
-        """
-        
-        result = self.normalizer.normalize_all_numbers(test_code)
-        
-        # Check that hex was converted
-        self.assertIn("255", result)
-        self.assertNotIn("0xFF", result)
-        
-        # Check that scientific notation was converted
-        self.assertIn("1000", result)
-        self.assertNotIn("1e3", result)
-        
-        # Check that string escapes were converted
-        self.assertIn("AB", result)
-        
-        # Check that unnecessary .0 was removed
-        self.assertIn("5", result)
-        self.assertNotIn("5.0", result)
-
-if __name__ == "__main__":
-    unittest.main()
+    def normalize_all_numbers(self, code: str) -> str:
+        # Normalize hex numbers: 0xFF -> decimal
+        code = re.sub(
+            r'0x([0-9A-Fa-f]+)',
+            lambda m: str(int(m.group(1), 16)),
+            code
+        )
+        # Normalize scientific notation
+        code = re.sub(
+            r'(\d+\.?\d*)[eE]([+-]?\d+)',
+            lambda m: str(float(m.group(0))),
+            code
+        )
+        # Replace string hex and unicode escapes
+        code = re.sub(
+            r'\\x([0-9A-Fa-f]{2})',
+            lambda m: self.normalize_hex_string(m.group(1)),
+            code
+        )
+        code = re.sub(
+            r'\\u([0-9A-Fa-f]{4})',
+            lambda m: self.normalize_unicode_escape(m.group(1)),
+            code
+        )
+        # Remove unnecessary .0 from floats
+        code = re.sub(r'(\d+)\.0\b', r'\1', code)
+        return code

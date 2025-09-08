@@ -1,263 +1,168 @@
-import re
-import logging
-from typing import Dict, Set, List, Tuple, Any
-from collections import defaultdict, Counter
+"""
+Variable and Function Renaming Module
+"""
 
-class VariableRenamer:
-    """Provides heuristic variable renaming for obfuscated Lua code."""
+import re
+from typing import Dict, Set, Optional
+import logging
+from collections import defaultdict
+
+class LuaVariableRenamer:
+    """Renames variables and functions with meaningful names"""
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self.variable_map = {}
-        self.used_names = set()
-        self.context_hints = {}
+        self.variable_map: Dict[str, str] = {}
+        self.function_map: Dict[str, str] = {}
+        self.used_names: Set[str] = set()
         
-        # Common variable name patterns
-        self.name_patterns = {
-            'loop_indices': ['i', 'j', 'k', 'index', 'idx'],
-            'counters': ['count', 'counter', 'num', 'n'],
-            'temporary': ['temp', 'tmp', 'val', 'value'],
-            'strings': ['str', 'string', 'text', 'msg'],
-            'tables': ['tbl', 'table', 'data', 'list'],
-            'functions': ['func', 'fn', 'callback', 'handler'],
-            'results': ['result', 'ret', 'output', 'res'],
-            'flags': ['flag', 'enabled', 'active', 'state'],
-            'lengths': ['len', 'length', 'size', 'count']
-        }
-        
-        # Reserved Lua keywords to avoid
+        # Reserved Lua keywords
         self.lua_keywords = {
             'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
             'function', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat',
             'return', 'then', 'true', 'until', 'while'
         }
         
-        # Common Lua globals to avoid
-        self.lua_globals = {
-            'print', 'type', 'pairs', 'ipairs', 'next', 'tostring', 'tonumber',
-            'string', 'table', 'math', 'io', 'os', 'debug', 'coroutine',
-            'package', 'require', 'load', 'loadstring', 'pcall', 'xpcall',
-            'error', 'assert', 'select', 'unpack', 'rawget', 'rawset',
-            'getmetatable', 'setmetatable', 'getfenv', 'setfenv'
+        # Extended meaningful variable names by context
+        self.context_names = {
+            'loop': ['index', 'counter', 'position', 'current', 'i', 'j', 'k', 'idx', 'step'],
+            'string': ['text', 'content', 'message', 'data', 'line', 'input', 'output', 'str_value'],
+            'number': ['value', 'amount', 'size', 'length', 'count', 'total', 'num', 'idx'],
+            'boolean': ['flag', 'enabled', 'active', 'valid', 'is_ready', 'has_value', 'success', 'done'],
+            'table': ['list', 'array', 'items', 'collection', 'table', 'dict', 'map', 'elements'],
+            'function': ['handler', 'callback', 'processor', 'method', 'action', 'executor', 'func']
         }
+    
+    def rename_variables(self, code: str) -> str:
+        """Main function to rename variables and functions"""
+        try:
+            self._identify_identifiers(code)
+            self._generate_meaningful_names()
+            code = self._apply_renaming(code)
+            return code
+        except Exception as e:
+            self.logger.error(f"Error during variable renaming: {e}")
+            return code
+    
+    def _identify_identifiers(self, code: str) -> None:
+        """Identify all variables and functions in the code"""
+        function_pattern = r'\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
+        for match in re.finditer(function_pattern, code):
+            func_name = match.group(1)
+            if self._is_obfuscated_name(func_name):
+                self.function_map[func_name] = ''
 
-    def analyze_variable_usage(self, code: str) -> Dict[str, Any]:
-        """Analyze how variables are used to infer their purpose."""
-        analysis = defaultdict(lambda: {
-            'occurrences': 0,
-            'contexts': [],
-            'likely_type': 'unknown',
-            'scope': 'unknown'
-        })
+        local_pattern = r'\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)'
+        for match in re.finditer(local_pattern, code):
+            var_name = match.group(1)
+            if self._is_obfuscated_name(var_name):
+                self.variable_map[var_name] = ''
+
+        assignment_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\s*='
+        for match in re.finditer(assignment_pattern, code):
+            var_name = match.group(1)
+            if self._is_obfuscated_name(var_name) and var_name not in self.lua_keywords:
+                self.variable_map[var_name] = ''
+
+    def _is_obfuscated_name(self, name: str) -> bool:
+        """Determine if a name appears to be obfuscated"""
+        if name in self.lua_keywords:
+            return False
         
-        # Find all variable declarations and usages
-        patterns = {
-            'local_declarations': r'local\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)',
-            'for_loops': r'for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=',
-            'for_pairs': r'for\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s+in',
-            'function_params': r'function\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(([^)]*)\)',
-            'assignments': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=',
-            'table_access': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\[',
-            'function_calls': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            'string_operations': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\.\s*',
-            'numeric_operations': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*[+\-*/]',
-            'comparisons': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*[<>=!~]',
-            'length_operations': r'#([a-zA-Z_][a-zA-Z0-9_]*)'
-        }
+        if len(name) == 1 and name not in 'ijk':
+            return True
         
-        for pattern_name, pattern in patterns.items():
-            matches = re.findall(pattern, code)
-            for match in matches:
-                if isinstance(match, tuple):
-                    variables = [v.strip() for v in match if v.strip()]
-                else:
-                    variables = [v.strip() for v in match.split(',') if v.strip()]
-                
-                for var in variables:
-                    if var and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', var):
-                        analysis[var]['occurrences'] += 1
-                        analysis[var]['contexts'].append(pattern_name)
+        if len(name) > 1:
+            if re.search(r'[a-z][A-Z][a-z]', name) or re.search(r'[A-Z][a-z][A-Z]', name):
+                return True
+            if re.search(r'[a-zA-Z]\d[a-zA-Z]', name):
+                return True
+            if len(name) <= 3 and not re.match(r'^[a-z]+$', name):
+                return True
         
-        # Infer variable types based on usage patterns
-        for var, info in analysis.items():
-            contexts = set(info['contexts'])
+        return False
+    
+    def _generate_meaningful_names(self) -> None:
+        """Generate meaningful names for identified variables and functions"""
+        func_counter = 1
+        for func_name in self.function_map.keys():
+            new_name = f"function_{func_counter}"
+            while new_name in self.used_names or new_name in self.lua_keywords:
+                func_counter += 1
+                new_name = f"function_{func_counter}"
+            self.function_map[func_name] = new_name
+            self.used_names.add(new_name)
+            func_counter += 1
+        
+        var_counter = 1
+        context_counters = defaultdict(int)
+        
+        for var_name in self.variable_map.keys():
+            context = self._determine_variable_context(var_name)
             
-            if 'for_loops' in contexts:
-                info['likely_type'] = 'loop_index'
-            elif 'length_operations' in contexts:
-                info['likely_type'] = 'table_or_string'
-            elif 'string_operations' in contexts:
-                info['likely_type'] = 'string'
-            elif 'numeric_operations' in contexts:
-                info['likely_type'] = 'number'
-            elif 'table_access' in contexts:
-                info['likely_type'] = 'table'
-            elif 'function_calls' in contexts:
-                info['likely_type'] = 'function'
-            elif 'comparisons' in contexts:
-                info['likely_type'] = 'comparable'
-        
-        return dict(analysis)
-
-    def generate_meaningful_name(self, old_name: str, var_info: Dict[str, Any]) -> str:
-        """Generate a meaningful name based on variable usage analysis."""
-        likely_type = var_info.get('likely_type', 'unknown')
-        contexts = var_info.get('contexts', [])
-        
-        # Start with base names based on inferred type
-        base_names = []
-        
-        if likely_type == 'loop_index':
-            base_names = self.name_patterns['loop_indices']
-        elif likely_type == 'string':
-            base_names = self.name_patterns['strings']
-        elif likely_type == 'table':
-            base_names = self.name_patterns['tables']
-        elif likely_type == 'function':
-            base_names = self.name_patterns['functions']
-        elif likely_type == 'number':
-            base_names = self.name_patterns['counters']
-        else:
-            # Use context clues
-            if 'for_loops' in contexts or 'for_pairs' in contexts:
-                base_names = self.name_patterns['loop_indices']
-            elif 'function_params' in contexts:
-                base_names = ['param', 'arg', 'value']
+            if context and context in self.context_names:
+                context_names = self.context_names[context]
+                context_counters[context] %= len(context_names)
+                base_name = context_names[context_counters[context]]
+                context_counters[context] += 1
+                
+                new_name = base_name
+                suffix = 1
+                while new_name in self.used_names or new_name in self.lua_keywords:
+                    new_name = f"{base_name}_{suffix}"
+                    suffix += 1
             else:
-                base_names = self.name_patterns['temporary']
-        
-        # Find an available name
-        for base_name in base_names:
-            candidate = base_name
-            counter = 1
+                new_name = f"var_{var_counter}"
+                while new_name in self.used_names or new_name in self.lua_keywords:
+                    var_counter += 1
+                    new_name = f"var_{var_counter}"
+                var_counter += 1
             
-            while (candidate in self.used_names or 
-                   candidate in self.lua_keywords or 
-                   candidate in self.lua_globals):
-                candidate = f"{base_name}{counter}"
-                counter += 1
-            
-            self.used_names.add(candidate)
-            return candidate
-        
-        # Fallback: use var + number
-        counter = 1
-        while f"var{counter}" in self.used_names:
-            counter += 1
-        
-        candidate = f"var{counter}"
-        self.used_names.add(candidate)
-        return candidate
-
-    def detect_obfuscated_variables(self, code: str) -> Set[str]:
-        """Detect variables that are likely obfuscated."""
-        obfuscated_vars = set()
-        
-        # Find all variable names
-        var_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b'
-        all_vars = set(re.findall(var_pattern, code))
-        
-        for var in all_vars:
-            # Skip Lua keywords and globals
-            if var in self.lua_keywords or var in self.lua_globals:
-                continue
-            
-            # Check for obfuscation patterns
-            is_obfuscated = (
-                # Very short random-looking names
-                (len(var) == 1 and var not in ['i', 'j', 'k', 'n', 'x', 'y', 'z']) or
-                
-                # Random character combinations
-                (len(var) <= 3 and not any(word in var.lower() 
-                                          for word_list in self.name_patterns.values() 
-                                          for word in word_list)) or
-                
-                # Mixed case without clear pattern
-                (len([c for c in var if c.isupper()]) > len(var) // 2 and len(var) > 1) or
-                
-                # Contains numbers in the middle (like a1b2c)
-                re.match(r'.*\d.*[a-zA-Z].*\d.*', var) or
-                
-                # Underscore-heavy names
-                var.count('_') > len(var) // 3 or
-                
-                # Very long seemingly random names
-                (len(var) > 10 and not any(common in var.lower() 
-                                          for common in ['function', 'table', 'string', 'value', 'data']))
-            )
-            
-            if is_obfuscated:
-                obfuscated_vars.add(var)
-        
-        self.logger.info(f"Detected {len(obfuscated_vars)} likely obfuscated variables")
-        return obfuscated_vars
-
-    def rename_variables(self, code: str, custom_mapping: Dict[str, str] = None) -> str:
-        """Rename obfuscated variables with meaningful names."""
-        self.logger.info("Starting heuristic variable renaming...")
-        
-        # Use custom mapping if provided
-        if custom_mapping:
-            self.variable_map.update(custom_mapping)
-            self.used_names.update(custom_mapping.values())
-        
-        # Analyze variable usage
-        var_analysis = self.analyze_variable_usage(code)
-        
-        # Detect obfuscated variables
-        obfuscated_vars = self.detect_obfuscated_variables(code)
-        
-        # Generate new names for obfuscated variables
-        for var in obfuscated_vars:
-            if var not in self.variable_map:
-                var_info = var_analysis.get(var, {})
-                new_name = self.generate_meaningful_name(var, var_info)
-                self.variable_map[var] = new_name
-        
-        # Apply renaming
-        renamed_code = code
-        
-        # Sort variables by length (longest first) to avoid partial replacements
-        sorted_vars = sorted(self.variable_map.items(), key=lambda x: len(x[0]), reverse=True)
-        
-        for old_name, new_name in sorted_vars:
-            # Use word boundaries to ensure we only replace complete variable names
-            pattern = r'\b' + re.escape(old_name) + r'\b'
-            renamed_code = re.sub(pattern, new_name, renamed_code)
-        
-        self.logger.info(f"Renamed {len(self.variable_map)} variables")
-        return renamed_code
-
-    def create_renaming_report(self) -> str:
-        """Create a report of variable renamings performed."""
-        if not self.variable_map:
-            return "No variables were renamed."
-        
-        report = "Variable Renaming Report:\n"
-        report += "=" * 50 + "\n\n"
-        
-        # Group by new names for better organization
-        by_type = defaultdict(list)
+            self.variable_map[var_name] = new_name
+            self.used_names.add(new_name)
+    
+    def _determine_variable_context(self, var_name: str) -> Optional[str]:
+        """Try to determine the context/type of a variable"""
+        if len(var_name) == 1 and var_name in 'ijk':
+            return 'loop'
+        # Optionally: detect string/number/table types from naming patterns
+        if re.search(r'(txt|str|msg|content)', var_name, re.IGNORECASE):
+            return 'string'
+        if re.search(r'(num|cnt|val|total|length|size)', var_name, re.IGNORECASE):
+            return 'number'
+        if re.search(r'(is_|has_|flag|enabled|active)', var_name, re.IGNORECASE):
+            return 'boolean'
+        if re.search(r'(list|array|table|dict|map|collection)', var_name, re.IGNORECASE):
+            return 'table'
+        return None
+    
+    def _apply_renaming(self, code: str) -> str:
+        """Apply the variable and function renaming to the code"""
+        # Only apply separately
         for old_name, new_name in self.variable_map.items():
-            # Determine type based on new name
-            var_type = 'other'
-            for type_name, names in self.name_patterns.items():
-                if any(name in new_name for name in names):
-                    var_type = type_name
-                    break
-            by_type[var_type].append((old_name, new_name))
+            if new_name:
+                pattern = r'\b' + re.escape(old_name) + r'\b'
+                code = re.sub(pattern, new_name, code)
+        for old_name, new_name in self.function_map.items():
+            if new_name:
+                pattern = r'\b' + re.escape(old_name) + r'\b'
+                code = re.sub(pattern, new_name, code)
+        return code
+    
+    def get_mapping_report(self) -> str:
+        """Generate a report of all variable and function mappings"""
+        report = ["Variable and Function Renaming Report", "=" * 40]
         
-        for var_type, renames in by_type.items():
-            if renames:
-                report += f"{var_type.replace('_', ' ').title()}:\n"
-                for old_name, new_name in sorted(renames):
-                    report += f"  {old_name} -> {new_name}\n"
-                report += "\n"
+        if self.function_map:
+            report.append("\nFunctions:")
+            for old, new in self.function_map.items():
+                if new:
+                    report.append(f"  {old} -> {new}")
         
-        return report
-
-    def reset(self):
-        """Reset the renamer state for a new analysis."""
-        self.variable_map.clear()
-        self.used_names.clear()
-        self.context_hints.clear()
+        if self.variable_map:
+            report.append("\nVariables:")
+            for old, new in self.variable_map.items():
+                if new:
+                    report.append(f"  {old} -> {new}")
+        
+        return "\n".join(report)

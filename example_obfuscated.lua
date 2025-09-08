@@ -1,0 +1,33 @@
+-- Example obfuscated Lua code for testing
+local _0x1a2b3c = string.char
+local _0x4d5e6f = string.byte
+local _0x789abc = table.concat
+local _0xdef012 = {104,101,108,108,111,32,119,111,114,108,100}
+
+function _0x345678()
+    local _0x9abcde = {}
+    for _0xfedcba = 1, #_0xdef012 do
+        _0x9abcde[_0xfedcba] = _0x1a2b3c(_0xdef012[_0xfedcba])
+    end
+    return _0x789abc(_0x9abcde)
+end
+
+local _0x567890 = _0x345678()
+print(_0x567890)
+
+-- More complex obfuscation
+local _0xabcdef = "SGVsbG8gV29ybGQ="
+local _0x123456 = ""
+for _0x987654 = 1, #_0xabcdef do
+    local _0xfedcba = _0x4d5e6f(_0xabcdef, _0x987654)
+    _0x123456 = _0x123456 .. _0x1a2b3c(_0xfedcba)
+end
+
+-- String escape obfuscation
+local _0xabc123 = "\72\101\108\108\111\32\87\111\114\108\100"
+print(_0xabc123)
+
+-- Function call obfuscation
+local _0xfunc1 = print
+local _0xfunc2 = _0xfunc1
+_0xfunc2("This is obfuscated")

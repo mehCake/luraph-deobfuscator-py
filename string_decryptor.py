@@ -1,6 +1,5 @@
 import re
 import base64
-from typing import Optional
 
 class StringDecryptor:
     def __init__(self):
@@ -11,65 +10,87 @@ class StringDecryptor:
     
     def decrypt(self, code: str) -> str:
         """
-        Decrypt strings in the provided code
-        
-        :param code: Input code with potentially encrypted strings
-        :return: Code with decrypted strings
+        Recursively decrypt strings in the provided code
         """
-        # Detect and decrypt base64 encoded strings
-        decrypted_code = self._decrypt_base64_strings(code)
+        previous_code = None
+        current_code = code
         
-        # Detect and decrypt XOR encoded strings
-        decrypted_code = self._decrypt_xor_strings(decrypted_code)
+        # Keep decrypting until no more changes
+        while current_code != previous_code:
+            previous_code = current_code
+            current_code = self._decrypt_base64_strings(current_code)
+            current_code = self._decrypt_xor_strings(current_code)
+            current_code = self._decode_lua_hex_escapes(current_code)
+            current_code = self._decode_lua_unicode_escapes(current_code)
+            current_code = self._decrypt_loadstring(current_code)
         
-        return decrypted_code
+        return current_code
     
     def _decrypt_base64_strings(self, code: str) -> str:
-        """
-        Decrypt base64 encoded strings
-        
-        :param code: Input code
-        :return: Code with base64 strings decoded
-        """
         base64_pattern = r'base64\.decode\([\'"]([^\'"]*)[\'"]\)'
-        
+
         def replace_base64(match):
             try:
-                return f"'{base64.b64decode(match.group(1)).decode('utf-8')}'"
+                decoded_bytes = base64.b64decode(match.group(1))
+                decoded_text = decoded_bytes.decode('utf-8', errors='replace')
+                return f"'{decoded_text}'"
             except Exception:
                 return match.group(0)
-        
+
         return re.sub(base64_pattern, replace_base64, code)
     
     def _decrypt_xor_strings(self, code: str) -> str:
-        """
-        Decrypt XOR encoded strings
-        
-        :param code: Input code
-        :return: Code with XOR strings decoded
-        """
         xor_pattern = r'xor_decrypt\([\'"]([^\'"]*)[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]\)'
-        
+
         def replace_xor(match):
             encrypted_text = match.group(1)
             key = match.group(2)
-            return f"'{self._xor_decrypt(encrypted_text, key)}'"
-        
+            decrypted = self._xor_decrypt(encrypted_text, key)
+            return f"'{decrypted}'"
+
         return re.sub(xor_pattern, replace_xor, code)
     
-    def _xor_decrypt(self, text: str, key: str) -> Optional[str]:
-        """
-        XOR decryption utility
-        
-        :param text: Encrypted text
-        :param key: Decryption key
-        :return: Decrypted text or None
-        """
+    def _xor_decrypt(self, text: str, key: str) -> str:
         try:
-            decrypted = ''.join(
-                chr(ord(c) ^ ord(key[i % len(key)])) 
+            return ''.join(
+                chr(ord(c) ^ ord(key[i % len(key)]))
                 for i, c in enumerate(text)
             )
-            return decrypted
         except Exception:
-            return None
+            return text
+    
+    def _decode_lua_hex_escapes(self, code: str) -> str:
+        hex_pattern = r'\\x([0-9A-Fa-f]{2})'
+
+        def replace_hex(match):
+            try:
+                return chr(int(match.group(1), 16))
+            except Exception:
+                return match.group(0)
+
+        return re.sub(hex_pattern, replace_hex, code)
+    
+    def _decode_lua_unicode_escapes(self, code: str) -> str:
+        unicode_pattern = r'\\u\{([0-9A-Fa-f]+)\}'
+
+        def replace_unicode(match):
+            try:
+                return chr(int(match.group(1), 16))
+            except Exception:
+                return match.group(0)
+
+        return re.sub(unicode_pattern, replace_unicode, code)
+    
+    def _decrypt_loadstring(self, code: str) -> str:
+        """
+        Detect and decode Lua loadstring/load calls
+        """
+        loadstring_pattern = r'(?:loadstring|load)\([\'"]([^\'"]*)[\'"]\)'
+
+        def replace_loadstring(match):
+            inner_code = match.group(1)
+            # Recursively decrypt the inner code
+            decrypted_inner = self.decrypt(inner_code)
+            return f"'{decrypted_inner}'"
+
+        return re.sub(loadstring_pattern, replace_loadstring, code)

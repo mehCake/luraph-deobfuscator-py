@@ -3,6 +3,7 @@ import os
 import logging
 import argparse
 import requests
+import re  # <- Added this
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Any, Tuple
 

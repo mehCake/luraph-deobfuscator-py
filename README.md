@@ -1,122 +1,248 @@
-# Lua Deobfuscator
+Advanced Lua Deobfuscator
 
-A comprehensive Python tool for analyzing and deobfuscating Lua scripts. This tool helps reverse engineers and security researchers understand obfuscated Lua code by applying various deobfuscation techniques.
+A comprehensive Python-based tool for deobfuscating Lua code, with specialized support for various obfuscation methods including Luraph, string obfuscation, and generic pattern-based obfuscation.
 
-## Features
+Repository (reference): https://github.com/mehCake/luraph-deobfuscator-py
 
-- **Code Analysis**: Identifies obfuscation patterns and suspicious constructs
-- **String Deobfuscation**: Decodes various string encoding methods
-- **Variable Renaming**: Replaces meaningless variable names with readable ones  
-- **Code Beautification**: Applies proper formatting and indentation
-- **Modular Design**: Each component can be used independently
+Note: If the repository link is not available or private, use the local project copy at C:\Users\mende\luraph-deobfuscator-py.
 
-## Installation
+Features
 
-1. Clone or download the project
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Multi-Method Support: Supports Luraph, generic string obfuscation, and pattern-based deobfuscation.
 
-## Usage
+Intelligent Analysis: Automatically detects obfuscation methods and complexity.
 
-### Basic Usage
+Comprehensive Transformations: Many deobfuscation techniques (string decoding, var renaming, control flow simplification, etc.).
 
-```bash
-# Analyze and deobfuscate a Lua file
-python src/main.py input.lua
+Modular Architecture: Separate modules for detection, transformations, utilities and CLI.
 
-# Save to a specific output file
-python src/main.py input.lua -o output.lua
-```
+Command-Line Interface: Easy-to-use CLI with options for analysis, method selection, verbosity, and output.
 
-### Advanced Options
+Interactive Mode: Terminal interactive UI for step-by-step usage.
 
-```bash
-# Only analyze the code (no output file)
-python src/main.py input.lua --analyze-only
+Logging: Configurable logging to file and console.
 
-# Only beautify the code
-python src/main.py input.lua --beautify-only
+Prerequisites
 
-# Only rename variables
-python src/main.py input.lua --rename-only
+Python 3.6+ (3.7+ recommended).
 
-# Skip specific steps
-python src/main.py input.lua --skip-beautify
-python src/main.py input.lua --skip-rename
+No required third-party pip packages for basic use (the project uses only standard library modules by default).
 
-# Adjust indentation size
-python src/main.py input.lua --indent-size 4
+Optional: pyinstaller to build a standalone executable.
 
-# Set logging level
-python src/main.py input.lua --log-level DEBUG
-```
+If you plan to create a Windows .exe, install PyInstaller:
 
-## Components
+pip install pyinstaller
 
-### Deobfuscator (`deobfuscator.py`)
-- Analyzes code for obfuscation patterns
-- Decodes string literals
-- Removes junk code and unnecessary complexity
-- Provides detailed analysis reports
+Project Layout
+luraph-deobfuscator-py/                # project root (local copy path e.g. C:\Users\mende\luraph-deobfuscator-py)
+├── main.py                           # Primary CLI + interactive entrypoint (root)
+├── run.py                            # Alternative entrypoint (older name / alias)
+├── README.md
+├── requirements.txt                  # Optional (list only pip installs needed)
+└── src/
+    ├── deobfuscator.py               # Core deobfuscator class
+    ├── patterns.py                   # Pattern detection & matcher
+    ├── transformations.py            # Transformations and cleaners
+    ├── utils.py                      # helpers: logging, file helpers
+    ├── gui.py                        # Terminal interactive GUI handler
+    ├── normalizer.py                 # Code normalization utilities
+    └── ...                           # other modules (string extractor, vm simulator, etc.)
 
-### Beautifier (`beautifier.py`) 
-- Applies proper indentation and formatting
-- Normalizes whitespace and line endings
-- Formats functions, tables, and control structures
-- Adds appropriate spacing around operators
 
-### Variable Renamer (`variable_renamer.py`)
-- Identifies obfuscated variable and function names
-- Generates meaningful replacement names based on context
-- Provides mapping reports showing all changes
+Note about two main.py files: Some branches or setups include both a main.py in the project root and another CLI/entrypoint inside src/. Use the root main.py for normal usage and interactive mode. The src entrypoint (if present) is typically for library/demo usage; README commands below assume root main.py is the intended entry.
 
-## Example
+Quickstart — Command-line usage
 
-Input (obfuscated):
-```lua
-local a=function(b,c)local d=""for e=1,#b do d=d..string.char(string.byte(b,e)~c)end return d end
-local f=a("\x1b\x0f\x0c\x0c\x11\x68\x75\x11\x16\x0c\x08",23)
-print(f)
-```
+Open a terminal and cd to your project folder (e.g. C:\Users\mende\luraph-deobfuscator-py).
 
-Output (deobfuscated):
-```lua
-local function_1 = function(text, value)
-  local content = ""
-  for index = 1, #text do
-    content = content .. string.char(string.byte(text, index) ~ value)
-  end
-  return content
-end
+Basic deobfuscation:
 
-local message = "Hello World"
-print(message)
-```
+python main.py path/to/obfuscated.lua
 
-## Logging
 
-The tool provides detailed logging at different levels:
-- **INFO**: General progress information
-- **DEBUG**: Detailed processing information  
-- **WARNING**: Potential issues or unusual patterns
-- **ERROR**: Errors that prevent processing
+Specify an output file:
 
-## Limitations
+python main.py path/to/obfuscated.lua -o path/to/clean.lua
 
-- Complex control flow obfuscation may require manual analysis
-- Some advanced obfuscation techniques may not be fully handled
-- Variable context detection is heuristic-based and may not always be accurate
 
-## Contributing
+Choose deobfuscation method:
 
-This tool is designed to be extensible. New deobfuscation techniques can be added by:
-1. Adding new methods to the `LuaDeobfuscator` class
-2. Implementing additional pattern recognition in the analyzer
-3. Extending the variable renamer with better context detection
+python main.py path/to/obfuscated.lua -m luraph
+python main.py path/to/obfuscated.lua -m generic
 
-## License
 
-This project is provided for educational and research purposes.
+Analyze only (no transformations):
 
+python main.py path/to/obfuscated.lua --analyze
+
+
+Verbose logging / debug mode:
+
+python main.py path/to/obfuscated.lua -v
+
+
+Options summary
+
+input_file — Path to the obfuscated Lua file.
+
+-o, --output — Output file path.
+
+-m, --method — auto (default), luraph, generic.
+
+-v, --verbose — Enable verbose logging.
+
+-a, --analyze — Only analyze; don’t write deobfuscated output.
+
+Interactive Mode (Terminal GUI)
+
+If you run the CLI without a filename, an interactive terminal GUI is available:
+
+python main.py
+# or
+python main.py --interactive
+
+
+Interactive flow:
+
+Welcome screen and main menu.
+
+Select 1. Select Lua file to enter a path.
+
+Configure options (deobfuscation and output settings).
+
+Start deobfuscation and view statistics and generated output file.
+
+Interactive UI features:
+
+File selection (validates extension .lua, .luac, .txt).
+
+Toggleable options:
+
+Remove junk code
+
+Decrypt strings
+
+Resolve function calls
+
+Simplify expressions
+
+Beautify output
+
+Rename variables
+
+Indent size
+
+Saves results to <input>_deobfuscated.lua by default, shows renaming report and stats.
+
+Building a Standalone Windows Executable
+
+Install PyInstaller:
+
+pip install pyinstaller
+
+
+From project root:
+
+pyinstaller --onefile --name LuaDeobfuscator main.py
+
+
+The built executable will be in dist\LuaDeobfuscator.exe.
+
+If you have custom data files (like config.json) referenced at runtime, pass --add-data options to PyInstaller and ensure the executable can locate them (or embed defaults in code).
+
+Logging & Output
+
+Default log file: deobfuscator.log (configurable via src/utils.py).
+
+Use -v/--verbose for console debug output and stack traces.
+
+Output modes: JSON (machine-readable) or plain text (formatted report).
+
+How the Tool Works (high-level)
+
+Phase 1 — Analysis
+
+Detect obfuscation type & variants (Luraph, IronBrew, generic).
+
+Gather heuristics: hex strings, long encoded strings, VM signatures, control-flow obfuscation.
+
+Phase 2 — Transformation
+
+Decode strings (hex, escapes, base64).
+
+Reconstruct constant pools (string.char tables, concatenations).
+
+Replace and simplify obfuscated expressions.
+
+Rename variables and functions heuristically.
+
+Remove traps, junk code and dummy wrappers.
+
+Attempt VM instruction decoding where possible.
+
+Phase 3 — Optimization & Output
+
+Beautify code (indentation, spacing).
+
+Create backups and optional rollbacks.
+
+Generate statistics & renaming reports.
+
+Notes & Limitations
+
+Heuristics: The tool uses pattern matching and heuristics. It does not run untrusted Lua code; VM simulation is static and conservative.
+
+Not guaranteed: Complex, custom, or multi-stage obfuscations may not be fully recovered automatically.
+
+Lua versions: Primary testing targets are Lua 5.1–5.4; some obfuscators use version-specific bytecode or features.
+
+Safety: Do not use the tool to automatically run unknown code in your environment.
+
+Examples
+
+Analyze a file:
+
+python main.py suspicious.lua --analyze
+
+
+Deobfuscate and save output:
+
+python main.py obfuscated.lua -o obfuscated_deobfuscated.lua -v
+
+
+Interactive quick use:
+
+python main.py
+# Follow prompts: select file -> adjust settings -> start deobfuscation
+
+Troubleshooting
+
+File not found: Specify full path or cd into the directory containing the file.
+
+Permission errors: Ensure you have read/write permissions for input and output directories.
+
+Executable build fails: Install pyinstaller and re-run; ensure file paths and --add-data paths are correct.
+
+Low confidence detection: Try using -m generic, increase --verbose, or analyze with --analyze to get a patterns report.
+
+Contributing
+
+To contribute:
+
+Add new detection patterns to src/patterns.py.
+
+Add transformation functions to src/transformations.py.
+
+Update src/deobfuscator.py to call them in the pipeline.
+
+Include unit tests in tests/ and update README.md where needed.
+
+License & Usage
+
+This tool is provided for educational and research purposes. Respect license obligations for third-party code. Use responsibly and ethically.
+
+Contact / Repository
+
+Reference repo: https://github.com/mehCake/luraph-deobfuscator-py
+If the repo is unavailable, use your local copy at C:\Users\mende\luraph-deobfuscator-py.

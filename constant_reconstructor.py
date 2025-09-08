@@ -1,8 +1,7 @@
+#!/usr/bin/env python3
 import re
-import ast
 import logging
-from typing import Dict, List, Any, Tuple, Optional, Union
-from collections import defaultdict
+from typing import Dict, List, Any, Union
 
 class ConstantReconstructor:
     """
@@ -20,12 +19,11 @@ class ConstantReconstructor:
         """Extract string constants from various hiding patterns."""
         constants = {}
         
-        # Pattern 1: String.char concatenation
+        # Pattern 1: string.char concatenation
         char_pattern = r'string\.char\(([^)]+)\)'
         for match in re.finditer(char_pattern, content):
             try:
                 args = match.group(1)
-                # Extract numbers
                 numbers = re.findall(r'\d+', args)
                 if numbers:
                     chars = [chr(int(num)) for num in numbers if 0 <= int(num) <= 255]
@@ -34,19 +32,14 @@ class ConstantReconstructor:
             except (ValueError, OverflowError):
                 continue
         
-        # Pattern 2: Table concat with char codes
+        # Pattern 2: table.concat with string.char inside
         table_pattern = r'table\.concat\(\{([^}]+)\}\)'
         for match in re.finditer(table_pattern, content):
             try:
                 args = match.group(1)
-                # Look for string.char patterns inside
                 if 'string.char' in args:
-                    char_matches = re.findall(r'string\.char\((\d+)\```python
-                    chars = []
-                    for char_match in char_matches:
-                        char_code = int(char_match)
-                        if 0 <= char_code <= 255:
-                            chars.append(chr(char_code))
+                    char_matches = re.findall(r'string\.char\((\d+)\)', args)
+                    chars = [chr(int(c)) for c in char_matches if 0 <= int(c) <= 255]
                     if chars:
                         reconstructed = ''.join(chars)
                         constants[match.group(0)] = f'"{reconstructed}"'
@@ -54,11 +47,10 @@ class ConstantReconstructor:
                 continue
         
         # Pattern 3: Escaped string reconstruction
-        escape_pattern = r'(["\'])(?:\\x[0-9a-fA-F]{2}|\\[0-9]{1,3}|\\[nrtbfav\\])+\1'
+        escape_pattern = r'(["\'])(?:\\x[0-9a-fA-F]{2}|\\[0-7]{1,3}|\\[nrtbfav\\])+\1'
         for match in re.finditer(escape_pattern, content):
             try:
                 original = match.group(0)
-                # Decode escape sequences
                 decoded = original.encode().decode('unicode_escape')
                 if decoded != original:
                     constants[original] = decoded
@@ -82,17 +74,15 @@ class ConstantReconstructor:
         """Extract numeric constants from obfuscated patterns."""
         constants = {}
         
-        # Pattern 1: Mathematical expressions that resolve to constants
+        # Pattern 1: Simple mathematical expressions
         math_patterns = [
             r'(\d+)\s*[\+\-\*/]\s*(\d+)',
             r'math\.(floor|ceil|abs)\(([^)]+)\)',
             r'bit32\.(band|bor|bxor)\(([^)]+)\)'
         ]
-        
         for pattern in math_patterns:
             for match in re.finditer(pattern, content):
                 try:
-                    # Try to evaluate simple mathematical expressions
                     if '+' in match.group(0):
                         parts = match.group(0).split('+')
                         if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
@@ -122,15 +112,11 @@ class ConstantReconstructor:
         for match in re.finditer(table_pattern, content):
             table_name = match.group(1)
             table_content = match.group(2)
-            
-            # Parse table elements
             elements = []
             
-            # Handle string elements
             string_elements = re.findall(r'["\']([^"\']*)["\']', table_content)
             elements.extend(string_elements)
             
-            # Handle numeric elements
             numeric_elements = re.findall(r'(?<!["\'])\b(\d+(?:\.\d+)?)\b(?!["\'])', table_content)
             elements.extend([float(x) if '.' in x else int(x) for x in numeric_elements])
             
@@ -142,9 +128,8 @@ class ConstantReconstructor:
         for match in re.finditer(func_array_pattern, content):
             func_name = match.group(1)
             array_content = match.group(2)
-            
-            # Extract elements similar to table pattern
             elements = []
+            
             string_elements = re.findall(r'["\']([^"\']*)["\']', array_content)
             elements.extend(string_elements)
             
@@ -165,10 +150,8 @@ class ConstantReconstructor:
         for match in re.finditer(return_pattern, content):
             func_name = match.group(1)
             return_value = match.group(2).strip()
-            
-            # Try to parse the return value
             if return_value.startswith('"') and return_value.endswith('"'):
-                functions[func_name] = return_value[1:-1]  # Remove quotes
+                functions[func_name] = return_value[1:-1]
             elif return_value.isdigit():
                 functions[func_name] = int(return_value)
             elif return_value.replace('.', '').isdigit():
@@ -177,14 +160,11 @@ class ConstantReconstructor:
                 functions[func_name] = return_value
         
         # Pattern 2: String concatenation functions
-        concat_pattern = r'function\s+(\w+)\(\)\s*return\s+([^end]+)\s*end'
-        for match in re.finditer(concat_pattern, content):
+        concat_pattern = r'function\s+(\w+)\(\)\s*return\s+(.+?)\s*end'
+        for match in re.finditer(concat_pattern, content, re.DOTALL):
             func_name = match.group(1)
             func_body = match.group(2)
-            
-            # Look for string concatenation patterns
             if '..' in func_body:
-                # Try to reconstruct concatenated strings
                 parts = re.findall(r'["\']([^"\']*)["\']', func_body)
                 if len(parts) > 1:
                     concatenated = ''.join(parts)
@@ -197,8 +177,8 @@ class ConstantReconstructor:
         patterns = []
         
         # Pattern 1: Loop-based generation
-        loop_pattern = r'for\s+\w+\s*=\s*\d+,\s*\d+\s+do\s*([^end]+)\s*end'
-        for match in re.finditer(loop_pattern, content):
+        loop_pattern = r'for\s+\w+\s*=\s*\d+,\s*\d+\s+do\s*(.*?)\s*end'
+        for match in re.finditer(loop_pattern, content, re.DOTALL):
             loop_body = match.group(1)
             if 'string.char' in loop_body or 'table.insert' in loop_body:
                 patterns.append({
@@ -222,7 +202,6 @@ class ConstantReconstructor:
         """Perform comprehensive constant reconstruction."""
         self.logger.info("Starting constant reconstruction...")
         
-        # Extract different types of constants
         string_constants = self.extract_string_constants(content)
         numeric_constants = self.extract_numeric_constants(content)
         array_constants = self.reconstruct_array_constants(content)
