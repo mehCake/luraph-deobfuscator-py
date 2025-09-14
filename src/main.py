@@ -1,33 +1,27 @@
 #!/usr/bin/env python3
-"""
-Legacy main entry point - redirects to new run.py
-"""
+"""Command line interface for the Lua deobfuscator."""
 
-import sys
-import os
+import argparse
+from pathlib import Path
 
-# Determine the absolute path to run.py
-# This assumes run.py is in the parent directory of src/
-script_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(script_dir)
-run_path = os.path.join(parent_dir, "run.py")
+from .deobfuscator import LuaDeobfuscator
+from . import utils
 
-# Add the parent directory to sys.path so Python can import run
-sys.path.insert(0, parent_dir)
 
-def main():
-    """Redirect to new main entry point"""
-    try:
-        import run
-        if hasattr(run, "main"):
-            return run.main()
-        else:
-            print("Error: run.py does not have a 'main' function.")
-            return 1
-    except ImportError as e:
-        print(f"Error importing run.py: {e}")
-        print("Please use 'python run.py' instead of 'python src/main.py'")
-        return 1
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
+    parser.add_argument("file", help="input Lua file")
+    parser.add_argument("-o", "--output", help="output file path")
+    args = parser.parse_args(argv)
 
-if __name__ == "__main__":
-    sys.exit(main())
+    deob = LuaDeobfuscator()
+    result = deob.deobfuscate_file(args.file)
+    out_path = args.output or utils.create_output_path(args.file, suffix="_deob.lua")
+    utils.safe_write_file(out_path, result)
+    print(f"Deobfuscated output written to {out_path}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())
+

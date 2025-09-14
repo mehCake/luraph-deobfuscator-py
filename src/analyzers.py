@@ -6,6 +6,7 @@ import re
 from typing import Dict, List
 from collections import defaultdict, Counter
 import logging
+from .utils import safe_read_file
 
 
 class ObfuscationDetector:
@@ -199,6 +200,16 @@ class CodeStructureAnalyzer:
             if re.search(r'\b(end|until)\b', line):
                 current_depth = max(0, current_depth - 1)
         return max_depth
+
+
+def analyze_file(path: str) -> Dict[str, any]:
+    """Convenience wrapper to analyze a file on disk."""
+    content = safe_read_file(path)
+    if content is None:
+        return {}
+    detector = ObfuscationDetector()
+    return detector.analyze_code(content)
+
 
     def _analyze_dependencies(self, code: str) -> Dict[str, any]:
         requires = re.findall(r'require\s*\(\s*["\']([^"\']+)["\']', code)

@@ -1,7 +1,14 @@
 import os
 import logging
 from pathlib import Path
-from typing import Optional
+import base64
+import binascii
+import json
+import re
+import zlib
+from typing import Optional, List, Any
+
+from .vm import LuraphVM
 
 def setup_logging(level: int = logging.INFO) -> None:
     """Setup logging configuration"""
@@ -59,3 +66,205 @@ def safe_read_file(filepath: str, encoding: str = 'utf-8') -> Optional[str]:
     except Exception as e:
         logging.error(f"Failed to read file '{filepath}': {e}")
         return None
+
+# ---------------------------------------------------------------------------
+# Terminal helpers used by the interactive GUI
+# ---------------------------------------------------------------------------
+
+_COLOR_CODES = {
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+}
+
+
+def colorize_text(text: str, color: str, bold: bool = False) -> str:
+    """Return *text* wrapped in ANSI color codes."""
+    code = _COLOR_CODES.get(color, "0")
+    style = "1;" if bold else ""
+    return f"\033[{style}{code}m{text}\033[0m"
+
+
+def clear_screen() -> None:
+    """Clear the terminal screen."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def get_user_input(prompt: str) -> str:
+    """Wrapper around :func:`input` allowing easier testing."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+# ---------------------------------------------------------------------------
+# Simple decoding helpers used across the deobfuscator
+# ---------------------------------------------------------------------------
+
+
+def _is_printable(s: str) -> bool:
+    return all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in s)
+
+
+def decode_numeric_array(text: str) -> str:
+    pattern = re.compile(r"\{(\s*\d+(?:\s*,\s*\d+)*)\s*\}")
+
+    def repl(match: re.Match) -> str:
+        nums = [int(n.strip()) for n in match.group(1).split(',')]
+        try:
+            result = ''.join(chr(n) for n in nums)
+            if _is_printable(result):
+                return f'"{result}"'
+        except Exception:
+            pass
+        return match.group(0)
+
+    return pattern.sub(repl, text)
+
+
+def decode_base64_strings(text: str) -> str:
+    pattern = re.compile(r'"([A-Za-z0-9+/=]{8,})"')
+
+    def repl(match: re.Match) -> str:
+        s = match.group(1)
+        try:
+            decoded = base64.b64decode(s).decode('utf-8')
+            if _is_printable(decoded):
+                return f'"{decoded}"'
+        except Exception:
+            pass
+        return match.group(0)
+
+    return pattern.sub(repl, text)
+
+
+def decode_numeric_escapes(text: str) -> str:
+    pattern = re.compile(r'"((?:\\\d{1,3})+)"')
+
+    def repl(match: re.Match) -> str:
+        nums = re.findall(r'\\(\d{1,3})', match.group(1))
+        try:
+            decoded = ''.join(chr(int(n)) for n in nums)
+            if _is_printable(decoded):
+                return f'"{decoded}"'
+        except Exception:
+            pass
+        return match.group(0)
+
+    return pattern.sub(repl, text)
+
+
+def decode_simple_obfuscations(text: str) -> str:
+    """Apply all lightweight decoders to *text*."""
+    text = decode_numeric_array(text)
+    text = decode_base64_strings(text)
+    text = decode_numeric_escapes(text)
+    return text
+
+
+def extract_embedded_json(content: str) -> Optional[str]:
+    """Return the first JSON snippet found inside a Lua string.
+
+    Some obfuscators store JSON-encoded payloads inside Lua long strings or
+    quoted literals.  This helper scans the input for any string literal that
+    looks like JSON and verifies it with :func:`json.loads`.
+    """
+
+    # Search Lua long bracket strings [[...]] first as they can span multiple
+    # lines without escaping.  If that fails fall back to regular quoted
+    # strings.
+    patterns = [r"\[\[(.*?)\]\]", r'"(.*?)"', r"'(.*?)'"]
+    for pat in patterns:
+        for match in re.findall(pat, content, re.DOTALL):
+            candidate = match.strip()
+            if candidate.startswith("{") or candidate.startswith("["):
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except Exception:
+                    continue
+    return None
+
+
+def decode_json_format(content: str) -> Optional[str]:
+    """Decode Luraph JSON-based payloads if present."""
+    try:
+        data = json.loads(content)
+    except Exception:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    first = data[0]
+    if not (isinstance(first, list) and len(first) == 2):
+        return None
+    hex_key, stub = first
+    try:
+        key_bytes = binascii.unhexlify(hex_key)
+    except Exception:
+        return None
+
+    decoded_segments: List[str] = []
+    for seg in data[1:]:
+        if not isinstance(seg, str):
+            continue
+        try:
+            decoded = ''.join(chr(ord(ch) ^ key_bytes[i % len(key_bytes)]) for i, ch in enumerate(seg))
+            if _is_printable(decoded):
+                decoded_segments.append(decoded)
+            else:
+                decoded_segments.append(seg)
+        except Exception:
+            decoded_segments.append(seg)
+    return stub + ''.join(decoded_segments)
+
+
+def decode_superflow(content: str) -> Optional[str]:
+    """Decode ``superflow_bytecode_ext0`` blobs if present."""
+    match = re.search(r'superflow_bytecode_ext0\s*=\s*"([^"]+)"', content)
+    if not match:
+        return None
+    data = bytes(int(n) for n in re.findall(r'\\(\d{1,3})', match.group(1)))
+    for key in range(256):
+        xored = bytes(b ^ key for b in data)
+        try:
+            out = zlib.decompress(xored)
+            return out.decode('utf-8', errors='ignore')
+        except Exception:
+            continue
+    return None
+
+
+def decode_virtual_machine(content: str) -> Optional[str]:
+    """Execute a minimal stack-based VM description if present.
+
+    The function expects *content* to be a JSON object with two keys:
+    ``constants`` (a list of constant values) and ``bytecode`` (a list of
+    instructions).  Each instruction is itself a list whose first element is the
+    opcode name followed by zero or more integer arguments.  A small but growing
+    set of opcodes is supported by :class:`LuraphVM`, including arithmetic,
+    comparisons, table manipulation, branching and simple function calls via a
+    tiny global environment.
+    """
+
+    try:
+        data: Any = json.loads(content)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    constants = data.get("constants")
+    bytecode = data.get("bytecode")
+    if not isinstance(constants, list) or not isinstance(bytecode, list):
+        return None
+
+    vm = LuraphVM(constants, bytecode)
+    result = vm.run()
+    if isinstance(result, (str, int, float)):
+        result_str = str(result)
+        if _is_printable(result_str):
+            return result_str
+    return None

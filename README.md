@@ -1,80 +1,89 @@
-Advanced Lua Deobfuscator (Python)
+# Lua Deobfuscator
 
-Description:
-Advanced Lua Deobfuscator normalizes numbers, strings, and Luraph-specific obfuscation in Lua code. Supports both command-line and interactive mode.
+Utilities for decoding Lua scripts obfuscated with Luraph/Luarmor styles.  The
+project ships a small command line interface together with a handful of helper
+modules located under `src/`.  A tiny stack based virtual machine is included
+for experimenting with devirtualisation of custom bytecode formats.  It is not
+a full re‑implementation of Luraph's VM but provides a foundation for further
+work.
 
-Requirements
+## Installation
 
-Python 3.10+
+Clone the repository and (optionally) install the non-existent dependencies to
+mirror a typical workflow:
 
-Only standard library modules (no extra pip installs required)
-
-If building an EXE, make sure the pathlib backport is not installed, as it conflicts with PyInstaller.
-
-Installation
-
-Clone the repository:
-
-git clone C:\Users\mende\luraph-deobfuscator-py
+```bash
+git clone https://github.com/example/luraph-deobfuscator-py.git
 cd luraph-deobfuscator-py
+pip install -r requirements.txt
+```
 
+## Usage
 
-Optionally, create an EXE:
+Deobfuscate a file and write the result next to the input with a `_deob.lua`
+suffix:
 
-pip uninstall pathlib      # Remove incompatible backport if installed
-pyinstaller --onefile --name "LuaDeobfuscator" main.py
+```bash
+python main.py path/to/obfuscated.lua
+```
 
+Specify an explicit output path with `-o`:
 
-The EXE will be generated in dist/LuaDeobfuscator.exe.
+```bash
+python main.py examples/complex_obfuscated -o decoded.lua
+```
 
-Usage
-1. Command-Line Interface (CLI)
-python main.py --file obfuscated.lua --output deobfuscated.lua --verbose --method luraph --analyze
+The CLI is thin wrapper around `src.deobfuscator.LuaDeobfuscator` which can also
+be used directly from Python code.
 
+The deobfuscator can also recognise JSON payloads stored inside Lua long
+strings—commonly used by Luraph—to automatically extract and decode the hidden
+source.
 
-Arguments:
+### Virtual Machine input
 
-Option	Shortcut	Description
---file	-f	Path to input Lua file (required)
---output	-o	Output Lua file (default: _deobfuscated.lua)
---verbose	-v	Enable verbose logging
---analyze		Analyze only, do not modify the code
---method		Normalization method: default or luraph (default: default)
+`LuaDeobfuscator` understands a very small JSON format describing VM
+bytecode.  The structure is:
 
-Example:
+```json
+{
+  "constants": ["hello"],
+  "bytecode": [["LOADK", 0], ["RETURN"]]
+}
+```
 
-python main.py -f obfuscated.lua -o output.lua -v --method luraph
+Running the deobfuscator on such a file yields the constant `"hello"` by
+executing the bytecode on the bundled VM.
 
-2. Interactive Mode (EXE or Python)
+The VM currently understands only a tiny instruction set.  Supported opcodes
+include:
 
-If you run without --file, the program opens interactive prompts:
+- `LOADK`, `LOADN`, `LOADB/LOADBOOL`, `LOADNIL`, `MOVE`
+- `GETGLOBAL`, `SETGLOBAL`
+- arithmetic operations `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `POW`, `UNM` and `CONCAT`
+- comparison and logic `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `NOT`
+- bitwise ops `BAND`, `BOR`, `BXOR`, `BNOT`, `SHL`, `SHR`
+- table handling `NEWTABLE`, `SETTABLE`, `GETTABLE`, `LEN`
+- flow control `JMP`, `JMPIF`, `JMPIFNOT`, `FORPREP`, `FORLOOP`
+- function invocation via `CALL`
+- `RETURN`
 
-python main.py
+This list grows over time as devirtualisation support is expanded.
 
+## Examples
 
-or after building the EXE:
+The `examples/` directory contains sample obfuscated scripts used by the test
+suite.  Running the CLI on these files yields readable output containing markers
+such as `script_key` or `hello world`.
 
-dist\LuaDeobfuscator.exe
+## Development
 
+Run basic checks before committing:
 
-You’ll be prompted for:
+```bash
+python -m py_compile src/*.py
+pytest -q
+```
 
-Input Lua file path
+No external dependencies are required beyond the Python standard library.
 
-Output file path (optional)
-
-Normalization method (default / luraph)
-
-Analyze-only mode (y/N)
-
-Verbose logging (y/N)
-
-The program will keep running until you complete the prompts and generate the output.
-
-Notes
-
-EXE mode is ideal for interactive use since it prevents the program from closing immediately.
-
-CLI mode is recommended for automation and batch processing.
-
-Luraph-specific normalizations remove dummy functions and unnecessary empty string concatenations.
