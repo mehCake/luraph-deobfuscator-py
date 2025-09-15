@@ -5,7 +5,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 from . import utils
 from .deobfuscator import LuaDeobfuscator
@@ -36,6 +36,13 @@ def configure_logging(trace: bool) -> None:
 class WorkItem:
     source: Path
     destination: Path
+
+
+@dataclass
+class WorkResult:
+    item: WorkItem
+    success: bool
+    error: Optional[str] = None
 
 
 def _gather_inputs(target: Path) -> List[Path]:
@@ -70,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-iterations", type=int, default=1, help="run the pipeline up to N times")
     parser.add_argument("--version", help="override version detection with an explicit value")
     parser.add_argument("--trace", action="store_true", help="enable verbose VM tracing")
+    parser.add_argument("--jobs", type=int, default=1, help="process inputs in parallel using N workers")
     args = parser.parse_args(argv)
 
     configure_logging(args.trace)
@@ -91,26 +99,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.getLogger(__name__).error(str(exc))
         return 2
 
-    deob = LuaDeobfuscator()
-    exit_code = 0
+    jobs = max(1, args.jobs)
 
-    for item in work_items:
-        logging.getLogger(__name__).info("processing %s", item.source)
+    def _process(item: WorkItem) -> WorkResult:
+        log = logging.getLogger(__name__)
+        log.info("processing %s", item.source)
         content = utils.safe_read_file(str(item.source))
         if content is None:
-            logging.getLogger(__name__).error("unable to read %s", item.source)
-            exit_code = 1
-            continue
-        output_text = deob.deobfuscate_content(
-            content,
-            max_iterations=max(args.max_iterations, 1),
-            version_override=args.version,
-        )
+            return WorkResult(item, False, "unable to read input file")
+        deob = LuaDeobfuscator()
+        try:
+            output_text = deob.deobfuscate_content(
+                content,
+                max_iterations=max(args.max_iterations, 1),
+                version_override=args.version,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("error processing %s", item.source)
+            return WorkResult(item, False, str(exc))
         if not utils.safe_write_file(str(item.destination), output_text):
-            logging.getLogger(__name__).error("failed to write %s", item.destination)
+            return WorkResult(item, False, "failed to write output")
+        log.info("wrote %s", item.destination)
+        return WorkResult(item, True, None)
+
+    try:
+        results, duration = utils.run_parallel(work_items, _process, jobs=jobs)
+    except Exception:  # pragma: no cover - catastrophic failure
+        logging.getLogger(__name__).exception("unexpected error while processing inputs")
+        return 1
+
+    exit_code = 0
+    failures = 0
+    for result in results:
+        if not result.success:
             exit_code = 1
-            continue
-        logging.getLogger(__name__).info("wrote %s", item.destination)
+            failures += 1
+            if result.error:
+                logging.getLogger(__name__).error(
+                    "failed processing %s: %s", result.item.source, result.error
+                )
+            else:
+                logging.getLogger(__name__).error("failed processing %s", result.item.source)
+
+    logging.getLogger(__name__).info(
+        "processed %d file(s) in %.2fs with %d job(s)",
+        len(work_items),
+        duration,
+        jobs,
+    )
+    if failures:
+        logging.getLogger(__name__).warning("%d file(s) failed", failures)
 
     return exit_code
 

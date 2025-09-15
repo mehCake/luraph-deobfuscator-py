@@ -60,6 +60,8 @@ class LuaDeobfuscator:
         self._all_features = self._version_detector.all_features
         self._opcode_lifter = OpcodeLifter()
         self._formatter = utils.LuaFormatter()
+        self._vm_max_steps = 100_000
+        self._vm_timeout = 5.0
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(self, text: str) -> VersionInfo:
@@ -207,7 +209,12 @@ class LuaDeobfuscator:
                 metadata["devirtualized"] = True
                 return DeobResult(pseudo, metadata)
 
-        vm = LuraphVM(constants=vm_ir.constants, bytecode=vm_ir.bytecode)
+        vm = LuraphVM(
+            constants=vm_ir.constants,
+            bytecode=vm_ir.bytecode,
+            max_steps=self._vm_max_steps,
+            timeout=self._vm_timeout,
+        )
         if vm_ir.version:
             try:
                 handler = versions.get_handler(vm_ir.version)

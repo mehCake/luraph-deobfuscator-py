@@ -1,16 +1,21 @@
 import os
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import base64
 import binascii
 import json
 import re
 import zlib
-from typing import Optional, List, Any
+from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar
 
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
 from .passes import Devirtualizer
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 def setup_logging(level: int = logging.INFO) -> None:
     """Setup logging configuration"""
@@ -399,3 +404,83 @@ def decode_virtual_machine(content: Any, handler=None) -> Optional[str]:
         if _is_printable(result_str):
             return result_str
     return None
+
+
+def run_parallel(
+    items: Sequence[T],
+    worker: Callable[[T], R],
+    *,
+    jobs: int = 1,
+    timer: Callable[[], float] | None = None,
+) -> Tuple[List[R], float]:
+    """Process ``items`` with ``worker`` possibly using a thread pool.
+
+    Returns a tuple ``(results, duration)`` where *duration* is measured in
+    seconds using :func:`time.perf_counter` unless a custom ``timer`` callable is
+    provided.  Results are ordered to match the input sequence.  Exceptions raised
+    by ``worker`` propagate to the caller.
+    """
+
+    if not items:
+        return [], 0.0
+
+    timer = timer or time.perf_counter
+    start = timer()
+
+    if jobs <= 1 or len(items) == 1:
+        results = [worker(item) for item in items]
+        return results, timer() - start
+
+    completed: List[Tuple[int, R]] = []
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(worker, item): idx for idx, item in enumerate(items)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            completed.append((idx, future.result()))
+
+    completed.sort(key=lambda item: item[0])
+    results = [value for _, value in completed]
+    return results, timer() - start
+
+
+def benchmark_parallel(
+    items: Sequence[T],
+    worker: Callable[[T], R],
+    *,
+    jobs: int = 2,
+    timer: Callable[[], float] | None = None,
+) -> dict[str, float]:
+    """Benchmark ``worker`` sequentially and in parallel.
+
+    The function executes ``worker`` sequentially to obtain a baseline duration
+    and then re-executes it using :func:`run_parallel` with the requested number
+    of ``jobs``.  A :class:`RuntimeError` is raised when the parallel run takes
+    more than twice as long as the baseline, signalling a regression.  The
+    resulting dictionary contains ``sequential``, ``parallel`` and ``ratio``
+    timing information.
+    """
+
+    if jobs <= 1:
+        raise ValueError("jobs must be greater than 1 for benchmarking")
+
+    timer = timer or time.perf_counter
+
+    start = timer()
+    for item in items:
+        worker(item)
+    sequential = timer() - start
+
+    _, parallel = run_parallel(items, worker, jobs=jobs, timer=timer)
+
+    ratio = parallel / sequential if sequential > 0 else 0.0
+    if ratio > 2.0:
+        raise RuntimeError(
+            f"parallel execution slower than baseline (ratio {ratio:.2f})"
+        )
+
+    return {
+        "sequential": sequential,
+        "parallel": parallel,
+        "ratio": ratio,
+        "jobs": float(jobs),
+    }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Mapping
 
 from src.exceptions import VMEmulationError
@@ -25,6 +26,8 @@ class LuraphVM:
         env: Optional[Dict[str, Any]] = None,
         *,
         symbolic: bool = False,
+        max_steps: int = 50_000,
+        timeout: float | None = 5.0,
     ) -> None:
         """Create a new VM instance.
 
@@ -45,6 +48,10 @@ class LuraphVM:
         self.logger = logging.getLogger(__name__)
         self.dispatch = dict(OPCODE_HANDLERS)
         self._result: Any = None
+        self.max_steps = max(1, max_steps)
+        self.timeout = timeout if timeout is None or timeout > 0 else 0.0
+        self._step_count = 0
+        self._deadline: float | None = None
     def load_bytecode(self, payload: Any) -> None:
         """Parse *payload* and populate the VM state.
 
@@ -80,11 +87,21 @@ class LuraphVM:
         self.state.bytecode = bytecode
         self.state.pc = 0
         self.state.stack.clear()
+        self._result = None
+        self._step_count = 0
+        self._deadline = None
     def step(self) -> Optional[Any]:
         """Execute a single instruction and return a result if available."""
         state = self.state
         if state.pc >= len(state.bytecode):
             return None
+
+        if self.timeout is not None and self._deadline is not None:
+            if time.monotonic() >= self._deadline:
+                raise VMEmulationError("execution timed out")
+
+        if self._step_count >= self.max_steps:
+            raise VMEmulationError("execution exceeded step limit")
 
         instr = state.bytecode[state.pc]
         op = instr[0]
@@ -97,11 +114,18 @@ class LuraphVM:
 
         advance, result = handler(state, *args)
         state.pc += advance
+        self._step_count += 1
         if result is not None:
             self._result = result
         return result
     def run(self) -> Any:
         """Execute instructions until completion and return the last result."""
+        self._result = None
+        self._step_count = 0
+        start = time.monotonic()
+        self._deadline = (
+            start + self.timeout if self.timeout is not None else None
+        )
         while self.state.pc < len(self.state.bytecode):
             res = self.step()
             if res is not None:

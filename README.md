@@ -43,6 +43,7 @@ Key options:
 - `--max-iterations N` – rerun the pipeline up to *N* times until convergence
 - `--version V` – override version detection heuristics
 - `--trace` – enable opcode-level tracing written to `deobfuscator.log`
+- `--jobs N` – process inputs in parallel using up to *N* worker threads
 
 The `examples/` directory contains small samples that can be used for quick
 testing.  The CLI remains a thin wrapper around
@@ -128,6 +129,12 @@ IR and, when the CLI is invoked with ``--dump-cfg``, produces Graphviz DOT files
 for visual inspection.  Dead branches introduced by opaque predicates are pruned
 during this analysis.
 
+VM execution is protected by a configurable instruction budget (default
+50,000 steps) and an execution timeout (default five seconds) so adversarial
+payloads cannot hang the tool.  These limits apply both when the VM is invoked
+from the CLI and when helper utilities such as ``utils.decode_virtual_machine``
+run standalone payloads.
+
 ## Examples
 
 The `examples/` directory contains sample obfuscated scripts used by the test
@@ -160,6 +167,15 @@ pytest -q
 External dependencies such as `networkx` and `sympy` are used for control-flow
 analysis and symbolic simplification; install them with `pip install -r
 requirements.txt`.
+
+Additional regression suites focus on fuzzing and performance hardening:
+
+- `pytest -q tests/test_vm_fuzz.py` exercises random VM programs against a
+  reference interpreter to ensure opcode semantics remain stable.
+- `pytest -q tests/test_vm_limits.py tests/test_parallel.py` checks that
+  instruction limits, timeouts, and the parallel dispatcher behave correctly.
+- ``src.utils.benchmark_parallel`` compares sequential and parallel runs and
+  raises when the parallel pass exceeds twice the baseline duration.
 
 ### Contributing
 
