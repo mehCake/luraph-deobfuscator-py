@@ -35,6 +35,9 @@ Deobfuscate a file or directory and write the result next to the input with a
 ```bash
 python main.py path/to/obfuscated.lua
 python main.py examples/
+
+# run the full pipeline on the complex fixtures with tracing and four workers
+python main.py examples/complex_obfuscated --jobs 4 --max-iterations 3 --trace
 ```
 
 Key options:
@@ -142,7 +145,7 @@ suite.  Running the CLI on these files yields readable output containing markers
 such as `script_key` or `hello world`.  When ``--dump-cfg`` is supplied a
 companion ``.dot`` file is written next to the deobfuscated output.
 
-## Guardrails
+## Guarantees
 
 - **Offline only.**  The tool intentionally rejects `http://` and `https://`
   inputs so that all work happens on local files.  This makes automated testing
@@ -150,17 +153,65 @@ companion ``.dot`` file is written next to the deobfuscated output.
 - **Deterministic output.**  Helpers normalise whitespace and output paths, and
   the pass registry keeps a stable ordering so consecutive runs produce
   identical artefacts.
+- **Sandboxed VM execution.**  The bundled virtual machine enforces instruction
+  and wall-clock limits so malformed payloads cannot hang the process.
 - **Extensible by construction.**  Version-specific tweaks live in
   `src/versions/` and the pass registry makes it simple to insert or disable
   passes when experimenting with new Luraph variants.
+
+## Known limits
+
+- The VM focuses on Luraph v14.x semantics.  Exotic third-party opcode packs
+  may require additional handlers.
+- Reconstruction favours readability over byte-perfect reproduction; formatting
+  may differ from the original unobfuscated script.
+- Only local filesystem inputs are supported.  Remote URLs must be downloaded
+  manually before running the tool.
+
+## Adding support for new Luraph versions
+
+Version-specific behaviour is described declaratively in
+`src/versions/config.json`.  To onboard a new release:
+
+1. Create a module under `src/versions/` (for example `v14_3.py`) exporting a
+   `process(vm: LuraphVM) -> None` function to patch opcode handlers or apply
+   runtime bypasses.
+2. Extend `config.json` with a new entry under `"versions"` referencing the
+   module and mapping observed opcode identifiers.
+3. Capture detection heuristics (loader signatures, constant table hints,
+   prologue shapes) so `VersionDetector` can automatically select the new
+   handler.
+4. Add regression samples to `examples/` and golden outputs to `tests/golden/`,
+   then extend `tests/test_versions.py` so the new heuristics are covered.
+
+### `config.json` schema
+
+Each entry under `"versions"` provides:
+
+- `module` – the Python module name under `src/versions/` exposing `process`.
+- `opcode_map` – a mapping from canonical opcode names (`LOADK`, `CALL`, …) to
+  version-specific identifiers.  The devirtualizer uses this to lift bytecode
+  into the shared IR.
+- `heuristics` – structured hints used during detection.  Supported keys:
+  - `signatures`: regex strings matched against the raw source.
+  - `loaders`: regexes representing loader shapes.
+  - `upvalues`: markers for closure usage.
+  - `long_strings`: regexes used when scanning Lua long strings.
+  - `constants`: strings expected in decoded constant pools.
+  - `prologues`: regexes for instruction or function prologues.
+- `known_traps` – identifiers consumed by `trap_detector` to enable targeted
+  bypasses.
+
+`VersionDetector` scores heuristics and selects the best match.  Missing fields
+default to empty lists, so partial descriptors are accepted while iterating on
+new samples.
 
 ## Development
 
 Run basic checks before committing:
 
 ```bash
-python -m py_compile src/*.py
-python -m mypy src
+python -m py_compile $(git ls-files '*.py')
 pytest -q
 ```
 
