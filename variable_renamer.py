@@ -1,228 +1,511 @@
-import re
-import logging
-from typing import Dict, Set, List, Any
-from collections import defaultdict
+"""Scope-aware renaming heuristics for pseudo-Lua registers.
 
-# Setup basic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+The devirtualiser emits readable but still machine-oriented identifiers such
+as ``R0``/``R1`` for temporaries and ``UPVAL0`` for captured variables.  This
+module rewrites those placeholders into deterministic, human friendly names
+while respecting Lua scoping rules.  The implementation operates purely on the
+Lua source text so it can be used as a final pretty-printing pass without
+needing a full parser.
+
+Key design goals:
+
+* Stable output – running the renamer multiple times on the same source must
+  always yield identical names.
+* Shadowing safety – nested functions receive their own namespace so reused
+  registers do not collide with outer scopes.
+* Role aware naming – loop counters become ``idx``/``idx2``, length
+  temporaries become ``len``/``len2`` and generic ``for`` iterator variables
+  map to ``key``/``value`` pairs.  Function parameters follow the familiar
+  ``arg1``/``arg2`` pattern while upvalues turn into ``uv1``/``uv2``.
+
+The heuristics intentionally remain conservative; identifiers that do not
+match the recognised register patterns are left untouched.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from collections import defaultdict
+import logging
+import re
+from typing import Dict, List, Optional, Sequence, Set
+
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_CANDIDATE_RE = re.compile(r"\b(?:R|T|UPVAL)\d+\b")
+_NUMERIC_FOR_RE = re.compile(r"for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=")
+_GENERIC_FOR_RE = re.compile(
+    r"for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*,\s*([A-Za-z_][A-Za-z0-9_]*))?(?:\s*,\s*([A-Za-z_][A-Za-z0-9_]*))?\s+in"
+)
+_LENGTH_RE = re.compile(r"#\s*([A-Za-z_][A-Za-z0-9_]*)")
+_INDEX_RE = re.compile(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]")
+
+_HEADER_RE = re.compile(
+    r"function\s*(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*)(?:[:.][A-Za-z_][A-Za-z0-9_]*)?)?\s*\((?P<params>[^)]*)\)",
+    re.S,
 )
 
+
+LUA_KEYWORDS: Set[str] = {
+    "and",
+    "break",
+    "do",
+    "else",
+    "elseif",
+    "end",
+    "false",
+    "for",
+    "function",
+    "if",
+    "in",
+    "local",
+    "nil",
+    "not",
+    "or",
+    "repeat",
+    "return",
+    "then",
+    "true",
+    "until",
+    "while",
+}
+
+
+LUA_GLOBALS: Set[str] = {
+    "_G",
+    "assert",
+    "error",
+    "getmetatable",
+    "ipairs",
+    "load",
+    "loadstring",
+    "next",
+    "pairs",
+    "pcall",
+    "print",
+    "rawequal",
+    "rawget",
+    "rawset",
+    "require",
+    "select",
+    "setmetatable",
+    "tonumber",
+    "tostring",
+    "type",
+}
+
+
+def _register_name(index: int) -> str:
+    """Return an alphabetical identifier for ``index`` (0 → ``a``)."""
+
+    chars: List[str] = []
+    current = index
+    while True:
+        chars.append(chr(ord("a") + (current % 26)))
+        current //= 26
+        if current == 0:
+            break
+        current -= 1
+    return "".join(reversed(chars))
+
+
+@dataclass
+class HeaderInfo:
+    name: Optional[str]
+    params: List[str]
+    end: int
+
+
+@dataclass
+class FunctionSpan:
+    start: int
+    end: int
+    header: Optional[HeaderInfo]
+
+
+@dataclass
+class SymbolInfo:
+    parameter_positions: List[int]
+    tags: Set[str]
+
+    @classmethod
+    def empty(cls) -> "SymbolInfo":
+        return cls(parameter_positions=[], tags=set())
+
+
+@dataclass
+class ScopeState:
+    used_names: Set[str]
+    role_counters: Dict[str, int]
+    alpha_index: int = 0
+
+    @classmethod
+    def root(cls) -> "ScopeState":
+        return cls(set(), defaultdict(int), 0)
+
+    def child(self) -> "ScopeState":
+        return ScopeState(set(self.used_names), defaultdict(int), 0)
+
+
 class VariableRenamer:
-    """Provides heuristic variable renaming for obfuscated Lua code."""
+    """Rename pseudo registers while keeping the code semantically intact."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.logger = logging.getLogger(__name__)
-        self.variable_map: Dict[str, str] = {}
-        self.used_names: Set[str] = set()
-        self.context_hints: Dict[str, Any] = {}
+        self._reserved_words = set(LUA_KEYWORDS)
+        self._reserved_words.update(LUA_GLOBALS)
 
-        # Common variable name patterns
-        self.name_patterns = {
-            'loop_indices': ['i', 'j', 'k', 'index', 'idx'],
-            'counters': ['count', 'counter', 'num', 'n'],
-            'temporary': ['temp', 'tmp', 'val', 'value'],
-            'strings': ['str', 'string', 'text', 'msg'],
-            'tables': ['tbl', 'table', 'data', 'list'],
-            'functions': ['func', 'fn', 'callback', 'handler'],
-            'results': ['result', 'ret', 'output', 'res'],
-            'flags': ['flag', 'enabled', 'active', 'state'],
-            'lengths': ['len', 'length', 'size', 'count']
-        }
+    # -- Public API -----------------------------------------------------
+    def rename_variables(self, lua_src: str) -> str:
+        """Return ``lua_src`` with registers renamed to human friendly names."""
 
-        # Reserved Lua keywords to avoid
-        self.lua_keywords = {
-            'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
-            'function', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat',
-            'return', 'then', 'true', 'until', 'while'
-        }
+        state = ScopeState.root()
+        return self._rename_scope(lua_src, state, header=None)
 
-        # Common Lua globals to avoid
-        self.lua_globals = {
-            'print', 'type', 'pairs', 'ipairs', 'next', 'tostring', 'tonumber',
-            'string', 'table', 'math', 'io', 'os', 'debug', 'coroutine',
-            'package', 'require', 'load', 'loadstring', 'pcall', 'xpcall',
-            'error', 'assert', 'select', 'unpack', 'rawget', 'rawset',
-            'getmetatable', 'setmetatable', 'getfenv', 'setfenv'
-        }
+    # -- Recursive scope processing ------------------------------------
+    def _rename_scope(
+        self,
+        text: str,
+        state: ScopeState,
+        *,
+        header: Optional[HeaderInfo],
+    ) -> str:
+        children = self._direct_child_functions(text, skip_self=header is not None)
+        masked = self._mask_children(text, children)
+        self._seed_existing_names(state, masked)
+        mapping = self._build_mapping(masked, header, state)
 
-    def analyze_variable_usage(self, code: str) -> Dict[str, Any]:
-        """Analyze how variables are used to infer their purpose."""
-        analysis = defaultdict(lambda: {
-            'occurrences': 0,
-            'contexts': [],
-            'likely_type': 'unknown',
-            'scope': 'unknown'
-        })
+        if not children:
+            return self._replace_identifiers(text, mapping)
 
-        # Patterns for variable analysis
-        patterns = {
-            'local_declarations': r'local\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)',
-            'for_loops': r'for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=',
-            'for_pairs': r'for\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s+in',
-            'function_params': r'function\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(([^)]*)\)',
-            'assignments': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=',
-            'table_access': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\[',
-            'function_calls': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            'string_operations': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\.',
-            'numeric_operations': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*[+\-*/]',
-            'comparisons': r'([a-zA-Z_][a-zA-Z0-9_]*)\s*[<>=!~]',
-            'length_operations': r'#([a-zA-Z_][a-zA-Z0-9_]*)'
-        }
+        result: List[str] = []
+        cursor = 0
+        for child in children:
+            segment = text[cursor : child.start]
+            result.append(self._replace_identifiers(segment, mapping))
+            child_state = state.child()
+            child_text = text[child.start : child.end]
+            renamed_child = self._rename_scope(child_text, child_state, header=child.header)
+            result.append(renamed_child)
+            cursor = child.end
+        tail = text[cursor:]
+        result.append(self._replace_identifiers(tail, mapping))
+        return "".join(result)
 
-        for pattern_name, pattern in patterns.items():
-            matches = re.findall(pattern, code)
-            for match in matches:
-                if isinstance(match, tuple):
-                    variables = [v.strip() for v in match if v.strip()]
-                else:
-                    variables = [v.strip() for v in match.split(',') if v.strip()]
+    # -- Mapping creation ----------------------------------------------
+    def _build_mapping(
+        self,
+        text: str,
+        header: Optional[HeaderInfo],
+        state: ScopeState,
+    ) -> Dict[str, str]:
+        candidates = sorted({match.group(0) for match in _CANDIDATE_RE.finditer(text)}, key=self._sort_key)
+        if not candidates:
+            return {}
 
-                for var in variables:
-                    if var and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', var):
-                        analysis[var]['occurrences'] += 1
-                        analysis[var]['contexts'].append(pattern_name)
+        info = {name: SymbolInfo.empty() for name in candidates}
+        if header is not None:
+            if header.name and header.name in info:
+                info[header.name].tags.add("function")
+            for position, param in enumerate(header.params, start=1):
+                if param in info:
+                    details = info[param]
+                    details.parameter_positions.append(position)
+                    details.tags.add("parameter")
 
-        # Infer variable types
-        for var, info in analysis.items():
-            contexts = set(info['contexts'])
-            if 'for_loops' in contexts:
-                info['likely_type'] = 'loop_index'
-            elif 'length_operations' in contexts:
-                info['likely_type'] = 'table_or_string'
-            elif 'string_operations' in contexts:
-                info['likely_type'] = 'string'
-            elif 'numeric_operations' in contexts:
-                info['likely_type'] = 'number'
-            elif 'table_access' in contexts:
-                info['likely_type'] = 'table'
-            elif 'function_calls' in contexts:
-                info['likely_type'] = 'function'
-            elif 'comparisons' in contexts:
-                info['likely_type'] = 'comparable'
+        self._apply_role_heuristics(info, text)
 
-        return dict(analysis)
+        mapping: Dict[str, str] = {}
+        for candidate in candidates:
+            mapping[candidate] = self._assign_name(candidate, info.get(candidate), state)
+        return mapping
 
-    def generate_meaningful_name(self, old_name: str, var_info: Dict[str, Any]) -> str:
-        """Generate a meaningful name based on variable usage analysis."""
-        likely_type = var_info.get('likely_type', 'unknown')
-        contexts = var_info.get('contexts', [])
-        base_names: List[str] = []
+    def _apply_role_heuristics(self, info: Dict[str, SymbolInfo], text: str) -> None:
+        if not info:
+            return
 
-        if likely_type == 'loop_index':
-            base_names = self.name_patterns['loop_indices']
-        elif likely_type == 'string':
-            base_names = self.name_patterns['strings']
-        elif likely_type == 'table':
-            base_names = self.name_patterns['tables']
-        elif likely_type == 'function':
-            base_names = self.name_patterns['functions']
-        elif likely_type == 'number':
-            base_names = self.name_patterns['counters']
-        else:
-            if 'for_loops' in contexts or 'for_pairs' in contexts:
-                base_names = self.name_patterns['loop_indices']
-            elif 'function_params' in contexts:
-                base_names = ['param', 'arg', 'value']
-            else:
-                base_names = self.name_patterns['temporary']
+        for match in _NUMERIC_FOR_RE.finditer(text):
+            name = match.group(1)
+            if name in info:
+                info[name].tags.add("loop_index")
 
-        for base_name in base_names:
-            candidate = base_name
-            counter = 1
-            while (candidate in self.used_names or 
-                   candidate in self.lua_keywords or 
-                   candidate in self.lua_globals):
-                candidate = f"{base_name}{counter}"
-                counter += 1
-            self.used_names.add(candidate)
-            return candidate  # Return only after valid candidate found
+        for match in _GENERIC_FOR_RE.finditer(text):
+            groups = [g for g in match.groups() if g]
+            if not groups:
+                continue
+            first, *rest = groups
+            if first in info:
+                info[first].tags.add("key")
+            for name in rest:
+                if name in info:
+                    info[name].tags.add("value")
 
-        # Fallback
-        counter = 1
-        while f"var{counter}" in self.used_names:
-            counter += 1
-        candidate = f"var{counter}"
-        self.used_names.add(candidate)
+        for match in _LENGTH_RE.finditer(text):
+            name = match.group(1)
+            if name in info:
+                info[name].tags.add("length")
+
+        for match in _INDEX_RE.finditer(text):
+            name = match.group(1)
+            if name in info:
+                info[name].tags.add("key")
+
+    # -- Name allocation ------------------------------------------------
+    def _assign_name(self, name: str, details: Optional[SymbolInfo], state: ScopeState) -> str:
+        if name.startswith("UPVAL"):
+            return self._assign_upvalue(name, state)
+
+        info = details or SymbolInfo.empty()
+        if "parameter" in info.tags:
+            return self._assign_parameter(info, state)
+        if "loop_index" in info.tags:
+            return self._assign_role("idx", state, plain_first=True)
+        if "length" in info.tags:
+            return self._assign_role("len", state, plain_first=True)
+        if "key" in info.tags:
+            return self._assign_role("key", state, plain_first=True)
+        if "value" in info.tags:
+            return self._assign_role("value", state, plain_first=True)
+        return self._assign_register(state)
+
+    def _assign_upvalue(self, name: str, state: ScopeState) -> str:
+        try:
+            index = int(name[5:]) + 1
+        except ValueError:
+            index = len([n for n in state.used_names if n.startswith("uv")]) + 1
+        candidate = f"uv{index}"
+        suffix = 1
+        while candidate in state.used_names or candidate in self._reserved_words:
+            suffix += 1
+            candidate = f"uv{index}_{suffix}"
+        state.used_names.add(candidate)
         return candidate
 
-    def detect_obfuscated_variables(self, code: str) -> Set[str]:
-        """Detect variables that are likely obfuscated."""
-        obfuscated_vars: Set[str] = set()
-        var_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b'
-        all_vars = set(re.findall(var_pattern, code))
+    def _assign_parameter(self, info: SymbolInfo, state: ScopeState) -> str:
+        for position in sorted(set(info.parameter_positions)):
+            candidate = f"arg{position}"
+            if candidate not in state.used_names and candidate not in self._reserved_words:
+                state.used_names.add(candidate)
+                return candidate
+        return self._assign_role("arg", state, plain_first=False)
 
-        for var in all_vars:
-            if var in self.lua_keywords or var in self.lua_globals:
+    def _assign_role(
+        self,
+        base: str,
+        state: ScopeState,
+        *,
+        plain_first: bool,
+        start_index: int = 1,
+    ) -> str:
+        counter = state.role_counters.get(base, 0)
+        while True:
+            if plain_first and counter == 0:
+                candidate = base
+            else:
+                candidate = f"{base}{start_index + counter}"
+            if candidate not in state.used_names and candidate not in self._reserved_words:
+                state.role_counters[base] = counter + 1
+                state.used_names.add(candidate)
+                return candidate
+            counter += 1
+
+    def _assign_register(self, state: ScopeState) -> str:
+        while True:
+            candidate = _register_name(state.alpha_index)
+            state.alpha_index += 1
+            if candidate not in state.used_names and candidate not in self._reserved_words:
+                state.used_names.add(candidate)
+                return candidate
+
+    # -- Helpers --------------------------------------------------------
+    def _sort_key(self, name: str) -> Sequence[int | str]:
+        match = re.match(r"([A-Z]+)(\d+)", name)
+        if match:
+            prefix, number = match.groups()
+            prefix_order = {"UPVAL": 0, "R": 1, "T": 2}.get(prefix, 3)
+            return (prefix_order, int(number))
+        return (4, name)
+
+    def _seed_existing_names(self, state: ScopeState, text: str) -> None:
+        for match in _IDENTIFIER_RE.finditer(text):
+            identifier = match.group(0)
+            if _CANDIDATE_RE.fullmatch(identifier):
                 continue
-            is_obfuscated = (
-                (len(var) == 1 and var not in ['i', 'j', 'k', 'n', 'x', 'y', 'z']) or
-                (len(var) <= 3 and not any(word in var.lower() for word_list in self.name_patterns.values() for word in word_list)) or
-                (len([c for c in var if c.isupper()]) > len(var) // 2 and len(var) > 1) or
-                re.match(r'.*\d.*[a-zA-Z].*\d.*', var) or
-                var.count('_') > len(var) // 3 or
-                (len(var) > 10 and not any(common in var.lower() for common in ['function', 'table', 'string', 'value', 'data']))
-            )
-            if is_obfuscated:
-                obfuscated_vars.add(var)
+            if identifier in self._reserved_words:
+                continue
+            state.used_names.add(identifier)
 
-        self.logger.info(f"Detected {len(obfuscated_vars)} likely obfuscated variables")
-        return obfuscated_vars
+    def _replace_identifiers(self, text: str, mapping: Dict[str, str]) -> str:
+        if not mapping:
+            return text
 
-    def rename_variables(self, code: str, custom_mapping: Dict[str, str] = None) -> str:
-        """Rename obfuscated variables with meaningful names."""
-        self.logger.info("Starting heuristic variable renaming...")
-        if custom_mapping:
-            self.variable_map.update(custom_mapping)
-            self.used_names.update(custom_mapping.values())
-
-        var_analysis = self.analyze_variable_usage(code)
-        obfuscated_vars = self.detect_obfuscated_variables(code)
-
-        for var in obfuscated_vars:
-            if var not in self.variable_map:
-                var_info = var_analysis.get(var, {})
-                new_name = self.generate_meaningful_name(var, var_info)
-                self.variable_map[var] = new_name
-
-        renamed_code = code
-        sorted_vars = sorted(self.variable_map.items(), key=lambda x: len(x[0]), reverse=True)
-
-        for old_name, new_name in sorted_vars:
-            pattern = r'\b' + re.escape(old_name) + r'\b'
-            renamed_code = re.sub(pattern, new_name, renamed_code)
-
-        self.logger.info(f"Renamed {len(self.variable_map)} variables")
-        return renamed_code
-
-    def create_renaming_report(self) -> str:
-        """Create a report of variable renamings performed."""
-        if not self.variable_map:
-            return "No variables were renamed."
-
-        report = "Variable Renaming Report:\n" + "=" * 50 + "\n\n"
-        by_type = defaultdict(list)
-
-        for old_name, new_name in self.variable_map.items():
-            var_type = 'other'
-            for type_name, names in self.name_patterns.items():
-                if any(name in new_name for name in names):
-                    var_type = type_name
+        result: List[str] = []
+        i = 0
+        length = len(text)
+        while i < length:
+            if text.startswith("--", i):
+                if text.startswith("--[[", i) or text.startswith("--[=", i):
+                    end = self._skip_long_bracket(text, i + 2)
+                    result.append(text[i:end])
+                    i = end
+                    continue
+                newline = text.find("\n", i)
+                if newline == -1:
+                    result.append(text[i:])
                     break
-            by_type[var_type].append((old_name, new_name))
+                result.append(text[i:newline + 1])
+                i = newline + 1
+                continue
+            if text[i] in {'"', '\''}:
+                end = self._skip_short_string(text, i)
+                result.append(text[i:end])
+                i = end
+                continue
+            if text.startswith("[[", i) or text.startswith("[=", i):
+                end = self._skip_long_bracket(text, i)
+                result.append(text[i:end])
+                i = end
+                continue
+            match = _IDENTIFIER_RE.match(text, i)
+            if match:
+                identifier = match.group(0)
+                replacement = mapping.get(identifier)
+                result.append(replacement or identifier)
+                i = match.end()
+            else:
+                result.append(text[i])
+                i += 1
+        return "".join(result)
 
-        for var_type, renames in by_type.items():
-            if renames:
-                report += f"{var_type.replace('_', ' ').title()}:\n"
-                for old_name, new_name in sorted(renames):
-                    report += f"  {old_name} -> {new_name}\n"
-                report += "\n"
+    def _direct_child_functions(self, text: str, *, skip_self: bool) -> List[FunctionSpan]:
+        spans = sorted(self._scan_functions(text), key=lambda span: span.start)
+        direct: List[FunctionSpan] = []
+        for span in spans:
+            if skip_self and span.start == 0:
+                skip_self = False
+                continue
+            if direct and span.start < direct[-1].end:
+                continue
+            direct.append(span)
+        return direct
 
-        return report
+    def _mask_children(self, text: str, children: Sequence[FunctionSpan]) -> str:
+        if not children:
+            return text
+        pieces: List[str] = []
+        cursor = 0
+        for child in children:
+            pieces.append(text[cursor:child.start])
+            pieces.append(" " * (child.end - child.start))
+            cursor = child.end
+        pieces.append(text[cursor:])
+        return "".join(pieces)
 
-    def reset(self):
-        """Reset the renamer state for a new analysis."""
-        self.variable_map.clear()
-        self.used_names.clear()
-        self.context_hints.clear()
+    # -- Token scanning -------------------------------------------------
+    def _scan_functions(self, text: str) -> List[FunctionSpan]:
+        spans: List[FunctionSpan] = []
+        stack: List[Dict[str, object]] = []
+        i = 0
+        length = len(text)
+        while i < length:
+            if text.startswith("--", i):
+                if text.startswith("--[[", i) or text.startswith("--[=", i):
+                    i = self._skip_long_bracket(text, i + 2)
+                else:
+                    newline = text.find("\n", i)
+                    i = length if newline == -1 else newline + 1
+                continue
+            ch = text[i]
+            if ch in {'"', '\''}:
+                i = self._skip_short_string(text, i)
+                continue
+            if text.startswith("[[", i) or text.startswith("[=", i):
+                i = self._skip_long_bracket(text, i)
+                continue
+            if ch.isalpha() or ch == "_":
+                j = i + 1
+                while j < length and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                word = text[i:j]
+                if word == "function":
+                    header = self._parse_header(text, i)
+                    stack.append(
+                        {
+                            "kind": "function",
+                            "start": i,
+                            "header": header,
+                        }
+                    )
+                elif word in {"do", "then"}:
+                    stack.append({"kind": word})
+                elif word == "repeat":
+                    stack.append({"kind": word})
+                elif word == "end":
+                    while stack:
+                        block = stack.pop()
+                        kind = block["kind"]
+                        if kind == "function":
+                            header = block.get("header")
+                            spans.append(
+                                FunctionSpan(
+                                    start=block["start"],
+                                    end=j,
+                                    header=header,
+                                )
+                            )
+                            break
+                        if kind in {"do", "then"}:
+                            break
+                elif word == "until":
+                    while stack:
+                        block = stack.pop()
+                        if block["kind"] == "repeat":
+                            break
+                i = j
+                continue
+            i += 1
+        spans.sort(key=lambda span: span.start)
+        return spans
+
+    def _parse_header(self, text: str, start: int) -> Optional[HeaderInfo]:
+        match = _HEADER_RE.match(text, start)
+        if not match:
+            return None
+        raw_params = match.group("params") or ""
+        params = [param.strip() for param in raw_params.split(",") if param.strip()]
+        name = match.group("name") or None
+        return HeaderInfo(name=name, params=params, end=match.end())
+
+    def _skip_short_string(self, text: str, start: int) -> int:
+        quote = text[start]
+        i = start + 1
+        length = len(text)
+        while i < length:
+            ch = text[i]
+            if ch == "\\" and i + 1 < length:
+                i += 2
+                continue
+            if ch == quote:
+                return i + 1
+            i += 1
+        return length
+
+    def _skip_long_bracket(self, text: str, start: int) -> int:
+        # Support [=[ ... ]=] style long strings/comments.
+        equals = 0
+        i = start + 1
+        length = len(text)
+        while i < length and text[i] == "=":
+            equals += 1
+            i += 1
+        if i >= length or text[i] != "[":
+            return start + 1
+        closing = "]" + "=" * equals + "]"
+        end = text.find(closing, i + 1)
+        return length if end == -1 else end + len(closing)
+
+    # -- End helpers ----------------------------------------------------
+
+
+__all__ = ["VariableRenamer"]
+

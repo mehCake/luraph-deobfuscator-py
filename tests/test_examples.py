@@ -1,0 +1,41 @@
+from pathlib import Path
+
+from pathlib import Path
+
+from constant_reconstructor import ConstantReconstructor
+from src.deobfuscator import LuaDeobfuscator
+from utils import normalize_whitespace
+
+
+def deobfuscate(path: str) -> str:
+    return LuaDeobfuscator().deobfuscate_file(path)
+
+
+def golden(path: str) -> str:
+    name = Path(path).name
+    return Path("tests/golden") / f"{name}.out"
+
+
+def test_example_obfuscated_matches_golden(tmp_path):
+    out = deobfuscate("example_obfuscated.lua")
+    expected = golden("example_obfuscated.lua").read_text()
+    assert out == expected
+
+
+def test_json_wrapped_matches_golden(tmp_path):
+    out = deobfuscate("examples/json_wrapped.lua")
+    expected = golden("json_wrapped.lua").read_text()
+    assert out == expected
+
+
+def test_complex_example_matches_golden(tmp_path):
+    out = deobfuscate("examples/complex_obfuscated")
+    expected = golden("complex_obfuscated").read_text()
+    assert normalize_whitespace(out) == normalize_whitespace(expected)
+
+
+def test_complex_fixture_dynamic_calls_are_reconstructed():
+    content = Path("examples/complex_obfuscated").read_text(encoding="utf-8", errors="ignore")
+    recon = ConstantReconstructor()
+    result = recon.reconstruct(content, None)
+    assert result["constants"]["replacements"]
