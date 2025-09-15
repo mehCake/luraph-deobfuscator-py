@@ -1,7 +1,35 @@
-import re
+"""Pattern and control‑flow analysis helpers.
+
+This module originally focused on opcode frequency analysis.  It now grows a
+light‑weight control–flow graph (CFG) builder used during devirtualisation to
+recover high level structures from the intermediate representation (IR)."""
+
+from __future__ import annotations
+
 import logging
-from typing import Dict, List, Tuple, Optional, Set
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
 from collections import defaultdict, Counter
+
+
+@dataclass
+class IRInstruction:
+    """Simple representation of a single IR instruction."""
+
+    index: int
+    opcode: str
+    args: List[str]
+
+
+@dataclass
+class CFG:
+    """Control‑flow graph structure used for reconstruction and dumping."""
+
+    nodes: Dict[int, IRInstruction]
+    edges: Dict[int, Set[int]]
 
 class PatternAnalyzer:
     """
@@ -297,3 +325,90 @@ class PatternAnalyzer:
                 'encryption_patterns': len(encryption_patterns)
             }
         }
+
+    # ------------------------------------------------------------------
+    # Control flow graph utilities
+    # ------------------------------------------------------------------
+    def parse_ir(self, code: str) -> List[IRInstruction]:
+        """Parse a simple IR listing into :class:`IRInstruction` objects."""
+        instructions: List[IRInstruction] = []
+        for idx, line in enumerate(code.splitlines()):
+            match = re.match(r"\s*(\w+)(?:\s+(.*))?", line)
+            if not match:
+                continue
+            opcode = match.group(1).upper()
+            arg_str = match.group(2) or ""
+            args = [a.strip() for a in arg_str.split() if a.strip()]
+            instructions.append(IRInstruction(idx, opcode, args))
+        return instructions
+
+    def build_cfg(self, instructions: Iterable[IRInstruction]) -> CFG:
+        """Build a CFG from a sequence of IR instructions."""
+        nodes = {ins.index: ins for ins in instructions}
+        edges: Dict[int, Set[int]] = defaultdict(set)
+        branch_ops = {"JMP", "EQ", "LT", "LE", "TEST", "TESTSET"}
+        max_index = max(nodes) if nodes else -1
+
+        for ins in instructions:
+            next_idx = ins.index + 1
+            if ins.opcode == "JMP" and ins.args:
+                edges[ins.index].add(int(ins.args[0]))
+            elif ins.opcode in branch_ops and ins.args:
+                edges[ins.index].add(int(ins.args[-1]))
+                if next_idx <= max_index:
+                    edges[ins.index].add(next_idx)
+            else:
+                if next_idx <= max_index:
+                    edges[ins.index].add(next_idx)
+
+        return CFG(nodes, edges)
+
+    def remove_dead_code(self, cfg: CFG) -> CFG:
+        """Return a copy of ``cfg`` with unreachable nodes removed."""
+        visited: Set[int] = set()
+        stack = [0]
+        while stack:
+            idx = stack.pop()
+            if idx in visited or idx not in cfg.nodes:
+                continue
+            visited.add(idx)
+            stack.extend(cfg.edges.get(idx, []))
+
+        nodes = {i: n for i, n in cfg.nodes.items() if i in visited}
+        edges = {i: {t for t in cfg.edges.get(i, set()) if t in visited} for i in visited}
+        return CFG(nodes, edges)
+
+    def reconstruct_structures(self, cfg: CFG) -> str:
+        """Reconstruct pseudo-Lua control structures from a CFG."""
+        lines: List[str] = []
+        for idx in sorted(cfg.nodes):
+            ins = cfg.nodes[idx]
+            if ins.opcode == "FORPREP":
+                lines.append("for ... do")
+            elif ins.opcode == "FORLOOP":
+                lines.append("end")
+            elif ins.opcode in {"JMP", "EQ", "LT", "LE", "TEST", "TESTSET"}:
+                lines.append(f"-- {ins.opcode} {' '.join(ins.args)}")
+            else:
+                lines.append(f"-- {ins.opcode}")
+        return "\n".join(lines)
+
+    def dump_cfg(self, cfg: CFG, path: Path) -> None:
+        """Write ``cfg`` to ``path`` in Graphviz DOT format."""
+        with path.open("w", encoding="utf8") as fh:
+            fh.write("digraph CFG {\n")
+            for idx, node in cfg.nodes.items():
+                label = f"{idx}: {node.opcode}"
+                fh.write(f"  n{idx} [label=\"{label}\"];\n")
+            for src, targets in cfg.edges.items():
+                for dst in targets:
+                    fh.write(f"  n{src} -> n{dst};\n")
+            fh.write("}\n")
+
+    def analyze_ir(self, code: str) -> Tuple[CFG, str]:
+        """Convenience wrapper to parse, clean and reconstruct IR."""
+        ir = self.parse_ir(code)
+        cfg = self.build_cfg(ir)
+        cfg = self.remove_dead_code(cfg)
+        pseudo = self.reconstruct_structures(cfg)
+        return cfg, pseudo
