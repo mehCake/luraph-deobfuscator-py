@@ -10,6 +10,7 @@ from typing import Optional, List, Any
 
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
+from .passes import Devirtualizer
 
 def setup_logging(level: int = logging.INFO) -> None:
     """Setup logging configuration"""
@@ -276,4 +277,6 @@ def decode_virtual_machine(content: str) -> Optional[str]:
         result_str = str(result)
         if _is_printable(result_str):
             return result_str
-    return None
+    devirt = Devirtualizer(vm)
+    code = devirt.devirtualize()
+    return code if code else None

@@ -1,3 +1,4 @@
 # Advanced Lua Deobfuscator
-# This project uses only Python standard library modules
-# No additional dependencies required
+# Third party dependencies used for analysis helpers
+networkx
+sympy
