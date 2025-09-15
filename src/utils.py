@@ -1,18 +1,19 @@
 import os
-import logging
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 import base64
 import binascii
 import json
+import logging
 import re
+import time
 import zlib
-from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
-from .vm import LuraphVM
 from .exceptions import VMEmulationError
 from .passes import Devirtualizer
+from .vm import LuraphVM
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -37,13 +38,13 @@ def validate_file(filepath: str) -> bool:
         logging.error(f"Error validating file '{filepath}': {e}")
         return False
 
-def create_output_path(input_path: str, suffix: str = "_deobfuscated") -> str:
-    """Create output path based on input path"""
+def create_output_path(input_path: str, suffix: str = "_deob.lua") -> str:
+    """Return a deterministic output path next to ``input_path``."""
+
     path = Path(input_path)
-    parent = path.parent
-    new_name = path.stem + suffix + path.suffix
-    output_path = str(parent / new_name)
-    logging.debug(f"Created output path '{output_path}' from input '{input_path}'")
+    new_name = path.stem + suffix
+    output_path = str(path.with_name(new_name))
+    logging.debug("Created output path '%s' from input '%s'", output_path, input_path)
     return output_path
 
 def safe_write_file(filepath: str, content: str, encoding: str = 'utf-8') -> bool:
@@ -484,3 +485,48 @@ def benchmark_parallel(
         "ratio": ratio,
         "jobs": float(jobs),
     }
+
+
+def serialise_metadata(value: Any) -> Any:
+    """Return a JSON-serialisable representation of ``value``."""
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+            if _is_printable(decoded):
+                return decoded
+        except Exception:
+            return value.hex()
+    if isinstance(value, (list, tuple, set)):
+        return [serialise_metadata(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): serialise_metadata(item) for key, item in value.items()}
+    if is_dataclass(value):
+        return {str(key): serialise_metadata(item) for key, item in asdict(value).items()}
+    return repr(value)
+
+
+def summarise_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a serialisable summary of ``metadata`` suitable for JSON dumps."""
+
+    return {str(key): serialise_metadata(value) for key, value in metadata.items()}
+
+
+def format_pass_summary(results: Sequence[Tuple[str, float]]) -> str:
+    """Format ``results`` as a small table for console output."""
+
+    if not results:
+        return ""
+    name_width = max(len(name) for name, _ in results)
+    lines = [f"{'Pass'.ljust(name_width)}  Duration"]
+    for name, duration in results:
+        lines.append(f"{name.ljust(name_width)}  {duration:.3f}s")
+    return "\n".join(lines)
+
+
+def ensure_directory(path: Path) -> None:
+    """Create *path* if it does not exist."""
+
+    path.mkdir(parents=True, exist_ok=True)

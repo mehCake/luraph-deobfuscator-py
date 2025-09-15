@@ -28,25 +28,57 @@ pip install -r requirements.txt  # installs networkx, sympy, and test tools
 
 ## Usage
 
-Deobfuscate a file or directory and write the result next to the input with a
-`_deob.lua` suffix.  The CLI now focuses on the staged pipeline exposed by
-`src.deobfuscator` and keeps only a handful of flags for convenience.
+The modern CLI drives the pass-based pipeline and emits a timing summary for
+every processed file.  Inputs can be provided either positionally or with the
+`--in` flag.  Outputs default to `<name>_deob.lua` (or `.json` when
+`--format json` is requested).
 
 ```bash
+# basic invocation with positional argument
 python main.py path/to/obfuscated.lua
-python main.py examples/
 
-# run the full pipeline on the complex fixtures with tracing and four workers
-python main.py examples/complex_obfuscated --jobs 4 --max-iterations 3 --trace
+# explicitly select JSON output and request per-pass artefacts
+python main.py --in examples/json_wrapped.lua --format json --write-artifacts artefacts/
+
+# run the complex sample with multiple workers and iteration fixpoint
+python main.py examples/complex_obfuscated --jobs 4 --max-iterations 3 --profile
 ```
 
-Key options:
+Frequently used flags:
 
-- `-o/--output` – explicit output file (only valid with a single input file)
-- `--max-iterations N` – rerun the pipeline up to *N* times until convergence
-- `--version V` – override version detection heuristics
-- `--trace` – enable opcode-level tracing written to `deobfuscator.log`
-- `--jobs N` – process inputs in parallel using up to *N* worker threads
+| Flag | Description |
+| --- | --- |
+| `-o/--out/--output` | Explicit output path (only valid for a single input file) |
+| `--format {lua,json}` | Choose Lua source or a JSON metadata bundle |
+| `--max-iterations N` | Re-run the pipeline until convergence or the limit is reached |
+| `--skip-passes` / `--only-passes` | Comma separated pass names to disable or exclusively enable |
+| `--profile` | Print a timing table for the executed passes |
+| `--verbose` | Enable colourised console logging alongside `deobfuscator.log` |
+| `--vm-trace`/`--trace` | Capture VM instruction traces when the simulator runs |
+| `--detect-only` | Stop after version detection and emit a textual report |
+| `--write-artifacts DIR` | Persist per-pass Lua/JSON artefacts for inspection |
+| `--jobs N` | Process inputs in parallel using up to `N` worker threads |
+
+Every execution prints a compact summary similar to:
+
+```
+== examples/json_wrapped.lua ==
+Version: v14.1
+Pass            Duration
+detect          0.004s
+preprocess      0.001s
+payload_decode  0.013s
+vm_lift         0.000s
+vm_devirtualize 0.021s
+cleanup         0.002s
+render          0.005s
+```
+
+JSON mode (`--format json`) writes the rendered Lua alongside pass metadata,
+detected version details, and the per-pass timing information shown above.
+Supplying `--write-artifacts DIR` produces files such as `preprocess.lua` or
+`vm_devirtualize.lua` for each processed input, which greatly simplifies
+debugging new samples.
 
 The `examples/` directory contains small samples that can be used for quick
 testing.  The CLI remains a thin wrapper around

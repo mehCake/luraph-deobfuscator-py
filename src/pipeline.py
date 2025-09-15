@@ -1,30 +1,75 @@
-"""Simple pass registry and runner used by the CLI."""
+"""Pass-based orchestration for the deobfuscation pipeline."""
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-import time
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from version_detector import VersionInfo
 
 from . import utils
-from .deobfuscator import LuaDeobfuscator
+from .deobfuscator import LuaDeobfuscator, VMIR
+
+LOG = logging.getLogger(__name__)
 
 PassFn = Callable[["Context"], None]
 
 
 @dataclass
 class Context:
-    input_path: str
+    """Shared state threaded through individual pipeline passes."""
+
+    input_path: Path
     raw_input: str = ""
-    decoded_payloads: List[str] = field(default_factory=list)
-    detected_version: Optional[str] = None
-    string_table: Dict[str, str] = field(default_factory=dict)
-    ir: Any = None
-    ast: Any = None
+    stage_output: str = ""
     output: str = ""
-    logs: List[str] = field(default_factory=list)
+    detected_version: VersionInfo | None = None
+    version_override: str | None = None
+    vm_ir: VMIR | None = None
+    decoded_payloads: List[str] = field(default_factory=list)
+    pass_metadata: Dict[str, Any] = field(default_factory=dict)
     artifacts: Optional[Path] = None
+    deobfuscator: LuaDeobfuscator | None = None
+    iteration: int = 0
+    options: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.deobfuscator is None:
+            self.deobfuscator = LuaDeobfuscator()
+        if not self.stage_output and self.raw_input:
+            self.stage_output = self.raw_input
+        if self.artifacts:
+            utils.ensure_directory(self.artifacts)
+
+    # ------------------------------------------------------------------
+    def ensure_raw_input(self) -> None:
+        if self.raw_input:
+            return
+        data = utils.safe_read_file(str(self.input_path))
+        self.raw_input = data or ""
+        self.stage_output = self.raw_input
+
+    def record_metadata(self, name: str, metadata: Dict[str, Any]) -> None:
+        summary = utils.summarise_metadata(metadata)
+        self.pass_metadata[name] = summary
+        if self.artifacts:
+            utils.ensure_directory(self.artifacts)
+            meta_path = self.artifacts / f"{name}.json"
+            meta_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+    def write_artifact(self, name: str, content: str, *, extension: str = ".lua") -> None:
+        if not self.artifacts:
+            return
+        if content is None or content == "":
+            return
+        utils.ensure_directory(self.artifacts)
+        safe_name = name.replace(" ", "_")
+        path = self.artifacts / f"{safe_name}{extension}"
+        path.write_text(content, encoding="utf-8")
 
 
 class PassRegistry:
@@ -34,7 +79,6 @@ class PassRegistry:
     def register_pass(self, name: str, fn: PassFn, order: int) -> None:
         self._passes[name] = (order, fn)
 
-    # core runner
     def run_passes(
         self,
         ctx: Context,
@@ -43,58 +87,184 @@ class PassRegistry:
         profile: bool = False,
     ) -> List[Tuple[str, float]]:
         selected: List[Tuple[int, str, PassFn]] = []
+        skip_set = {name.strip() for name in (skip or []) if name}
+        only_set = {name.strip() for name in (only or []) if name}
+
         for name, (order, fn) in self._passes.items():
-            if skip and name in skip:
+            if skip_set and name in skip_set:
                 continue
-            if only and name not in only:
+            if only_set and name not in only_set:
                 continue
             selected.append((order, name, fn))
         selected.sort()
-        results: List[Tuple[str, float]] = []
-        if ctx.artifacts:
-            Path(ctx.artifacts).mkdir(parents=True, exist_ok=True)
+
+        timings: List[Tuple[str, float]] = []
         for _, name, fn in selected:
-            start = time.time()
+            start = time.perf_counter()
             fn(ctx)
-            duration = time.time() - start
-            results.append((name, duration))
-            if ctx.artifacts:
-                log_path = Path(ctx.artifacts) / f"{name}.log"
-                with log_path.open("w", encoding="utf8") as fh:
-                    fh.write(f"{name} completed in {duration:.3f}s\n")
-        return results
+            duration = time.perf_counter() - start
+            timings.append((name, duration))
+            LOG.debug("pass %s completed in %.3fs", name, duration)
+        return timings
 
 
 PIPELINE = PassRegistry()
 
 
 # ---------------------------------------------------------------------------
-# Default pass implementations
+# Pass implementations
 
 
 def _pass_detect(ctx: Context) -> None:
-    ctx.raw_input = utils.safe_read_file(ctx.input_path) or ""
-    deob = LuaDeobfuscator()
-    ctx.detected_version = deob.detect_version(ctx.raw_input)
+    ctx.ensure_raw_input()
+    deob = ctx.deobfuscator
+    assert deob is not None
+
+    if ctx.version_override:
+        version = deob._resolve_version(ctx.raw_input, ctx.version_override)  # type: ignore[attr-defined]
+    else:
+        version = deob.detect_version(ctx.raw_input)
+    ctx.detected_version = version
+
+    metadata: Dict[str, Any] = {
+        "name": version.name,
+        "major": version.major,
+        "minor": version.minor,
+        "confidence": version.confidence,
+        "features": sorted(version.features) if version.features else [],
+    }
+    if version.matched_categories:
+        metadata["matched_categories"] = list(version.matched_categories)
+    ctx.record_metadata("detect", metadata)
+    if ctx.iteration == 0:
+        ctx.write_artifact("raw_input", ctx.raw_input)
 
 
-def _pass_decode(ctx: Context) -> None:
-    if not ctx.raw_input:
+def _pass_preprocess(ctx: Context) -> None:
+    deob = ctx.deobfuscator
+    assert deob is not None
+    text = ctx.stage_output or ctx.raw_input
+    if not text:
+        ctx.record_metadata("preprocess", {"empty": True})
         return
-    deob = LuaDeobfuscator()
-    ctx.output = deob.deobfuscate_content(ctx.raw_input)
+    processed = deob.preprocess(text)
+    ctx.stage_output = processed
+    ctx.record_metadata(
+        "preprocess",
+        {
+            "input_length": len(text),
+            "output_length": len(processed),
+            "changed": processed != text,
+        },
+    )
+    ctx.write_artifact("preprocess", processed)
 
 
-def _pass_format(ctx: Context) -> None:
-    # Placeholder hook for future pretty-printing.  For now it simply ensures
-    # the output is a string.
-    if ctx.output is None:
-        ctx.output = ""
+def _pass_payload_decode(ctx: Context) -> None:
+    deob = ctx.deobfuscator
+    assert deob is not None
+    text = ctx.stage_output or ctx.raw_input
+    if not text:
+        ctx.record_metadata("payload_decode", {"empty": True})
+        return
+
+    version = ctx.detected_version or deob.detect_version(text)
+    features = version.features if version.features else None
+    result = deob.decode_payload(text, version=version, features=features)
+    metadata = dict(result.metadata)
+    vm_ir = metadata.pop("vm_ir", None)
+    if isinstance(vm_ir, VMIR):
+        ctx.vm_ir = vm_ir
+        metadata["vm_ir"] = {
+            "constants": len(vm_ir.constants),
+            "bytecode": len(vm_ir.bytecode),
+        }
+    ctx.record_metadata("payload_decode", metadata)
+
+    if result.text:
+        ctx.stage_output = result.text
+        ctx.decoded_payloads.append(result.text)
+        ctx.write_artifact("payload_decode", result.text)
+
+
+def _pass_vm_lift(ctx: Context) -> None:
+    if ctx.vm_ir is None:
+        ctx.record_metadata("vm_lift", {"available": False})
+        return
+    vm_ir = ctx.vm_ir
+    ctx.record_metadata(
+        "vm_lift",
+        {
+            "constants": len(vm_ir.constants),
+            "bytecode": len(vm_ir.bytecode),
+            "prototypes": len(vm_ir.prototypes or []),
+        },
+    )
+    if ctx.artifacts:
+        ctx.write_artifact(
+            "vm_lift",
+            json.dumps(
+                {
+                    "constants": vm_ir.constants,
+                    "bytecode": vm_ir.bytecode,
+                    "prototypes": vm_ir.prototypes or [],
+                },
+                indent=2,
+            ),
+            extension=".json",
+        )
+
+
+def _pass_vm_devirtualize(ctx: Context) -> None:
+    if ctx.vm_ir is None:
+        ctx.record_metadata("vm_devirtualize", {"skipped": True})
+        return
+    deob = ctx.deobfuscator
+    assert deob is not None
+    version = ctx.detected_version
+    features = version.features if version and version.features else None
+    result = deob.devirtualize(ctx.vm_ir, version=version, features=features)
+    ctx.record_metadata("vm_devirtualize", dict(result.metadata))
+    if result.text:
+        ctx.stage_output = result.text
+        ctx.write_artifact("vm_devirtualize", result.text)
+
+
+def _pass_cleanup(ctx: Context) -> None:
+    deob = ctx.deobfuscator
+    assert deob is not None
+    text = ctx.stage_output
+    if not text:
+        ctx.record_metadata("cleanup", {"empty": True})
+        return
+    cleaned = deob.cleanup(text)
+    ctx.stage_output = cleaned
+    ctx.record_metadata("cleanup", {"changed": cleaned != text, "length": len(cleaned)})
+    ctx.write_artifact("cleanup", cleaned)
+
+
+def _pass_render(ctx: Context) -> None:
+    deob = ctx.deobfuscator
+    assert deob is not None
+    text = ctx.stage_output
+    if not text:
+        ctx.output = text
+        ctx.record_metadata("render", {"empty": True})
+        return
+    rendered = deob.render(text)
+    ctx.stage_output = rendered
+    ctx.output = rendered
+    ctx.record_metadata("render", {"length": len(rendered)})
+    ctx.write_artifact("render", rendered)
 
 
 PIPELINE.register_pass("detect", _pass_detect, 10)
-PIPELINE.register_pass("decode", _pass_decode, 20)
-PIPELINE.register_pass("format", _pass_format, 30)
+PIPELINE.register_pass("preprocess", _pass_preprocess, 20)
+PIPELINE.register_pass("payload_decode", _pass_payload_decode, 30)
+PIPELINE.register_pass("vm_lift", _pass_vm_lift, 40)
+PIPELINE.register_pass("vm_devirtualize", _pass_vm_devirtualize, 50)
+PIPELINE.register_pass("cleanup", _pass_cleanup, 60)
+PIPELINE.register_pass("render", _pass_render, 70)
 
 
 __all__ = ["Context", "PassRegistry", "PIPELINE"]

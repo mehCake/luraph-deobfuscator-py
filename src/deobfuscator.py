@@ -54,7 +54,7 @@ class DeobResult:
 class LuaDeobfuscator:
     """Coordinate the individual stages of the deobfuscation pipeline."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, vm_trace: bool = False) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
         self._all_features = self._version_detector.all_features
@@ -62,6 +62,7 @@ class LuaDeobfuscator:
         self._formatter = utils.LuaFormatter()
         self._vm_max_steps = 100_000
         self._vm_timeout = 5.0
+        self._vm_trace = vm_trace
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(self, text: str) -> VersionInfo:
@@ -195,7 +196,7 @@ class LuaDeobfuscator:
                 self.logger.debug("Opcode lifting failed: %s", exc)
 
         if canonical and canonical.instructions:
-            simulator = LuaVMSimulator()
+            simulator = LuaVMSimulator(trace=self._vm_trace)
             try:
                 result = simulator.run(canonical)
             except VMEmulationError:  # pragma: no cover - fallback

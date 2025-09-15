@@ -1,6 +1,5 @@
 # Dependencies for analysis helpers
-networkx
-sympy
-mypy
-pytest
-
+networkx==3.2.1
+sympy==1.13.2
+mypy==1.10.0
+pytest==8.2.2
