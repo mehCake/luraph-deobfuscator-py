@@ -3,6 +3,19 @@ import logging
 from typing import Dict, Set, List, Any
 from collections import defaultdict
 
+
+def _register_name(index: int) -> str:
+    """Return a short alphabetic name for a register index."""
+    alphabet = []
+    while True:
+        alphabet.append(index % 26)
+        index //= 26
+        if index == 0:
+            break
+        index -= 1
+    chars = [chr(ord('a') + n) for n in reversed(alphabet)]
+    return ''.join(chars)
+
 # Setup basic logging
 logging.basicConfig(
     level=logging.INFO,
@@ -154,7 +167,7 @@ class VariableRenamer:
         all_vars = set(re.findall(var_pattern, code))
 
         for var in all_vars:
-            if var in self.lua_keywords or var in self.lua_globals:
+            if var in self.lua_keywords or var in self.lua_globals or var in self.used_names:
                 continue
             is_obfuscated = (
                 (len(var) == 1 and var not in ['i', 'j', 'k', 'n', 'x', 'y', 'z']) or
@@ -177,6 +190,9 @@ class VariableRenamer:
             self.variable_map.update(custom_mapping)
             self.used_names.update(custom_mapping.values())
 
+        # Rename registers and special placeholders first
+        code = self._rename_special_variables(code)
+
         var_analysis = self.analyze_variable_usage(code)
         obfuscated_vars = self.detect_obfuscated_variables(code)
 
@@ -195,6 +211,49 @@ class VariableRenamer:
 
         self.logger.info(f"Renamed {len(self.variable_map)} variables")
         return renamed_code
+
+    # ------------------------------------------------------------------
+    # Special renaming helpers
+    # ------------------------------------------------------------------
+    def _rename_special_variables(self, code: str) -> str:
+        """Rename VM registers, function parameters and upvalues."""
+
+        def repl_reg(match: re.Match[str]) -> str:
+            idx = int(match.group(1))
+            name = _register_name(idx)
+            self.variable_map[match.group(0)] = name
+            self.used_names.add(name)
+            return name
+
+        code = re.sub(r"R(\d+)", repl_reg, code)
+
+        # Function parameters
+        def repl_func(match: re.Match[str]) -> str:
+            func_name = match.group(1) or ""
+            params = [p.strip() for p in match.group(2).split(',') if p.strip()]
+            new_params: List[str] = []
+            for i, param in enumerate(params, 1):
+                new_name = f"arg{i}"
+                self.variable_map[param] = new_name
+                self.used_names.add(new_name)
+                new_params.append(new_name)
+            prefix = f"function {func_name}" if func_name else "function"
+            return f"{prefix}({', '.join(new_params)})"
+
+        code = re.sub(r"function\s*(\w*)\s*\(([^)]*)\)", repl_func, code)
+
+        # Upvalues encoded as UPVAL0, UV1, etc.
+        def repl_upval(match: re.Match[str]) -> str:
+            idx = int(match.group(1)) + 1
+            name = f"uv{idx}"
+            self.variable_map[match.group(0)] = name
+            self.used_names.add(name)
+            return name
+
+        code = re.sub(r"UPVAL(\d+)", repl_upval, code)
+        code = re.sub(r"UV(\d+)", repl_upval, code)
+
+        return code
 
     def create_renaming_report(self) -> str:
         """Create a report of variable renamings performed."""

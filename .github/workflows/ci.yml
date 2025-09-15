@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run py_compile
+        run: python -m py_compile $(git ls-files '*.py')
+      - name: Run mypy
+        run: python -m mypy src/analysis src/vm src/exceptions.py src/deobfuscator.py src/utils.py --ignore-missing-imports
+      - name: Run tests
+        run: pytest -q
