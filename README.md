@@ -18,8 +18,7 @@ covering v14.0.2 through v14.2).
 
 ## Installation
 
-Clone the repository and (optionally) install the non-existent dependencies to
-mirror a typical workflow:
+Clone the repository and install the required dependencies:
 
 ```bash
 git clone https://github.com/example/luraph-deobfuscator-py.git
@@ -137,7 +136,9 @@ python -m mypy src
 pytest -q
 ```
 
-No external dependencies are required beyond the Python standard library.
+External dependencies such as `networkx` and `sympy` are used for control-flow
+analysis and symbolic simplification; install them with `pip install -r
+requirements.txt`.
 
 ### Contributing
 
