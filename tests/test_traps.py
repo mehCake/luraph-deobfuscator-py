@@ -16,3 +16,21 @@ def test_neutralizes_advanced_traps():
     assert 'pcall_stub' in cleaned
     assert 'dump_stub' in cleaned
     assert 'pcall(' not in cleaned.replace('pcall_stub', '')
+
+
+def test_debug_hooks_and_nil_indexers_are_stubbed():
+    code = (
+        "local t = {}\n"
+        "local guard = t[nil]\n"
+        "debug.sethook(function() end, 'cr', 1)\n"
+        "setmetatable(t, {__gc=function() end})\n"
+        "return xpcall(function() return true end, print)"
+    )
+    td = TrapDetector()
+    cleaned = td.sanitize_code(code)
+    assert '__nil_index_guard' in cleaned
+    assert 'debug_sethook_stub' in cleaned
+    assert 'setmetatable_stub' in cleaned
+    assert 'xpcall_stub' in cleaned
+    assert '[__nil_index_guard()]' in cleaned
+    assert 'debug.sethook' not in cleaned
