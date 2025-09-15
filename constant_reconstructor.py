@@ -14,6 +14,28 @@ class ConstantReconstructor:
         self.constant_cache = {}
         self.function_cache = {}
         self.array_cache = {}
+    # Encrypted constant pools
+    def decrypt_lph_encfunc(self, value: str, key: int) -> str:
+        """Decode LPH_ENCFUNC v14.x encrypted strings using XOR."""
+        return ''.join(chr(ord(c) ^ key) for c in value)
+
+    def decrypt_encrypted_pools(self, content: str) -> Dict[str, Union[str, int]]:
+        """Detect and decrypt ``LPH_ENCFUNC`` calls for strings and numbers."""
+        pattern = r'LPH_ENCFUNC\(([^,]+),\s*(\d+)\)'
+        constants: Dict[str, Union[str, int]] = {}
+        for match in re.finditer(pattern, content):
+            raw_val, key_s = match.groups()
+            key = int(key_s, 10)
+            if raw_val.startswith(('"', "'")):
+                decoded = self.decrypt_lph_encfunc(raw_val[1:-1], key)
+                constants[match.group(0)] = f'"{decoded}"'
+            else:
+                try:
+                    num = int(raw_val, 0)
+                    constants[match.group(0)] = num ^ key
+                except ValueError:
+                    continue
+        return constants
     
     def extract_string_constants(self, content: str) -> Dict[str, str]:
         """Extract string constants from various hiding patterns."""
@@ -68,6 +90,11 @@ class ConstantReconstructor:
             except Exception:
                 continue
         
+        # Luraph v14 encrypted pools
+        for k, v in self.decrypt_encrypted_pools(content).items():
+            if isinstance(v, str):
+                constants[k] = v
+
         return constants
     
     def extract_numeric_constants(self, content: str) -> Dict[str, Union[int, float]]:
@@ -101,6 +128,11 @@ class ConstantReconstructor:
             except ValueError:
                 continue
         
+        # Encrypted numeric pools
+        for k, v in self.decrypt_encrypted_pools(content).items():
+            if isinstance(v, int):
+                constants[k] = v
+
         return constants
     
     def reconstruct_array_constants(self, content: str) -> Dict[str, List]:

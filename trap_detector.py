@@ -36,14 +36,13 @@ class TrapDetector:
             ],
             'debug_hooks': [
                 r'debug\.sethook\s*\([^)]+\)',
-                r'debug\.getinfo\s*\([^)]+\)',
                 r'debug\.traceback\s*\([^)]*\)',
             ],
             'environment_checks': [
                 r'getfenv\s*\(\s*\)\s*\[\s*["\'].*?["\'].*?\s*\]',
                 r'_G\s*\[\s*["\'].*?["\'].*?\].*?==.*?nil',
                 r'type\s*\(\s*.*?\s*\)\s*~=\s*["\']function["\']',
-            ]
+            ],
         }
 
         # Function wrappers that do nothing
@@ -148,6 +147,36 @@ class TrapDetector:
         self.logger.info("Starting comprehensive trap detection and removal...")
         self.detect_traps(code)
         cleaned_code = self.remove_traps(code)
+        cleaned_code = self.neutralize_advanced_traps(cleaned_code)
         self.analyze_function_complexity(cleaned_code)
         self.detect_anti_debug_checks(cleaned_code)
         return cleaned_code
+    # Advanced trap neutralisation
+    def neutralize_advanced_traps(self, code: str) -> str:
+        """Replace advanced anti-debug checks with benign stubs.
+
+        This makes line number checks via ``debug.getinfo`` return a static value,
+        forces ``pcall`` to always succeed and neuters ``string.dump`` based
+        integrity verification.  The original calls are replaced and small stub
+        helpers are injected at the top of the script so execution can continue
+        without triggering the protections.
+        """
+
+        stubs: List[str] = []
+
+        if re.search(r'debug\.getinfo', code):
+            code = re.sub(r'debug\.getinfo', 'debug_getinfo_stub', code)
+            stubs.append('local debug_getinfo_stub=function(...) return {currentline=0} end')
+
+        if re.search(r'\bpcall\b', code):
+            code = re.sub(r'\bpcall\b', 'pcall_stub', code)
+            stubs.append('local pcall_stub=function(f, ...) return true, f(...) end')
+
+        if re.search(r'string\.dump', code):
+            code = re.sub(r'string\.dump', 'dump_stub', code)
+            stubs.append('local dump_stub=function(f) return "" end')
+
+        if stubs:
+            code = '\n'.join(stubs) + '\n' + code
+
+        return code
