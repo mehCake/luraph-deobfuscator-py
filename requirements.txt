@@ -1,4 +1,4 @@
-# Advanced Lua Deobfuscator
-# Third party dependencies used for analysis helpers
+# Dependencies for analysis helpers
 networkx
 sympy
+

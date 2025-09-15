@@ -108,8 +108,26 @@ def decode_simple_obfuscations(content: str) -> str:
     content = _decode_numeric_escapes(content)
     return content
 
-def deobfuscate(path: str) -> str:
-    content = Path(path).read_text()
+
+def extract_embedded_json(content: str) -> Optional[str]:
+    patterns = [r"\[\[(.*?)\]\]", r'"(.*?)"', r"'(.*?)'"]
+    for pat in patterns:
+        for match in re.findall(pat, content, re.DOTALL):
+            candidate = match.strip()
+            if candidate.startswith("{") or candidate.startswith("["):
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except Exception:
+                    continue
+    return None
+
+
+def deobfuscate_content(content: str) -> str:
+    embedded = extract_embedded_json(content)
+    if embedded:
+        return deobfuscate_content(embedded)
+
     result = decode_json_format(content)
     if result is not None:
         return result
@@ -117,6 +135,10 @@ def deobfuscate(path: str) -> str:
     if result is not None:
         return result
     return decode_simple_obfuscations(content)
+
+
+def deobfuscate(path: str) -> str:
+    return deobfuscate_content(Path(path).read_text())
 
 def main():
     import argparse

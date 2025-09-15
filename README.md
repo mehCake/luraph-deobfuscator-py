@@ -37,6 +37,13 @@ data and controlling output files.
 python main.py path/to/obfuscated.lua
 ```
 
+For quick one-off decoding without the full pipeline, a standalone
+`luraph_for_lua.py` script provides the same lightweight helpers:
+
+```bash
+python luraph_for_lua.py examples/example_obfuscated.lua
+```
+
 Specify an explicit pseudo‑Lua output path with `-o` and optionally a separate
 clean bytecode target via `--luac-out`:
 
