@@ -2,4 +2,5 @@
 networkx
 sympy
 mypy
+pytest
 
