@@ -6,6 +6,7 @@ import re
 from typing import Dict, Set, Optional
 import logging
 from collections import defaultdict
+from .utils import safe_read_file, safe_write_file
 
 class LuaVariableRenamer:
     """Renames variables and functions with meaningful names"""
@@ -166,3 +167,13 @@ class LuaVariableRenamer:
                     report.append(f"  {old} -> {new}")
         
         return "\n".join(report)
+
+
+def rename_in_file(input_path: str, output_path: str) -> bool:
+    """Rename variables in ``input_path`` and write to ``output_path``."""
+    content = safe_read_file(input_path)
+    if content is None:
+        return False
+    renamer = LuaVariableRenamer()
+    out = renamer.rename_variables(content)
+    return safe_write_file(output_path, out)

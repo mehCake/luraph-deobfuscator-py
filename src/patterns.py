@@ -6,6 +6,7 @@ Handles detection and analysis of various obfuscation patterns
 import re
 from typing import Dict, List, Any
 from dataclasses import dataclass
+from .utils import safe_read_file
 
 @dataclass
 class PatternMatch:
@@ -287,3 +288,12 @@ class PatternAnalyzer:
             'complexity_assessment': analysis['deobfuscation_difficulty'],
             'detection_confidence': max(analysis['confidence_scores'].values()) if analysis['confidence_scores'] else 0.0
         }
+
+
+def analyze_file(path: str) -> Dict[str, Any]:
+    """Analyze the file at ``path`` for known obfuscation patterns."""
+    content = safe_read_file(path)
+    if content is None:
+        return {}
+    analyzer = PatternAnalyzer()
+    return analyzer.analyze_content(content)

@@ -1,7 +1,6 @@
-import re
-import math
 import logging
-from typing import Union, Optional
+import re
+from typing import Union
 
 class HexNumberNormalizer:
     """Normalizes various number formats in Lua code (hex, float, scientific notation)."""
@@ -9,41 +8,60 @@ class HexNumberNormalizer:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         
-        # Number patterns
         self.patterns = {
-            'hex_numbers': r'0[xX]([0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?\d+)?)',
-            'scientific_notation': r'(\d+(?:\.\d*)?[eE][+-]?\d+)',
-            'float_numbers': r'(\d+\.\d+)',
-            'hex_strings': r'\\x([0-9a-fA-F]{2})',
-            'unicode_escapes': r'\\u([0-9a-fA-F]{4})',
-            'octal_numbers': r'\\(\d{3})',
+            "hex": r"0[xX][0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?\d+)?",
+            "scientific": r"\b\d+(?:\.\d*)?[eE][+-]?\d+\b",
+            "float": r"\b\d+\.\d+\b",
+            "hex_string": r"\\x([0-9a-fA-F]{2})",
+            "unicode": r"\\u([0-9a-fA-F]{4})",
+            "octal": r"\\(\d{3})",
         }
 
-    def normalize_hex_number(self, hex_str: str) -> str:
+    # ------------------------------------------------------------------
+    def parse_literal(self, literal: str) -> Union[int, float]:
+        literal = literal.strip()
+        if not literal:
+            raise ValueError("empty literal")
         try:
-            if 'p' in hex_str.lower():
-                return str(float.fromhex('0x' + hex_str))
-            else:
-                if '.' in hex_str:
-                    return str(float.fromhex('0x' + hex_str))
-                else:
-                    return str(int(hex_str, 16))
-        except (ValueError, OverflowError):
-            self.logger.warning(f"Could not convert hex number: {hex_str}")
-            return f"0x{hex_str}"
+            if literal.lower().startswith("0x"):
+                if "p" in literal.lower() or "." in literal:
+                    return float.fromhex(literal)
+                return int(literal, 16)
+            if literal.startswith("-") and literal[1:].lower().startswith("0x"):
+                if "p" in literal.lower() or "." in literal:
+                    return float.fromhex(literal)
+                return int(literal, 16)
+            if any(ch in literal for ch in "eE"):
+                return float(literal)
+            if "." in literal:
+                value = float(literal)
+                return int(value) if value.is_integer() else value
+            return int(literal, 10)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported numeric literal: {literal}") from exc
 
-    def normalize_scientific_notation(self, sci_str: str) -> str:
+    def canonicalize_literal(self, literal: str) -> str:
         try:
-            value = float(sci_str)
-            if value.is_integer() and abs(value) < 1e15:
-                return str(int(value))
-            if 1e-6 < abs(value) < 1e10:
-                formatted = f"{value:.10f}".rstrip('0').rstrip('.')
-                return formatted if '.' in formatted else f"{formatted}.0"
-            return sci_str
-        except (ValueError, OverflowError):
-            self.logger.warning(f"Could not convert scientific notation: {sci_str}")
-            return sci_str
+            value = self.parse_literal(literal)
+        except ValueError:
+            return literal
+        return self.format_literal(value)
+
+    def format_literal(self, value: Union[int, float], prefer_hex: bool = False) -> str:
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if isinstance(value, int):
+            if prefer_hex:
+                return hex(value)
+            return str(value)
+        if prefer_hex:
+            return value.hex()
+        text = f"{value:.12g}"
+        if "e" in text or "E" in text:
+            return text
+        if value.is_integer():
+            return str(int(value))
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
     def normalize_hex_string(self, hex_byte: str) -> str:
         try:
@@ -87,27 +105,17 @@ class HexNumberNormalizer:
         normalized_code = code
         normalization_count = 0
 
-        # Hex numbers
-        def hex_replacer(match):
+        def numeric_replacer(match: re.Match[str]) -> str:
             nonlocal normalization_count
-            hex_num = match.group(1)
-            normalized = self.normalize_hex_number(hex_num)
-            if normalized != f"0x{hex_num}":
+            literal = match.group(0)
+            normalized = self.canonicalize_literal(literal)
+            if normalized != literal:
                 normalization_count += 1
             return normalized
-        
-        normalized_code = re.sub(self.patterns['hex_numbers'], hex_replacer, normalized_code)
 
-        # Scientific notation
-        def sci_replacer(match):
-            nonlocal normalization_count
-            sci_num = match.group(1)
-            normalized = self.normalize_scientific_notation(sci_num)
-            if normalized != sci_num:
-                normalization_count += 1
-            return normalized
-        
-        normalized_code = re.sub(self.patterns['scientific_notation'], sci_replacer, normalized_code)
+        normalized_code = re.sub(self.patterns["hex"], numeric_replacer, normalized_code)
+        normalized_code = re.sub(self.patterns["scientific"], numeric_replacer, normalized_code)
+        normalized_code = re.sub(self.patterns["float"], numeric_replacer, normalized_code)
 
         # Hex string
         def hex_string_replacer(match):
@@ -117,8 +125,8 @@ class HexNumberNormalizer:
             if normalized != f"\\x{hex_byte}":
                 normalization_count += 1
             return normalized
-        
-        normalized_code = re.sub(r'\\x([0-9a-fA-F]{2})', hex_string_replacer, normalized_code)
+
+        normalized_code = re.sub(self.patterns["hex_string"], hex_string_replacer, normalized_code)
 
         # Unicode
         def unicode_replacer(match):
@@ -128,8 +136,8 @@ class HexNumberNormalizer:
             if normalized != f"\\u{unicode_hex}":
                 normalization_count += 1
             return normalized
-        
-        normalized_code = re.sub(r'\\u([0-9a-fA-F]{4})', unicode_replacer, normalized_code)
+
+        normalized_code = re.sub(self.patterns["unicode"], unicode_replacer, normalized_code)
 
         # Octal
         def octal_replacer(match):
@@ -139,22 +147,8 @@ class HexNumberNormalizer:
             if normalized != f"\\{octal_str}":
                 normalization_count += 1
             return normalized
-        
-        normalized_code = re.sub(r'\\(\d{3})', octal_replacer, normalized_code)
 
-        # Floating point cleanup
-        def float_cleaner(match):
-            float_str = match.group(1)
-            try:
-                value = float(float_str)
-                if value.is_integer():
-                    return str(int(value))
-                cleaned = f"{value:.10f}".rstrip('0').rstrip('.')
-                return cleaned if '.' in cleaned else str(int(float(cleaned)))
-            except ValueError:
-                return float_str
-
-        normalized_code = re.sub(r'\b(\d+\.\d*)\b', float_cleaner, normalized_code)
+        normalized_code = re.sub(self.patterns["octal"], octal_replacer, normalized_code)
         self.logger.info(f"Number normalization completed. {normalization_count} normalizations applied.")
         return normalized_code
 
