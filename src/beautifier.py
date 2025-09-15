@@ -5,6 +5,7 @@ Lua Code Beautification Module
 import re
 from typing import List
 import logging
+from .utils import safe_read_file, safe_write_file
 
 class LuaBeautifier:
     """Beautifies and formats Lua code for better readability"""
@@ -166,7 +167,7 @@ class LuaBeautifier:
         
         while cleaned_lines and not cleaned_lines[-1].strip():
             cleaned_lines.pop()
-        
+
         return '\n'.join(cleaned_lines)
     
     def _remove_comments_and_strings(self, line: str) -> str:
@@ -175,3 +176,14 @@ class LuaBeautifier:
         line = re.sub(r'"[^"]*"', '""', line)
         line = re.sub(r"'[^']*'", "''", line)
         return line
+
+
+def beautify_file(input_path: str, output_path: str) -> bool:
+    """Beautify ``input_path`` and write the result to ``output_path``."""
+    content = safe_read_file(input_path)
+    if content is None:
+        return False
+    beautifier = LuaBeautifier()
+    out = beautifier.beautify(content)
+    return safe_write_file(output_path, out)
+

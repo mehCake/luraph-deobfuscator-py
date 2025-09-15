@@ -2,8 +2,7 @@ import sys
 import os
 import logging
 import argparse
-import requests
-import re  # <- Added this
+import re
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -53,22 +52,21 @@ class EnhancedLuraphDeobfuscator:
         }
     
     def download_from_url(self, url: str) -> str:
-        """Download content from URL."""
-        try:
-            self.logger.info(f"Downloading from: {url}")
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            return response.text
-        except Exception as e:
-            self.logger.error(f"Failed to download from URL: {e}")
-            raise
+        """Network access has been disabled for safety reasons."""
+
+        raise RuntimeError(
+            "Downloading sources is not supported. Save the script locally and "
+            "provide the file path instead."
+        )
     
     def process_input(self, input_path: str) -> str:
         """Process input from file or URL."""
-        if input_path.startswith(('http://', 'https://')):
-            return self.download_from_url(input_path)
-        else:
-            return read_file_content(input_path)
+        parsed = urlparse(input_path)
+        if parsed.scheme in {"http", "https"}:
+            raise ValueError(
+                "Network sources are not allowed. Provide a local file path instead."
+            )
+        return read_file_content(input_path)
     
     def detect_obfuscation_type(self, content: str) -> Dict[str, Any]:
         """Detect the type and version of obfuscation."""

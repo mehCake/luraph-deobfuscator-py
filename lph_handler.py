@@ -17,10 +17,7 @@ from pathlib import Path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_dir = os.path.join(current_dir, 'src')
 sys.path.insert(0, src_dir)
-
-# =======================
 # Utility Functions
-# =======================
 def setup_logging(level=logging.INFO):
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -33,13 +30,10 @@ def validate_file(filepath):
 def create_output_path(input_file):
     base, ext = os.path.splitext(input_file)
     return f"{base}_deobfuscated{ext}"
-
-# =======================
 # Lua String Extractor
-# =======================
 class StringExtractor:
     """Extract different types of obfuscated strings"""
-    
+
     def extract_hex_strings(self, code):
         pattern = r'"(\\x[0-9a-fA-F]{2})+"'
         return [{'full_string': m.group(0)} for m in re.finditer(pattern, code)]
@@ -57,18 +51,22 @@ class StringExtractor:
         pattern = r'_LPH\(["\'](.*?)["\']\)'
         return [{'full_string': m.group(0), 'content': m.group(1)} for m in re.finditer(pattern, code)]
 
-# =======================
+
+class LPHStringExtractor:
+    """Compatibility wrapper expected by the legacy CLI."""
+
+    def extract_strings(self, code: str) -> str:
+        # The legacy flow used to mutate strings in-place.  For the baseline
+        # scaffolding we simply return the input unchanged so the method can be
+        # safely chained without altering behaviour.
+        return code
 # Lua Deobfuscator
-# =======================
 class LuaDeobfuscator:
     def __init__(self, config=None):
         self.config = config or {}
         self.extractor = StringExtractor()
         self.logger = logging.getLogger(__name__)
-
-    # -------------
     # Analysis
-    # -------------
     def analyze_code(self, code):
         analysis = {
             'obfuscated': False,
@@ -101,10 +99,7 @@ class LuaDeobfuscator:
         }
 
         return analysis
-
-    # -------------
     # Deobfuscation
-    # -------------
     def deobfuscate(self, code, method=None):
         # Step 1: Decode hex strings
         for hex_info in self.extractor.extract_hex_strings(code):
@@ -132,10 +127,7 @@ class LuaDeobfuscator:
             code = code.replace(full_str, f'"{decoded}"')
 
         return code
-
-    # ------------------------
     # Internal helper methods
-    # ------------------------
     def _process_hex_string(self, s):
         s = s.strip('"').strip("'")
         try:
@@ -164,10 +156,7 @@ class LuaDeobfuscator:
             return decoded
         except Exception:
             return s
-
-# =======================
 # Command-line interface
-# =======================
 def create_parser():
     parser = argparse.ArgumentParser(
         description='Advanced Lua Deobfuscator with LPH Support',

@@ -1,5 +1,5 @@
 import re
-from typing import List, Dict
+from typing import Dict
 
 class EnhancedLuraphDetector:
     """Improved detection of Luraph obfuscation versions and variants"""
@@ -65,9 +65,21 @@ class EnhancedLuraphDetector:
             return "unknown"
         return max(scores, key=scores.get)
 
-# Example usage:
-# detector = EnhancedLuraphDetector()
-# version_scores = detector.detect_version(lua_code_content)
-# variant_scores = detector.detect_variant(lua_code_content)
-# most_likely_version = detector.most_likely(version_scores)
-# most_likely_variant = detector.most_likely(variant_scores)
+class VersionDetector:
+    """Small wrapper that exposes a simple dictionary-based API."""
+
+    def __init__(self) -> None:
+        self._detector = EnhancedLuraphDetector()
+
+    def detect_version(self, content: str) -> Dict[str, str | Dict[str, int]]:
+        version_scores = self._detector.detect_version(content)
+        variant_scores = self._detector.detect_variant(content)
+        return {
+            "most_likely_version": self._detector.most_likely(version_scores),
+            "most_likely_variant": self._detector.most_likely(variant_scores),
+            "version_scores": version_scores,
+            "variant_scores": variant_scores,
+        }
+
+
+__all__ = ["EnhancedLuraphDetector", "VersionDetector"]
