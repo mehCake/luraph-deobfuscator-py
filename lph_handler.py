@@ -94,10 +94,19 @@ def _normalise(data: Any) -> Optional[Dict[str, Any]]:
         if data and isinstance(data[0], list) and len(data[0]) == 2 and all(
             isinstance(part, str) for part in data[0]
         ):
+            script = data[0][1]
+            if script:
+                constants.append(script)
             for element in data[1:]:
-                if isinstance(element, str):
+                if isinstance(element, str) and element.strip():
                     constants.append(element)
-            return {"constants": constants, "bytecode": code, "code": code, "prototypes": []}
+            return {
+                "constants": constants,
+                "bytecode": code,
+                "code": code,
+                "prototypes": [],
+                "script": script,
+            }
         if all(isinstance(item, list) for item in data):
             code = [list(instr) for instr in data]
             return {"constants": [], "bytecode": code, "code": code, "prototypes": []}

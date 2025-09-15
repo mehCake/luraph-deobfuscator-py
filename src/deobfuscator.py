@@ -8,9 +8,13 @@ from typing import Any, Dict, Optional
 from lph_handler import extract_vm_ir
 from version_detector import VersionDetector, VersionInfo
 
+from opcode_lifter import OpcodeLifter
+from lua_vm_simulator import LuaVMSimulator
+
 from . import utils, versions
 from .passes import Devirtualizer
 from .vm import LuraphVM
+from .exceptions import VMEmulationError
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,7 @@ class LuaDeobfuscator:
     def __init__(self) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
+        self._opcode_lifter = OpcodeLifter()
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(self, text: str) -> VersionInfo:
@@ -82,6 +87,11 @@ class LuaDeobfuscator:
         constant_rendered: Optional[str] = None
         vm_ir = None
         if payload_dict:
+            script_text = payload_dict.get("script")
+            if isinstance(script_text, str) and script_text.strip():
+                cleaned_script = utils.strip_non_printable(script_text)
+                metadata["script_payload"] = True
+                return DeobResult(cleaned_script, metadata)
             vm_ir = self._vm_ir_from_mapping(payload_dict)
             if vm_ir is None:
                 constants = payload_dict.get("constants")
@@ -119,6 +129,37 @@ class LuaDeobfuscator:
     def devirtualize(self, vm_ir: VMIR) -> DeobResult:
         """Run the VM program and emit pseudo Lua code when possible."""
 
+        metadata: Dict[str, Any] = {}
+
+        canonical: Optional[Any] = None
+        if vm_ir.bytecode and all(isinstance(ins, dict) for ins in vm_ir.bytecode):
+            try:
+                canonical = self._opcode_lifter.lift_program(
+                    {
+                        "constants": vm_ir.constants,
+                        "bytecode": vm_ir.bytecode,
+                        "prototypes": vm_ir.prototypes or [],
+                    },
+                    version=vm_ir.version,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.debug("Opcode lifting failed: %s", exc)
+
+        if canonical and canonical.instructions:
+            simulator = LuaVMSimulator()
+            try:
+                result = simulator.run(canonical)
+            except VMEmulationError:  # pragma: no cover - fallback
+                result = None
+            if simulator.trace_log:
+                metadata["vm_trace"] = simulator.trace_log
+            if isinstance(result, (str, int, float)):
+                return DeobResult(str(result), {**metadata, "vm_result": result})
+            pseudo = Devirtualizer(canonical).render()
+            if pseudo:
+                metadata["devirtualized"] = True
+                return DeobResult(pseudo, metadata)
+
         vm = LuraphVM(constants=vm_ir.constants, bytecode=vm_ir.bytecode)
         if vm_ir.version:
             try:
@@ -128,7 +169,7 @@ class LuaDeobfuscator:
                 pass
 
         result = vm.run()
-        metadata: Dict[str, Any] = {"vm_result": result}
+        metadata.setdefault("vm_result", result)
         if isinstance(result, (str, int, float)):
             if isinstance(result, str):
                 decrypted = utils.decrypt_lph_string(result)
@@ -136,8 +177,7 @@ class LuaDeobfuscator:
                     metadata["vm_result_decrypted"] = True
                     return DeobResult(decrypted, metadata)
             return DeobResult(str(result), metadata)
-        devirt = Devirtualizer(vm)
-        pseudo = devirt.devirtualize()
+        pseudo = Devirtualizer(vm).render()
         if pseudo:
             return DeobResult(pseudo, metadata)
         return DeobResult("", metadata)
@@ -145,7 +185,8 @@ class LuaDeobfuscator:
     def cleanup(self, lua_src: str) -> str:
         """Apply lightweight decoding passes to ``lua_src``."""
 
-        return utils.decode_simple_obfuscations(lua_src)
+        cleaned = utils.decode_simple_obfuscations(lua_src)
+        return utils.strip_non_printable(cleaned)
 
     def render(self, lua_src: str) -> str:
         """Pretty print Lua code for readability."""

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from constant_reconstructor import ConstantReconstructor
 from src.deobfuscator import LuaDeobfuscator
+from utils import normalize_whitespace
 
 
 def deobfuscate(path: str) -> str:
@@ -27,9 +28,10 @@ def test_json_wrapped_matches_golden(tmp_path):
     assert out == expected
 
 
-def test_complex_example_contains_script_key(tmp_path):
+def test_complex_example_matches_golden(tmp_path):
     out = deobfuscate("examples/complex_obfuscated")
-    assert "script_key" in out
+    expected = golden("complex_obfuscated").read_text()
+    assert normalize_whitespace(out) == normalize_whitespace(expected)
 
 
 def test_complex_fixture_dynamic_calls_are_reconstructed():

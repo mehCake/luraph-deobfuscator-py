@@ -105,6 +105,13 @@ def _is_printable(s: str) -> bool:
     return all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in s)
 
 
+def strip_non_printable(text: str) -> str:
+    """Return *text* with control characters removed."""
+
+    allowed = {"\n", "\r", "\t", " "}
+    return "".join(ch for ch in text if 32 <= ord(ch) <= 126 or ch in allowed)
+
+
 def decrypt_lph_string(data: str, key: str = "hxsk0st7cyvjkicxnibhbm") -> str:
     """XOR-decrypt *data* using the provided *key*.
 
@@ -276,6 +283,4 @@ def decode_virtual_machine(content: Any, handler=None) -> Optional[str]:
         result_str = str(result)
         if _is_printable(result_str):
             return result_str
-    devirt = Devirtualizer(vm)
-    code = devirt.devirtualize()
-    return code if code else None
+    return None
