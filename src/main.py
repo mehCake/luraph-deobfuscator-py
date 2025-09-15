@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence
 
 from . import utils
-from .deobfuscator import LuaDeobfuscator, VMIR, VersionInfo
+from .deobfuscator import LuaDeobfuscator
 
 LOG_FILE = Path("deobfuscator.log")
 
@@ -63,36 +63,6 @@ def _prepare_work_items(inputs: List[Path], override: Path | None) -> Iterable[W
         yield WorkItem(src, dst)
 
 
-def _run_iterations(
-    deob: LuaDeobfuscator,
-    text: str,
-    *,
-    max_iterations: int,
-    forced_version: str | None,
-) -> str:
-    current = text
-    for iteration in range(max_iterations):
-        processed = deob.preprocess(current)
-        version = VersionInfo(forced_version, 1.0) if forced_version else deob.detect_version(processed)
-        result = deob.decode_payload(processed)
-        if forced_version:
-            result.metadata["version"] = version
-        vm_ir = result.metadata.get("vm_ir")
-        stage_output = result.text
-        if isinstance(vm_ir, VMIR):
-            devirt = deob.devirtualize(vm_ir)
-            stage_output = devirt.text or stage_output
-        cleaned = deob.cleanup(stage_output)
-        rendered = deob.render(cleaned)
-        logging.getLogger(__name__).info(
-            "iteration %s produced %d characters", iteration + 1, len(rendered)
-        )
-        if rendered == current:
-            return rendered
-        current = rendered
-    return current
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
     parser.add_argument("path", help="input file or directory")
@@ -131,11 +101,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             logging.getLogger(__name__).error("unable to read %s", item.source)
             exit_code = 1
             continue
-        output_text = _run_iterations(
-            deob,
+        output_text = deob.deobfuscate_content(
             content,
             max_iterations=max(args.max_iterations, 1),
-            forced_version=args.version,
+            version_override=args.version,
         )
         if not utils.safe_write_file(str(item.destination), output_text):
             logging.getLogger(__name__).error("failed to write %s", item.destination)

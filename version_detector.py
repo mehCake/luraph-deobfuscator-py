@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping, Tuple
+from typing import Dict, Iterable, Mapping, Tuple, FrozenSet
 
 from src.versions import iter_descriptors
 
@@ -39,6 +39,7 @@ class VersionDetector:
         if descriptors is None:
             descriptors = {name: desc for name, desc in iter_descriptors()}
         self._descriptors: Dict[str, Mapping[str, object]] = dict(descriptors)
+        self._all_features: FrozenSet[str] = self._collect_all_features()
 
     def detect(self, content: str) -> VersionInfo:
         best = VersionInfo("unknown", 0, 0, frozenset(), 0.0, ())
@@ -64,7 +65,7 @@ class VersionDetector:
                         category_hits += 1
                 if category_hits:
                     categories.append(category)
-                    feature = self._CATEGORY_FEATURE_MAP.get(category, category)
+                    feature = self._CATEGORY_FEATURE_MAP.get(category) or category
                     features.add(feature)
             if total == 0:
                 continue
@@ -84,6 +85,46 @@ class VersionDetector:
 
     def detect_version(self, content: str) -> VersionInfo:
         return self.detect(content)
+
+    @property
+    def all_features(self) -> FrozenSet[str]:
+        """Return the union of all feature flags known to the detector."""
+
+        return self._all_features
+
+    def info_for_name(self, name: str) -> VersionInfo:
+        """Return a :class:`VersionInfo` for ``name`` based on stored descriptors."""
+
+        descriptor = self._descriptors.get(name)
+        features: set[str] = set()
+        categories: list[str] = []
+        if isinstance(descriptor, Mapping):
+            heuristics = descriptor.get("heuristics", {})
+            if isinstance(heuristics, Mapping):
+                for category in heuristics.keys():
+                    categories.append(category)
+                    feature = self._CATEGORY_FEATURE_MAP.get(category) or category
+                    features.add(feature)
+        major, minor = _parse_version_numbers(name)
+        return VersionInfo(
+            name=name,
+            major=major,
+            minor=minor,
+            features=frozenset(features),
+            confidence=1.0 if descriptor else 0.0,
+            matched_categories=tuple(categories),
+        )
+
+    def _collect_all_features(self) -> FrozenSet[str]:
+        features: set[str] = set()
+        for descriptor in self._descriptors.values():
+            heuristics = descriptor.get("heuristics", {}) if isinstance(descriptor, Mapping) else {}
+            if not isinstance(heuristics, Mapping):
+                continue
+            for category in heuristics.keys():
+                feature = self._CATEGORY_FEATURE_MAP.get(category) or category
+                features.add(feature)
+        return frozenset(features)
 
 
 def _parse_version_numbers(name: str) -> Tuple[int, int]:
