@@ -1,29 +1,32 @@
-import re
 import base64
+import codecs
+import re
+
 
 class StringDecryptor:
-    def __init__(self):
-        """
-        Initialize String Decryptor
-        """
-        pass
-    
+    def __init__(self) -> None:
+        """Initialize with a collection of decoding passes."""
+        self._passes = [
+            self._decrypt_base64_strings,
+            self._decrypt_xor_strings,
+            self._decrypt_rot13_strings,
+            self._decode_lua_hex_escapes,
+            self._decode_lua_unicode_escapes,
+            self._decode_byte_escapes,
+            self._decrypt_loadstring,
+        ]
+
     def decrypt(self, code: str) -> str:
-        """
-        Recursively decrypt strings in the provided code
-        """
+        """Recursively decrypt strings in ``code`` using best effort."""
         previous_code = None
         current_code = code
-        
-        # Keep decrypting until no more changes
         while current_code != previous_code:
             previous_code = current_code
-            current_code = self._decrypt_base64_strings(current_code)
-            current_code = self._decrypt_xor_strings(current_code)
-            current_code = self._decode_lua_hex_escapes(current_code)
-            current_code = self._decode_lua_unicode_escapes(current_code)
-            current_code = self._decrypt_loadstring(current_code)
-        
+            for func in self._passes:
+                try:
+                    current_code = func(current_code)
+                except Exception:
+                    continue
         return current_code
     
     def _decrypt_base64_strings(self, code: str) -> str:
@@ -80,6 +83,26 @@ class StringDecryptor:
                 return match.group(0)
 
         return re.sub(unicode_pattern, replace_unicode, code)
+
+    def _decode_byte_escapes(self, code: str) -> str:
+        byte_pattern = r'\\(\d{1,3})'
+
+        def replace_byte(match: re.Match[str]) -> str:
+            try:
+                return chr(int(match.group(1), 10))
+            except Exception:
+                return match.group(0)
+
+        return re.sub(byte_pattern, replace_byte, code)
+
+    def _decrypt_rot13_strings(self, code: str) -> str:
+        rot_pattern = r'rot13\([\'"]([^\'"]*)[\'"]\)'
+
+        def replace_rot(match: re.Match[str]) -> str:
+            decoded = codecs.decode(match.group(1), "rot_13")
+            return f"'{decoded}'"
+
+        return re.sub(rot_pattern, replace_rot, code)
     
     def _decrypt_loadstring(self, code: str) -> str:
         """
