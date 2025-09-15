@@ -43,6 +43,7 @@ class LuraphVM:
             symbolic=symbolic,
         )
         self.logger = logging.getLogger(__name__)
+        self.dispatch = dict(OPCODE_HANDLERS)
         self._result: Any = None
 
     # ------------------------------------------------------------------
@@ -89,7 +90,7 @@ class LuraphVM:
         args = instr[1:]
         self.logger.debug("Executing %s %s", op, args)
 
-        handler = OPCODE_HANDLERS.get(op)
+        handler = self.dispatch.get(op)
         if handler is None:
             raise VMEmulationError(f"Unknown opcode: {op}")
 

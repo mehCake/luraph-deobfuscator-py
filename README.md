@@ -11,6 +11,11 @@ Building on top of the VM, the `src/passes/devirtualizer.py` module illustrates
 how control‑flow graphs, taint tracking and symbolic execution can be combined
 to reconstruct readable Lua from simple bytecode traces.
 
+Heuristics in `src/deobfuscator.py` attempt to detect the Luraph version used
+in a script.  Version specific tweaks live in `src/versions/` and are applied
+automatically when the virtual machine executes embedded bytecode (currently
+covering v14.0.2 through v14.2).
+
 ## Installation
 
 Clone the repository and (optionally) install the non-existent dependencies to

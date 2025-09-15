@@ -255,7 +255,7 @@ def decode_superflow(content: str) -> Optional[str]:
     return None
 
 
-def decode_virtual_machine(content: str) -> Optional[str]:
+def decode_virtual_machine(content: str, handler=None) -> Optional[str]:
     """Execute a minimal stack-based VM description if present.
 
     The function expects *content* to be a JSON object with two keys:
@@ -265,6 +265,9 @@ def decode_virtual_machine(content: str) -> Optional[str]:
     set of opcodes is supported by :class:`LuraphVM`, including arithmetic,
     comparisons, table manipulation, branching and simple function calls via a
     tiny global environment.
+
+    ``handler`` may be a version specific module exposing a ``process`` function
+    that can modify the VM before execution.
     """
 
     vm = LuraphVM()
@@ -272,6 +275,8 @@ def decode_virtual_machine(content: str) -> Optional[str]:
         vm.load_bytecode(content)
     except VMEmulationError:
         return None
+    if handler is not None:
+        handler.process(vm)
     result = vm.run()
     if isinstance(result, (str, int, float)):
         result_str = str(result)
