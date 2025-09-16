@@ -25,6 +25,6 @@ jobs:
       - name: Run py_compile
         run: python -m py_compile $(git ls-files '*.py')
       - name: Run mypy
-        run: python -m mypy src/analysis src/vm src/exceptions.py src/deobfuscator.py src/utils.py --ignore-missing-imports
+        run: python -m mypy src/analysis src/vm src/exceptions.py src/deobfuscator.py src/utils --ignore-missing-imports
       - name: Run tests
         run: pytest -q
