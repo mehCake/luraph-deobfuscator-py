@@ -303,7 +303,7 @@ class GUIHandler:
         
         try:
             # Initialize deobfuscator
-            self.deobfuscator = LuaDeobfuscator(config=self.config)
+            self.deobfuscator = LuaDeobfuscator()
             
             print(f"Processing file: {colorize_text(self.current_file, 'green')}")
             print("Starting deobfuscation...")
