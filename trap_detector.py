@@ -36,14 +36,13 @@ class TrapDetector:
             ],
             'debug_hooks': [
                 r'debug\.sethook\s*\([^)]+\)',
-                r'debug\.getinfo\s*\([^)]+\)',
                 r'debug\.traceback\s*\([^)]*\)',
             ],
             'environment_checks': [
                 r'getfenv\s*\(\s*\)\s*\[\s*["\'].*?["\'].*?\s*\]',
                 r'_G\s*\[\s*["\'].*?["\'].*?\].*?==.*?nil',
                 r'type\s*\(\s*.*?\s*\)\s*~=\s*["\']function["\']',
-            ]
+            ],
         }
 
         # Function wrappers that do nothing
@@ -69,6 +68,8 @@ class TrapDetector:
         """Remove detected traps from the code."""
         cleaned_code = code
         for trap_type, patterns in self.trap_patterns.items():
+            if trap_type in {"debug_hooks", "environment_checks"}:
+                continue
             for pattern in patterns:
                 cleaned_code = re.sub(pattern, '', cleaned_code, flags=re.IGNORECASE | re.DOTALL)
         cleaned_code = self._remove_dummy_wrappers(cleaned_code)
@@ -148,6 +149,82 @@ class TrapDetector:
         self.logger.info("Starting comprehensive trap detection and removal...")
         self.detect_traps(code)
         cleaned_code = self.remove_traps(code)
+        cleaned_code = self.neutralize_advanced_traps(cleaned_code)
         self.analyze_function_complexity(cleaned_code)
         self.detect_anti_debug_checks(cleaned_code)
         return cleaned_code
+    # Advanced trap neutralisation
+    def neutralize_advanced_traps(self, code: str) -> str:
+        """Replace advanced anti-debug checks with benign stubs.
+
+        This makes line number checks via ``debug.getinfo`` return a static value,
+        forces ``pcall`` to always succeed and neuters ``string.dump`` based
+        integrity verification.  It further sanitises metatable tricks, nil
+        indexers and debug hooks so execution can continue without triggering
+        protections.
+        """
+
+        stubs: List[str] = []
+        added: set[str] = set()
+
+        def add_stub(name: str, definition: str) -> None:
+            if name not in added:
+                added.add(name)
+                stubs.append(definition)
+
+        if re.search(r'\[\s*nil\s*\]', code):
+            code = re.sub(r'\[\s*nil\s*\]', '[__nil_index_guard()]', code)
+            add_stub('__nil_index_guard', 'local function __nil_index_guard() return 0 end')
+
+        if re.search(r'debug\.getinfo', code):
+            code = re.sub(r'debug\.getinfo', 'debug_getinfo_stub', code)
+            add_stub('debug_getinfo_stub', 'local function debug_getinfo_stub(...) return {currentline=0} end')
+
+        if re.search(r'\bpcall\b', code):
+            code = re.sub(r'\bpcall\b', 'pcall_stub', code)
+            add_stub('pcall_stub', 'local function pcall_stub(f, ...) return true, f(...) end')
+
+        if re.search(r'\bxpcall\b', code):
+            code = re.sub(r'\bxpcall\b', 'xpcall_stub', code)
+            add_stub('xpcall_stub', 'local function xpcall_stub(f, handler, ...) return f(...) end')
+
+        if re.search(r'string\.dump', code):
+            code = re.sub(r'string\.dump', 'dump_stub', code)
+            add_stub('dump_stub', 'local function dump_stub(_) return "" end')
+
+        if re.search(r'debug\.sethook', code):
+            code = re.sub(r'debug\.sethook', 'debug_sethook_stub', code)
+            add_stub('debug_sethook_stub', 'local function debug_sethook_stub(...) return end')
+
+        if re.search(r'debug\.gethook', code):
+            code = re.sub(r'debug\.gethook', 'debug_gethook_stub', code)
+            add_stub('debug_gethook_stub', 'local function debug_gethook_stub(...) return nil end')
+
+        if re.search(r'debug\.traceback', code):
+            code = re.sub(r'debug\.traceback', 'debug_traceback_stub', code)
+            add_stub('debug_traceback_stub', 'local function debug_traceback_stub(...) return "" end')
+
+        if re.search(r'\bsetmetatable\b', code):
+            code = re.sub(r'\bsetmetatable\b', 'setmetatable_stub', code)
+            add_stub('setmetatable_stub', 'local function setmetatable_stub(tbl, mt) return tbl end')
+
+        if re.search(r'\bgetmetatable\b', code):
+            code = re.sub(r'\bgetmetatable\b', 'getmetatable_stub', code)
+            add_stub('getmetatable_stub', 'local function getmetatable_stub(tbl) return {} end')
+
+        if re.search(r'debug\.getmetatable', code):
+            code = re.sub(r'debug\.getmetatable', 'debug_getmetatable_stub', code)
+            add_stub('debug_getmetatable_stub', 'local function debug_getmetatable_stub(tbl) return {} end')
+
+        if re.search(r'\bsetfenv\b', code):
+            code = re.sub(r'\bsetfenv\b', 'setfenv_stub', code)
+            add_stub('setfenv_stub', 'local function setfenv_stub(fn, env) return fn end')
+
+        if re.search(r'\bgetfenv\b', code):
+            code = re.sub(r'\bgetfenv\b', 'getfenv_stub', code)
+            add_stub('getfenv_stub', 'local function getfenv_stub(level) return _G end')
+
+        if added:
+            code = '\n'.join(stubs) + '\n' + code
+
+        return code

@@ -1,0 +1,75 @@
+{
+  "versions": {
+    "luraph_v14_2_json": {
+      "module": "luraph_v14_2_json",
+      "priority": 70,
+      "opcode_map": {
+        "LOADK": "0x01",
+        "CALL": "0x13",
+        "RETURN": "0x15",
+        "JMP": "0x28"
+      },
+      "heuristics": {
+        "signatures": ["init_fn\\s*\\("],
+        "loaders": ["loadstring"],
+        "constants": ["script_key\\s*=\\s*script_key\\s*or\\s*getgenv\\(\\)\\.script_key"],
+        "long_strings": ["[A-Za-z0-9+/=]{200,}"],
+        "prologues": ["script_key\\s*=\\s*script_key"]
+      },
+      "known_traps": []
+    },
+    "v14.0.2": {
+      "module": "v14_0",
+      "opcode_map": {
+        "LOADK": "0x01",
+        "CALL": "0x24",
+        "RETURN": "0x27"
+      },
+      "heuristics": {
+        "signatures": ["Luraph\\s+v14\\.0"],
+        "loaders": ["local\\s+function\\s+__?LURAPH"],
+        "upvalues": ["setfenv", "getfenv"],
+        "long_strings": ["\\[\\[[\\s\\S]*script_key"],
+        "constants": ["hxsk0st7cyvjkicxnibhbm", "LPH_ENCFUNC"],
+        "prologues": ["local\\s+_ENV"]
+      },
+      "known_traps": []
+    },
+    "v14.1": {
+      "module": "v14_1",
+      "opcode_map": {
+        "LOADK": "0x01",
+        "CALL": "0x24",
+        "RETURN": "0x27",
+        "SUPERFLOW": "0x40"
+      },
+      "heuristics": {
+        "signatures": ["Luraph\\s+v14\\.1"],
+        "loaders": ["superflow_bytecode_ext0", "Luarmor"],
+        "upvalues": ["setupvalue", "getupvalue"],
+        "long_strings": ["\\[\\[[\\s\\S]*superflow_bytecode_ext0"],
+        "constants": ["static_content"],
+        "prologues": ["return\\s+function"]
+      },
+      "known_traps": ["luarmor-cache"]
+    },
+    "v14.2": {
+      "module": "v14_2",
+      "opcode_map": {
+        "LOADK": "0x01",
+        "CALL": "0x24",
+        "RETURN": "0x27",
+        "PCALL": "0x46"
+      },
+      "heuristics": {
+        "signatures": ["Luraph\\s+v14\\.2"],
+        "loaders": ["pcall"],
+        "upvalues": ["debug\\.getinfo"],
+        "long_strings": ["\\[\\[[0-9a-f]{16,}"],
+        "constants": ["2611"],
+        "prologues": ["function\\s+\\w+\\("]
+      },
+      "known_traps": ["pcall-line-check", "debug-info"]
+    }
+  }
+}

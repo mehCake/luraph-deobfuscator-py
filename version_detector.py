@@ -1,73 +1,152 @@
+from __future__ import annotations
+
 import re
-from typing import List, Dict
+from dataclasses import dataclass
+from typing import Dict, Iterable, Mapping, Tuple, FrozenSet
 
-class EnhancedLuraphDetector:
-    """Improved detection of Luraph obfuscation versions and variants"""
+from src.versions import iter_descriptors
 
-    def __init__(self):
-        # Additional patterns for more robust detection
-        self.extra_patterns = {
-            'v1.x': [
-                r'eval\(',  # dynamic eval
-                r'function\s*\(\s*\)',  # anonymous functions
-                r'_G\[["\']\w+["\']\]'  # global table access
-            ],
-            'v2.x': [
-                r'bit\.32\.',  # bit32 operations
-                r'load\(',  # alternative loader
-                r'coroutine\.resume'  # coroutine usage
-            ],
-            'v3.x': [
-                r'debug\.setupvalue',
-                r'debug\.getupvalue',
-                r'setmetatable\s*\(.*, __index'
-            ],
-            'v4.x': [
-                r'pcall\s*\(function',
-                r'rawget\s*\(_ENV',
-                r'checksum|hash',  # anti-tamper
-            ],
-            'v5.x': [
-                r'debug\.getlocal',
-                r'custom_cipher',
-                r'math\.randomseed',
-                r'unpack\s*\('
-            ]
-        }
-        # Extra variant patterns
-        self.extra_variant_patterns = {
-            'standard': r'_G|_ENV',
-            'premium': r'getfenv|setfenv',
-            'enterprise': r'coroutine|thread|yield',
-            'custom': r'__[A-Z]{3,}__|_[a-z]+_'
-        }
 
-    def detect_version(self, content: str) -> Dict[str, int]:
-        """Score detection based on extra patterns"""
-        scores = {v: 0 for v in self.extra_patterns.keys()}
-        for version, patterns in self.extra_patterns.items():
-            for pattern in patterns:
-                matches = re.findall(pattern, content, re.IGNORECASE)
-                scores[version] += len(matches)
-        return scores
+@dataclass(frozen=True)
+class VersionInfo:
+    """Description of a detected Luraph VM version."""
 
-    def detect_variant(self, content: str) -> Dict[str, int]:
-        """Score variant detection"""
-        scores = {v: 0 for v in self.extra_variant_patterns.keys()}
-        for variant, pattern in self.extra_variant_patterns.items():
-            matches = re.findall(pattern, content, re.IGNORECASE)
-            scores[variant] += len(matches)
-        return scores
+    name: str
+    major: int
+    minor: int
+    features: frozenset[str]
+    confidence: float
+    matched_categories: Tuple[str, ...] = ()
 
-    def most_likely(self, scores: Dict[str, int]) -> str:
-        """Return key with highest score or unknown"""
-        if not scores or max(scores.values()) == 0:
-            return "unknown"
-        return max(scores, key=scores.get)
+    @property
+    def is_unknown(self) -> bool:
+        return self.name == "unknown"
 
-# Example usage:
-# detector = EnhancedLuraphDetector()
-# version_scores = detector.detect_version(lua_code_content)
-# variant_scores = detector.detect_variant(lua_code_content)
-# most_likely_version = detector.most_likely(version_scores)
-# most_likely_variant = detector.most_likely(variant_scores)
+
+class VersionDetector:
+    """Heuristic detector for Luraph versions using repository descriptors."""
+
+    _CATEGORY_FEATURE_MAP = {
+        "signatures": "banner",
+        "loaders": "loader",
+        "upvalues": "upvalues",
+        "long_strings": "container",
+        "constants": "constants",
+        "prologues": "prologue",
+    }
+
+    def __init__(self, descriptors: Mapping[str, Mapping[str, object]] | None = None) -> None:
+        if descriptors is None:
+            descriptors = {name: desc for name, desc in iter_descriptors()}
+        self._descriptors: Dict[str, Mapping[str, object]] = dict(descriptors)
+        self._all_features: FrozenSet[str] = self._collect_all_features()
+
+    def detect(self, content: str) -> VersionInfo:
+        best = VersionInfo("unknown", 0, 0, frozenset(), 0.0, ())
+        best_score = 0
+        best_priority = -1
+        for name, descriptor in self._descriptors.items():
+            heuristics = descriptor.get("heuristics", {})
+            if not isinstance(heuristics, Mapping):
+                continue
+            priority = 0
+            raw_priority = descriptor.get("priority") if isinstance(descriptor, Mapping) else None
+            if isinstance(raw_priority, (int, float)):
+                priority = int(raw_priority)
+            score = 0
+            total = 0
+            categories: list[str] = []
+            features: set[str] = set()
+            for category, patterns in heuristics.items():
+                if not isinstance(patterns, Iterable):
+                    continue
+                category_hits = 0
+                for pattern in patterns:
+                    if not isinstance(pattern, str):
+                        continue
+                    total += 1
+                    if re.search(pattern, content, re.IGNORECASE):
+                        score += 1
+                        category_hits += 1
+                if category_hits:
+                    categories.append(category)
+                    feature = self._CATEGORY_FEATURE_MAP.get(category) or category
+                    features.add(feature)
+            if total == 0:
+                continue
+            confidence = score / total
+            better_score = score > best_score
+            better_conf = score == best_score and confidence > best.confidence
+            better_priority = (
+                score == best_score
+                and abs(confidence - best.confidence) < 1e-9
+                and priority > best_priority
+            )
+            if better_score or better_conf or better_priority:
+                major, minor = _parse_version_numbers(name)
+                best = VersionInfo(
+                    name=name,
+                    major=major,
+                    minor=minor,
+                    features=frozenset(features),
+                    confidence=confidence,
+                    matched_categories=tuple(categories),
+                )
+                best_score = score
+                best_priority = priority
+        return best
+
+    def detect_version(self, content: str) -> VersionInfo:
+        return self.detect(content)
+
+    @property
+    def all_features(self) -> FrozenSet[str]:
+        """Return the union of all feature flags known to the detector."""
+
+        return self._all_features
+
+    def info_for_name(self, name: str) -> VersionInfo:
+        """Return a :class:`VersionInfo` for ``name`` based on stored descriptors."""
+
+        descriptor = self._descriptors.get(name)
+        features: set[str] = set()
+        categories: list[str] = []
+        if isinstance(descriptor, Mapping):
+            heuristics = descriptor.get("heuristics", {})
+            if isinstance(heuristics, Mapping):
+                for category in heuristics.keys():
+                    categories.append(category)
+                    feature = self._CATEGORY_FEATURE_MAP.get(category) or category
+                    features.add(feature)
+        major, minor = _parse_version_numbers(name)
+        return VersionInfo(
+            name=name,
+            major=major,
+            minor=minor,
+            features=frozenset(features),
+            confidence=1.0 if descriptor else 0.0,
+            matched_categories=tuple(categories),
+        )
+
+    def _collect_all_features(self) -> FrozenSet[str]:
+        features: set[str] = set()
+        for descriptor in self._descriptors.values():
+            heuristics = descriptor.get("heuristics", {}) if isinstance(descriptor, Mapping) else {}
+            if not isinstance(heuristics, Mapping):
+                continue
+            for category in heuristics.keys():
+                feature = self._CATEGORY_FEATURE_MAP.get(category) or category
+                features.add(feature)
+        return frozenset(features)
+
+
+def _parse_version_numbers(name: str) -> Tuple[int, int]:
+    matches = re.findall(r"\d+", name)
+    if not matches:
+        return 0, 0
+    major = int(matches[0])
+    minor = int(matches[1]) if len(matches) > 1 else 0
+    return major, minor
+
+
+__all__ = ["VersionDetector", "VersionInfo"]

@@ -1,284 +1,501 @@
-import re
-import math
+from __future__ import annotations
+
+"""Register-based Lua VM simulator operating on canonical VM IR."""
+
+from dataclasses import dataclass, field
 import logging
-from typing import Dict, List, Any
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+
+from src.exceptions import VMEmulationError
+from src.ir import VMFunction, VMInstruction
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VMFrame:
+    func: VMFunction
+    registers: List[Any]
+    pc: int = 0
+    upvalues: Dict[int, Any] = field(default_factory=dict)
+    varargs: List[Any] = field(default_factory=list)
+
+
+class LuaClosure:
+    """Callable capturing upvalues for nested VM functions."""
+
+    def __init__(self, simulator: "LuaVMSimulator", proto: VMFunction, upvalues: Dict[int, Any]):
+        self._simulator = simulator
+        self._proto = proto
+        self._upvalues = upvalues
+
+    def __call__(self, *args: Any) -> Any:  # pragma: no cover - thin wrapper
+        return self._simulator._call_function(self._proto, list(args), self._upvalues)
+
 
 class LuaVMSimulator:
-    """
-    Simplified Lua VM simulator for analyzing obfuscated code patterns
-    without full execution. Focuses on constant extraction and control flow.
-    """
+    """Execute :class:`VMFunction` objects produced by the opcode lifter."""
 
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-        self.variables: Dict[str, Any] = {}
-        self.functions: Dict[str, str] = {}
-        self.tables: Dict[str, List[Any]] = {}
-        self.stack: List[Any] = []
-        self.pc: int = 0  # Program counter
-        self.instructions: List[str] = []
+    def __init__(
+        self,
+        *,
+        max_steps: int = 100_000,
+        trace: bool = False,
+        trace_hook: Optional[Callable[[VMInstruction, VMFrame], None]] = None,
+        env: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.max_steps = max_steps
+        self.trace_enabled = trace
+        self.trace_hook = trace_hook
+        self.trace_log: List[str] = []
+        self._globals: Dict[str, Any] = {"print": lambda *args: None}
+        if env:
+            self._globals.update(env)
+        self._frames: List[VMFrame] = []
 
-        # Built-in functions simulation
-        self.builtins = {
-            'string.char': self._string_char,
-            'string.byte': self._string_byte,
-            'string.sub': self._string_sub,
-            'table.concat': self._table_concat,
-            'table.insert': self._table_insert,
-            'math.floor': math.floor,
-            'math.ceil': math.ceil,
-            'tonumber': self._tonumber,
-            'tostring': str,
-        }
+    # ------------------------------------------------------------------
+    def run(self, function: VMFunction, args: Optional[Sequence[Any]] = None) -> Any:
+        """Execute ``function`` and return the last ``RETURN`` value."""
 
-    def _string_char(self, *args):
-        try:
-            return ''.join(chr(int(arg)) for arg in args if 0 <= int(arg) <= 255)
-        except (ValueError, OverflowError):
-            return ''
+        self._frames = [self._create_frame(function, list(args or []))]
+        result: Any = None
+        steps = 0
 
-    def _string_byte(self, string_val, i=1):
-        try:
-            return ord(string_val[i - 1]) if 0 < i <= len(string_val) else None
-        except (IndexError, TypeError):
+        while self._frames:
+            frame = self._frames[-1]
+            if frame.pc >= len(frame.func.instructions):
+                self._frames.pop()
+                continue
+
+            instr = frame.func.instructions[frame.pc]
+            if self.trace_enabled:
+                log_line = f"{len(self._frames)-1}:{frame.pc:04d} {instr.opcode}"
+                self.trace_log.append(log_line)
+                if self.trace_hook:
+                    self.trace_hook(instr, frame)
+
+            frame.pc += 1
+            handler = getattr(self, f"_op_{instr.opcode.lower()}", None)
+            if handler is None:
+                raise VMEmulationError(f"unsupported opcode: {instr.opcode}")
+            result = handler(frame, instr)
+
+            steps += 1
+            if steps > self.max_steps:
+                raise VMEmulationError("step limit exceeded")
+
+            if result is not None and not self._frames:
+                return result
+
+        return result
+
+    # ------------------------------------------------------------------
+    def _create_frame(self, func: VMFunction, args: List[Any], upvalues: Optional[Dict[int, Any]] = None) -> VMFrame:
+        register_count = max(func.register_count, len(args)) or 8
+        registers = [None] * register_count
+        for index, value in enumerate(args):
+            if index < len(registers):
+                registers[index] = value
+        frame = VMFrame(func=func, registers=registers)
+        frame.upvalues = dict(upvalues or {})
+        if func.num_params and len(args) > func.num_params:
+            frame.varargs = list(args[func.num_params :])
+        elif func.is_vararg and len(args) > func.num_params:
+            frame.varargs = list(args[func.num_params :])
+        return frame
+
+    def _call_function(self, func: VMFunction, args: List[Any], upvalues: Optional[Dict[int, Any]] = None) -> Any:
+        self._frames.append(self._create_frame(func, args, upvalues))
+        return None
+
+    # ------------------------------------------------------------------
+    # Operand helpers
+    def _read_register(self, frame: VMFrame, index: Optional[int]) -> Any:
+        if index is None:
             return None
+        if index >= len(frame.registers):
+            frame.registers.extend([None] * (index - len(frame.registers) + 1))
+        return frame.registers[index]
 
-    def _string_sub(self, string_val, i, j=None):
-        try:
-            if j is None:
-                return string_val[i - 1:]
-            return string_val[i - 1:j]
-        except (IndexError, TypeError):
-            return ''
+    def _write_register(self, frame: VMFrame, index: Optional[int], value: Any) -> None:
+        if index is None:
+            return
+        if index >= len(frame.registers):
+            frame.registers.extend([None] * (index - len(frame.registers) + 1))
+        frame.registers[index] = value
 
-    def _table_concat(self, table, sep='', i=1, j=None):
-        try:
-            if isinstance(table, list):
-                if j is None:
-                    j = len(table)
-                return sep.join(str(x) for x in table[i - 1:j])
-            return ''
-        except (IndexError, TypeError):
-            return ''
-
-    def _table_insert(self, table, pos, value=None):
-        try:
-            if value is None:
-                value = pos
-                pos = len(table) + 1
-            if isinstance(table, list):
-                table.insert(pos - 1, value)
-        except (IndexError, TypeError):
-            pass
-
-    def _tonumber(self, value, base=10):
-        try:
-            if isinstance(value, (int, float)):
-                return value
-            if isinstance(value, str):
-                if base == 10:
-                    return int(value) if value.isdigit() else float(value)
-                return int(value, base)
-        except (ValueError, TypeError):
-            return None
-
-    def parse_simple_expression(self, expr: str) -> Any:
-        expr = expr.strip()
-
-        # String literal
-        if (expr.startswith('"') and expr.endswith('"')) or \
-           (expr.startswith("'") and expr.endswith("'")):
-            return expr[1:-1]
-
-        # Numeric literal
-        if expr.isdigit():
-            return int(expr)
-        try:
-            if '.' in expr:
-                return float(expr)
-        except ValueError:
-            pass
-
-        # Hex literal
-        if expr.startswith('0x'):
-            try:
-                return int(expr, 16)
-            except ValueError:
-                pass
-
-        # Variable lookup
-        if expr in self.variables:
-            return self.variables[expr]
-
-        # Simple math
-        for op in ['+', '-', '*', '/', '%']:
-            if op in expr:
-                parts = expr.split(op, 1)
-                if len(parts) == 2:
-                    left = self.parse_simple_expression(parts[0])
-                    right = self.parse_simple_expression(parts[1])
-                    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                        try:
-                            return {
-                                '+': left + right,
-                                '-': left - right,
-                                '*': left * right,
-                                '/': left / right if right != 0 else None,
-                                '%': left % right if right != 0 else None
-                            }[op]
-                        except Exception:
-                            return None
-        return expr
-
-    def simulate_function_call(self, func_name: str, args: List[str]) -> Any:
-        parsed_args = [self.parse_simple_expression(arg) for arg in args]
-
-        if func_name in self.builtins:
-            try:
-                return self.builtins[func_name](*parsed_args)
-            except Exception as e:
-                self.logger.debug(f"Error calling {func_name}: {e}")
+    def _operand_value(self, frame: VMFrame, instr: VMInstruction, name: str, raw: Optional[int]) -> Any:
+        mode = instr.aux.get(f"{name}_mode", "register")
+        if mode == "register":
+            return self._read_register(frame, raw)
+        if mode == "const":
+            key = f"const_{name}"
+            if key in instr.aux:
+                return instr.aux[key]
+            index = instr.aux.get(f"{name}_index", raw)
+            if isinstance(index, int) and 0 <= index < len(frame.func.constants):
+                return frame.func.constants[index]
+            return index
+        if mode == "immediate":
+            return instr.aux.get(f"immediate_{name}", raw)
+        if mode == "rk":
+            key = f"const_{name}"
+            if key in instr.aux:
+                return instr.aux[key]
+            return self._read_register(frame, raw)
+        if mode == "upvalue":
+            if raw is None:
                 return None
+            return frame.upvalues.get(raw)
+        return raw
 
-        if func_name in self.functions:
-            return self.execute_function(func_name, parsed_args)
-        return None
+    def _store_result(self, frame: VMFrame, instr: VMInstruction, value: Any) -> None:
+        self._write_register(frame, instr.a, value)
 
-    def execute_function(self, func_name: str, args: List[Any]) -> Any:
-        if func_name not in self.functions:
+    # ------------------------------------------------------------------
+    # Arithmetic helpers with metamethod fallbacks
+    def _binary_operation(
+        self,
+        frame: VMFrame,
+        instr: VMInstruction,
+        operation: Callable[[Any, Any], Any],
+        metamethod: str,
+    ) -> None:
+        left = self._operand_value(frame, instr, "b", instr.b)
+        right = self._operand_value(frame, instr, "c", instr.c)
+        try:
+            result = operation(left, right)
+        except Exception:
+            result = self._invoke_metamethod(frame, left, right, metamethod)
+        self._store_result(frame, instr, result)
+
+    def _unary_operation(
+        self,
+        frame: VMFrame,
+        instr: VMInstruction,
+        operation: Callable[[Any], Any],
+        metamethod: str,
+    ) -> None:
+        operand = self._operand_value(frame, instr, "b", instr.b)
+        try:
+            result = operation(operand)
+        except Exception:
+            result = self._invoke_metamethod(frame, operand, None, metamethod)
+        self._store_result(frame, instr, result)
+
+    def _invoke_metamethod(self, frame: VMFrame, left: Any, right: Any, name: str) -> Any:
+        for candidate in (left, right):
+            if isinstance(candidate, dict) and name in candidate:
+                method = candidate[name]
+                if isinstance(method, str):
+                    method = self._globals.get(method)
+                if callable(method):
+                    if right is None:
+                        return method(candidate)
+                    return method(left, right)
+        raise VMEmulationError(f"metamethod {name} not found")
+
+    # ------------------------------------------------------------------
+    # Opcode handlers
+    def _op_loadk(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "b", instr.b)
+        self._store_result(frame, instr, value)
+
+    def _op_loadn(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "b", instr.b)
+        self._store_result(frame, instr, value)
+
+    def _op_loadb(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = bool(self._operand_value(frame, instr, "b", instr.b))
+        self._store_result(frame, instr, value)
+
+    def _op_loadnil(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._store_result(frame, instr, None)
+
+    def _op_move(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "b", instr.b)
+        self._store_result(frame, instr, value)
+
+    def _op_getglobal(self, frame: VMFrame, instr: VMInstruction) -> None:
+        name = self._operand_value(frame, instr, "b", instr.b)
+        self._store_result(frame, instr, self._globals.get(name))
+
+    def _op_setglobal(self, frame: VMFrame, instr: VMInstruction) -> None:
+        name = self._operand_value(frame, instr, "b", instr.b)
+        value = self._operand_value(frame, instr, "a", instr.a)
+        if isinstance(name, str):
+            self._globals[name] = value
+
+    def _op_getupval(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "b", instr.b)
+        self._store_result(frame, instr, value)
+
+    def _op_setupval(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "a", instr.a)
+        index = instr.aux.get("upvalue_index", instr.b or 0)
+        frame.upvalues[index] = value
+
+    def _op_newtable(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._store_result(frame, instr, {})
+
+    def _op_settable(self, frame: VMFrame, instr: VMInstruction) -> None:
+        table = self._operand_value(frame, instr, "a", instr.a)
+        key = self._operand_value(frame, instr, "b", instr.b)
+        value = self._operand_value(frame, instr, "c", instr.c)
+        if isinstance(table, dict):
+            if key in table or "__newindex" not in table:
+                table[key] = value
+            else:
+                self._invoke_newindex(frame, table, key, value)
+
+    def _invoke_newindex(self, frame: VMFrame, table: Dict[Any, Any], key: Any, value: Any) -> None:
+        handler = table.get("__newindex")
+        if isinstance(handler, str):
+            handler = self._globals.get(handler)
+        if callable(handler):
+            handler(table, key, value)
+        elif isinstance(handler, dict):
+            handler[key] = value
+        else:
+            table[key] = value
+
+    def _op_gettable(self, frame: VMFrame, instr: VMInstruction) -> None:
+        table = self._operand_value(frame, instr, "b", instr.b)
+        key = self._operand_value(frame, instr, "c", instr.c)
+        if isinstance(table, dict):
+            if key in table:
+                value = table[key]
+            else:
+                value = self._invoke_index(frame, table, key)
+        else:
+            value = None
+        self._store_result(frame, instr, value)
+
+    def _invoke_index(self, frame: VMFrame, table: Dict[Any, Any], key: Any) -> Any:
+        handler = table.get("__index")
+        if handler is None:
             return None
-        func_def = self.functions[func_name]
-        return_match = re.search(r'return\s+([^;\n]+)', func_def)
-        if return_match:
-            return self.parse_simple_expression(return_match.group(1).strip())
+        if isinstance(handler, str):
+            handler = self._globals.get(handler)
+        if callable(handler):
+            return handler(table, key)
+        if isinstance(handler, dict):
+            return handler.get(key)
         return None
 
-    def analyze_control_flow(self, content: str) -> Dict[str, List]:
-        patterns = {
-            'if_statements': [],
-            'for_loops': [],
-            'while_loops': [],
-            'function_calls': [],
-            'assignments': []
-        }
+    def _op_self(self, frame: VMFrame, instr: VMInstruction) -> None:
+        table = self._operand_value(frame, instr, "b", instr.b)
+        key = self._operand_value(frame, instr, "c", instr.c)
+        self._write_register(frame, instr.a, table)
+        next_reg = None if instr.a is None else instr.a + 1
+        method = None
+        if isinstance(table, dict):
+            method = table.get(key)
+        elif table is not None:
+            method = getattr(table, key, None)
+        self._write_register(frame, next_reg, method)
 
-        if_pattern = r'if\s+(.*?)\s+then(.*?)end'
-        for match in re.finditer(if_pattern, content, re.DOTALL):
-            patterns['if_statements'].append({
-                'condition': match.group(1).strip(),
-                'body': match.group(2).strip(),
-                'position': match.start()
-            })
+    def _op_len(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "b", instr.b)
+        try:
+            result = len(value)
+        except Exception:
+            result = self._invoke_metamethod(frame, value, None, "__len")
+        self._store_result(frame, instr, result)
 
-        for_pattern = r'for\s+(\w+)\s*=\s*([^,]+),\s*([^do]+)do(.*?)end'
-        for match in re.finditer(for_pattern, content, re.DOTALL):
-            patterns['for_loops'].append({
-                'variable': match.group(1),
-                'start': match.group(2).strip(),
-                'end': match.group(3).strip(),
-                'body': match.group(4).strip(),
-                'position': match.start()
-            })
+    def _op_concat(self, frame: VMFrame, instr: VMInstruction) -> None:
+        left = self._operand_value(frame, instr, "b", instr.b)
+        right = self._operand_value(frame, instr, "c", instr.c)
+        self._store_result(frame, instr, f"{left}{right}")
 
-        while_pattern = r'while\s+(.*?)\s+do(.*?)end'
-        for match in re.finditer(while_pattern, content, re.DOTALL):
-            patterns['while_loops'].append({
-                'condition': match.group(1).strip(),
-                'body': match.group(2).strip(),
-                'position': match.start()
-            })
+    def _op_not(self, frame: VMFrame, instr: VMInstruction) -> None:
+        value = self._operand_value(frame, instr, "b", instr.b)
+        self._store_result(frame, instr, not bool(value))
 
-        call_pattern = r'(\w+)\s*\(([^)]*)\)'
-        for match in re.finditer(call_pattern, content):
-            patterns['function_calls'].append({
-                'function': match.group(1),
-                'args': [arg.strip() for arg in match.group(2).split(',') if arg.strip()],
-                'position': match.start()
-            })
+    def _op_band(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: int(a) & int(b), "__band")
 
-        assign_pattern = r'(\w+)\s*=\s*([^;\n]+)'
-        for match in re.finditer(assign_pattern, content):
-            patterns['assignments'].append({
-                'variable': match.group(1),
-                'value': match.group(2).strip(),
-                'position': match.start()
-            })
+    def _op_bor(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: int(a) | int(b), "__bor")
 
-        return patterns
+    def _op_bxor(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: int(a) ^ int(b), "__bxor")
 
-    def extract_string_operations(self, content: str) -> List[Dict[str, Any]]:
-        operations = []
+    def _op_bnot(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._unary_operation(frame, instr, lambda a: ~int(a), "__bnot")
 
-        concat_pattern = r'([^.\s][^.]*)\.\.\s*([^.\s][^.]*)'
-        for match in re.finditer(concat_pattern, content):
-            left = self.parse_simple_expression(match.group(1))
-            right = self.parse_simple_expression(match.group(2))
-            if isinstance(left, str) and isinstance(right, str):
-                operations.append({
-                    'type': 'concatenation',
-                    'left': left,
-                    'right': right,
-                    'result': left + right,
-                    'position': match.start()
-                })
+    def _op_shl(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: int(a) << int(b), "__shl")
 
-        string_funcs = ['string.char', 'string.byte', 'string.sub', 'string.find']
-        for func in string_funcs:
-            func_pattern = f'{func}\\s*\\(([^)]*)\\)'
-            for match in re.finditer(func_pattern, content):
-                args = [arg.strip() for arg in match.group(1).split(',') if arg.strip()]
-                operations.append({
-                    'type': 'function_call',
-                    'function': func,
-                    'args': args,
-                    'result': self.simulate_function_call(func, args),
-                    'position': match.start()
-                })
+    def _op_shr(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: int(a) >> int(b), "__shr")
 
-        return operations
+    def _op_add(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: a + b, "__add")
 
-    def simulate_execution_path(self, content: str) -> Dict[str, Any]:
-        self.logger.info("Starting VM simulation...")
+    def _op_sub(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: a - b, "__sub")
 
-        # Extract function definitions
-        func_pattern = r'function\s+(\w+)\s*\([^)]*\)\s*(.*?)\s*end'
-        for match in re.finditer(func_pattern, content, re.DOTALL):
-            self.functions[match.group(1)] = match.group(2)
+    def _op_mul(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: a * b, "__mul")
 
-        # Extract table definitions
-        table_pattern = r'(\w+)\s*=\s*\{([^}]*)\}'
-        for match in re.finditer(table_pattern, content):
-            elements = [self.parse_simple_expression(e.strip()) for e in match.group(2).split(',')]
-            self.tables[match.group(1)] = elements
+    def _op_div(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: a / b, "__div")
 
-        control_flow = self.analyze_control_flow(content)
-        string_ops = self.extract_string_operations(content)
+    def _op_mod(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: a % b, "__mod")
 
-        # Resolve variables
-        for assignment in control_flow['assignments']:
-            self.variables[assignment['variable']] = self.parse_simple_expression(assignment['value'])
+    def _op_pow(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._binary_operation(frame, instr, lambda a, b: a ** b, "__pow")
 
-        simulated_calls = []
-        for call in control_flow['function_calls']:
-            simulated_calls.append({
-                'function': call['function'],
-                'args': call['args'],
-                'result': self.simulate_function_call(call['function'], call['args']),
-                'position': call['position']
-            })
+    def _op_unm(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._unary_operation(frame, instr, lambda a: -a, "__unm")
 
-        return {
-            'functions': dict(self.functions),
-            'tables': dict(self.tables),
-            'variables': dict(self.variables),
-            'control_flow': control_flow,
-            'string_operations': string_ops,
-            'simulated_calls': simulated_calls,
-            'execution_summary': {
-                'functions_defined': len(self.functions),
-                'tables_created': len(self.tables),
-                'variables_assigned': len(self.variables),
-                'function_calls_simulated': len(simulated_calls),
-                'string_operations': len(string_ops)
-            }
-        }
+    def _comparison(self, frame: VMFrame, instr: VMInstruction, op: Callable[[Any, Any], bool]) -> None:
+        left = self._operand_value(frame, instr, "b", instr.b)
+        right = self._operand_value(frame, instr, "c", instr.c)
+        try:
+            result = op(left, right)
+        except Exception:
+            result = self._invoke_metamethod(frame, left, right, "__eq")
+        self._store_result(frame, instr, result)
+
+    def _op_eq(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._comparison(frame, instr, lambda a, b: a == b)
+
+    def _op_ne(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._comparison(frame, instr, lambda a, b: a != b)
+
+    def _op_lt(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._comparison(frame, instr, lambda a, b: a < b)
+
+    def _op_le(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._comparison(frame, instr, lambda a, b: a <= b)
+
+    def _op_gt(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._comparison(frame, instr, lambda a, b: a > b)
+
+    def _op_ge(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._comparison(frame, instr, lambda a, b: a >= b)
+
+    def _jump(self, frame: VMFrame, instr: VMInstruction, condition: Optional[bool]) -> None:
+        offset = int(instr.aux.get("offset", instr.b or 0))
+        if condition is None or condition:
+            frame.pc += offset
+
+    def _op_jmp(self, frame: VMFrame, instr: VMInstruction) -> None:
+        self._jump(frame, instr, True)
+
+    def _op_jmpif(self, frame: VMFrame, instr: VMInstruction) -> None:
+        condition = bool(self._operand_value(frame, instr, "a", instr.a))
+        self._jump(frame, instr, condition)
+
+    def _op_jmpifnot(self, frame: VMFrame, instr: VMInstruction) -> None:
+        condition = not bool(self._operand_value(frame, instr, "a", instr.a))
+        self._jump(frame, instr, condition)
+
+    def _op_test(self, frame: VMFrame, instr: VMInstruction) -> None:
+        expectation = bool(self._operand_value(frame, instr, "b", instr.b))
+        value = bool(self._operand_value(frame, instr, "a", instr.a))
+        if value != expectation:
+            frame.pc += 1
+
+    def _op_testset(self, frame: VMFrame, instr: VMInstruction) -> None:
+        expectation = bool(self._operand_value(frame, instr, "c", instr.c))
+        value = bool(self._operand_value(frame, instr, "b", instr.b))
+        if value == expectation:
+            self._store_result(frame, instr, self._operand_value(frame, instr, "b", instr.b))
+        else:
+            frame.pc += 1
+
+    def _op_forprep(self, frame: VMFrame, instr: VMInstruction) -> None:
+        base = instr.a or 0
+        start = self._read_register(frame, base)
+        step = self._read_register(frame, base + 2)
+        if start is None:
+            start = 0
+        if step is None:
+            step = 1
+        self._write_register(frame, base, start - step)
+        self._jump(frame, instr, True)
+
+    def _op_forloop(self, frame: VMFrame, instr: VMInstruction) -> None:
+        base = instr.a or 0
+        step = self._read_register(frame, base + 2) or 1
+        value = (self._read_register(frame, base) or 0) + step
+        limit = self._read_register(frame, base + 1) or 0
+        self._write_register(frame, base, value)
+        self._write_register(frame, base + 3, value)
+        if (step >= 0 and value <= limit) or (step < 0 and value >= limit):
+            frame.pc += int(instr.aux.get("offset", instr.b or 0))
+
+    def _op_call(self, frame: VMFrame, instr: VMInstruction) -> None:
+        base = instr.a or 0
+        arg_count = int(instr.aux.get("immediate_b", instr.b or 0))
+        ret_count = int(instr.aux.get("immediate_c", instr.c or 0))
+        func = self._read_register(frame, base)
+        args = [self._read_register(frame, base + i) for i in range(1, max(arg_count, 1))]
+        result = None
+        if callable(func):
+            result = func(*args)
+        if ret_count == 0:
+            return
+        if ret_count == 1:
+            self._write_register(frame, base, result)
+        else:
+            results = result if isinstance(result, (list, tuple)) else [result]
+            for offset, value in enumerate(results[:ret_count]):
+                self._write_register(frame, base + offset, value)
+
+    def _op_tailcall(self, frame: VMFrame, instr: VMInstruction) -> Any:
+        self._op_call(frame, instr)
+        self._frames.pop()
+        return None
+
+    def _op_return(self, frame: VMFrame, instr: VMInstruction) -> Any:
+        base = instr.a or 0
+        count = int(instr.aux.get("immediate_b", instr.b or 0))
+        if count <= 0:
+            result = None
+        else:
+            result = self._read_register(frame, base)
+        self._frames.pop()
+        return result
+
+    def _op_vararg(self, frame: VMFrame, instr: VMInstruction) -> None:
+        base = instr.a or 0
+        count = int(instr.aux.get("immediate_b", instr.b or 0))
+        for idx in range(count):
+            value = frame.varargs[idx] if idx < len(frame.varargs) else None
+            self._write_register(frame, base + idx, value)
+
+    def _op_closure(self, frame: VMFrame, instr: VMInstruction) -> None:
+        proto_index = instr.aux.get("proto_index", instr.b or 0)
+        if proto_index >= len(frame.func.prototypes):
+            raise VMEmulationError("closure prototype out of range")
+        proto = frame.func.prototypes[proto_index]
+        bindings: Dict[int, Any] = {}
+        for idx, spec in enumerate(instr.aux.get("upvalues", [])):
+            kind = spec.get("type", "register")
+            source = spec.get("index", idx)
+            if kind == "register":
+                bindings[idx] = self._read_register(frame, source)
+            else:
+                bindings[idx] = frame.upvalues.get(source)
+        closure = LuaClosure(self, proto, bindings)
+        self._store_result(frame, instr, closure)
+
+    def _op_setlist(self, frame: VMFrame, instr: VMInstruction) -> None:
+        table = self._operand_value(frame, instr, "a", instr.a)
+        count = int(instr.aux.get("immediate_b", instr.b or 0))
+        for offset in range(count):
+            value = self._read_register(frame, (instr.a or 0) + 1 + offset)
+            if isinstance(table, dict):
+                table[offset + 1] = value
+
+    def _op_close(self, frame: VMFrame, instr: VMInstruction) -> None:  # pragma: no cover - stub
+        _ = instr
+
+
+__all__ = ["LuaVMSimulator", "LuaClosure"]

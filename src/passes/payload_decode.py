@@ -1,0 +1,168 @@
+"""Payload decoding helpers for version-specific handling."""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict, List, TYPE_CHECKING
+
+from ..deobfuscator import VMIR
+from ..versions import PayloadInfo, VersionHandler, get_handler
+
+LOG = logging.getLogger(__name__)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..pipeline import Context
+
+
+ConstPool = List[Any]
+
+
+def run(ctx: "Context") -> Dict[str, Any]:
+    """Decode payloads and enrich context metadata."""
+
+    ctx.ensure_raw_input()
+    deob = ctx.deobfuscator
+    assert deob is not None
+
+    text = ctx.stage_output or ctx.raw_input
+    if not text:
+        ctx.stage_output = ""
+        return {"empty": True}
+
+    version = ctx.detected_version or deob.detect_version(text)
+    ctx.detected_version = version
+    features = version.features if version.features else None
+
+    result = deob.decode_payload(text, version=version, features=features)
+    output_text = result.text or ""
+    ctx.stage_output = output_text
+    if output_text:
+        ctx.decoded_payloads.append(output_text)
+
+    metadata: Dict[str, Any] = dict(result.metadata)
+    vm_ir = metadata.pop("vm_ir", None)
+    if isinstance(vm_ir, VMIR):
+        ctx.vm_ir = vm_ir
+        metadata["vm_ir"] = {
+            "constants": len(vm_ir.constants),
+            "bytecode": len(vm_ir.bytecode),
+            "prototypes": len(vm_ir.prototypes or []),
+        }
+
+    if version.name == "luraph_v14_2_json":
+        handler_meta = _populate_v142_json_payload(ctx, text)
+        if handler_meta:
+            metadata.update(handler_meta)
+
+    return metadata
+
+
+def _populate_v142_json_payload(ctx: "Context", text: str) -> Dict[str, Any]:
+    """Extract bytecode details for the JSON-based v14.2 handler."""
+
+    try:
+        handler = get_handler("luraph_v14_2_json")
+    except KeyError:
+        return {}
+    if not isinstance(handler, VersionHandler):
+        return {}
+
+    payload = handler.locate_payload(text)
+    if payload is None:
+        return {}
+
+    try:
+        raw_bytes = handler.extract_bytecode(payload)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.debug("failed to extract v14.2 JSON bytecode: %s", exc, exc_info=True)
+        return {"handler_bytecode_error": str(exc)}
+
+    data = _payload_mapping(payload)
+
+    const_pool: ConstPool = _ensure_list(data.get("constants"))
+    ctx.vm.const_pool = const_pool
+
+    proto_candidates = _ensure_list(
+        data.get("prototypes") if isinstance(data, dict) else None
+    )
+    if not proto_candidates and isinstance(data, dict):
+        proto_candidates = _ensure_list(data.get("protos"))
+    proto_count = len(proto_candidates)
+
+    endianness = "little"
+    if isinstance(data, dict):
+        raw_endian = data.get("endianness") or data.get("endian")
+        if isinstance(raw_endian, str) and raw_endian:
+            endianness = raw_endian.lower()
+
+    initial_pc = 0
+    if isinstance(data, dict):
+        initial_pc = _first_int(data, "initial_pc", "pc", "start_pc")
+
+    ctx.vm.bytecode = raw_bytes
+    ctx.vm.meta.clear()
+    ctx.vm.meta.update(
+        {
+            "endianness": endianness,
+            "proto_count": proto_count,
+            "initial_pc": initial_pc,
+        }
+    )
+
+    opcodes = list(raw_bytes)
+    if opcodes:
+        op_min = min(opcodes)
+        op_max = max(opcodes)
+        ctx.vm.meta["opcode_min"] = op_min
+        ctx.vm.meta["opcode_max"] = op_max
+        op_range = f"0x{op_min:02x}-0x{op_max:02x}"
+    else:
+        op_range = "n/a"
+
+    LOG.debug(
+        "luraph_v14_2_json payload extracted: size=%d protos=%d range=%s",
+        len(raw_bytes),
+        proto_count,
+        op_range,
+    )
+
+    metadata: Dict[str, Any] = {
+        "handler_payload_bytes": len(raw_bytes),
+        "handler_proto_count": proto_count,
+        "handler_endianness": endianness,
+        "handler_initial_pc": initial_pc,
+        "handler_const_count": len(const_pool),
+    }
+    if opcodes:
+        metadata["handler_opcode_min"] = min(opcodes)
+        metadata["handler_opcode_max"] = max(opcodes)
+
+    return metadata
+
+
+def _payload_mapping(payload: PayloadInfo) -> Dict[str, Any]:
+    if payload.data and isinstance(payload.data, dict):
+        return payload.data
+    try:
+        data = json.loads(payload.text)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ensure_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return list(value)
+    return []
+
+
+def _first_int(data: Dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+__all__ = ["run"]
