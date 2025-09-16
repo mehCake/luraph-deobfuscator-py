@@ -27,6 +27,8 @@ from .passes.preprocess import run as preprocess_run
 from .passes.payload_decode import run as payload_decode_run
 from .passes.vm_devirtualize import run as vm_devirtualize_run
 from .passes.vm_lift import run as vm_lift_run
+from .passes.cleanup import run as cleanup_run
+from .passes.render import run as render_run
 
 LOG = logging.getLogger(__name__)
 
@@ -218,31 +220,17 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
 
 
 def _pass_cleanup(ctx: Context) -> None:
-    deob = ctx.deobfuscator
-    assert deob is not None
-    text = ctx.stage_output
-    if not text:
-        ctx.record_metadata("cleanup", {"empty": True})
-        return
-    cleaned = deob.cleanup(text)
-    ctx.stage_output = cleaned
-    ctx.record_metadata("cleanup", {"changed": cleaned != text, "length": len(cleaned)})
-    ctx.write_artifact("cleanup", cleaned)
+    metadata = cleanup_run(ctx)
+    ctx.record_metadata("cleanup", metadata)
+    if ctx.stage_output:
+        ctx.write_artifact("cleanup", ctx.stage_output)
 
 
 def _pass_render(ctx: Context) -> None:
-    deob = ctx.deobfuscator
-    assert deob is not None
-    text = ctx.stage_output
-    if not text:
-        ctx.output = text
-        ctx.record_metadata("render", {"empty": True})
-        return
-    rendered = deob.render(text)
-    ctx.stage_output = rendered
-    ctx.output = rendered
-    ctx.record_metadata("render", {"length": len(rendered)})
-    ctx.write_artifact("render", rendered)
+    metadata = render_run(ctx)
+    ctx.record_metadata("render", metadata)
+    if ctx.stage_output:
+        ctx.write_artifact("render", ctx.stage_output)
 
 
 PIPELINE.register_pass("detect", _pass_detect, 10)

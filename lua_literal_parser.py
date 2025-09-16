@@ -169,7 +169,8 @@ class _LuaParser:
             return self._parse_short_string()
         if ch == "[" and self.text.startswith("[[", self.pos):
             return self._parse_long_string()
-        if ch.isdigit() or (ch == "-" and self._peek_ahead(1) and self._peek_ahead(1).isdigit()):
+        next_ch = self._peek_ahead(1)
+        if ch.isdigit() or (ch == "-" and next_ch is not None and next_ch.isdigit()):
             return self._parse_number()
         if _is_identifier_start(ch):
             ident = self._parse_identifier()

@@ -236,6 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {
                         "detect_only": args.detect_only,
                         "format": args.format,
+                        "render_output": str(item.destination),
                     }
                 )
                 only_selection: Optional[Iterable[str]] = only or None
