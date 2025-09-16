@@ -1,4 +1,4 @@
-# Lua Deobfuscator
+# Lua Deobfuscator (IN BETA MIGHT NOT WORK YET.)
 
 Utilities for decoding Lua scripts obfuscated with Luraph/Luarmor styles.  The
 project ships a small command line interface together with a handful of helper
