@@ -85,6 +85,42 @@ testing.  The CLI remains a thin wrapper around
 `src.deobfuscator.LuaDeobfuscator`, which can also be used directly from Python
 code.
 
+## JSON input (Luraph v14.2 JSON variant)
+
+When a `.json` file is supplied the preprocessing stage flattens nested arrays
+of strings into a single Lua chunk before handing control to the detector.  The
+reconstructed source is also written to a temporary `_reconstructed.lua` file or
+an artifacts directory so you can inspect the loader that ships with the JSON
+payload.【F:src/passes/preprocess.py†L16-L61】
+
+Run the variant end to end (with IR and trace dumps) using:
+
+```bash
+python main.py init.json -o ./out --trace --dump-ir out/ir.txt
+```
+
+### Detection and overrides
+
+The high-priority `luraph_v14_2_json` handler looks for the short
+`init_fn(...)` bootstrap, script-key initialisation, and long high-entropy blobs
+that characterise this release.  It also walks embedded JSON/long-string blocks
+to locate the payload before extracting bytecode and constants.【F:src/versions/luraph_v14_2_json.py†L13-L79】
+
+If detection misfires you can inspect what the detector sees via
+`--detect-only` or skip heuristics entirely with
+`--force-version luraph_v14_2_json` on the CLI.  The override hooks straight
+into the pipeline and bypasses automatic detection for the current run.【F:src/main.py†L205-L243】
+
+### Limits & troubleshooting
+
+- Detailed logs are always written to `deobfuscator.log`; enable `--verbose` to
+  mirror them to the console while keeping the file on disk.【F:src/main.py†L1-L52】
+- Unknown VM opcodes are reported with their program counter.  Check the log for
+  `unknown opcode 0x..` entries when output still contains VM scaffolding.【F:src/passes/vm_lift.py†L77-L95】
+- Capture a textual VM IR listing with `--dump-ir` and attach it alongside the
+  original sample when filing an issue; it helps pinpoint unsupported patterns in
+  the lifter or devirtualiser.【F:src/main.py†L226-L234】
+
 ## Project map
 
 The repository keeps long-lived helper modules at the top level for
