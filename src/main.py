@@ -211,7 +211,13 @@ def _format_ir_arg(value: object) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
-    parser.add_argument("--in", dest="input_path", help="input file or directory")
+    parser.add_argument(
+        "-i",
+        "--in",
+        "--input",
+        dest="input_path",
+        help="input file or directory",
+    )
     parser.add_argument("path", nargs="?", help="input file or directory (fallback)")
     parser.add_argument("-o", "--out", "--output", dest="output", help="output file path")
     parser.add_argument("--format", choices=("lua", "json"), default="lua", help="output format")
