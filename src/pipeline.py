@@ -25,6 +25,7 @@ from . import utils
 from .deobfuscator import LuaDeobfuscator, VMIR
 from .passes.preprocess import run as preprocess_run
 from .passes.payload_decode import run as payload_decode_run
+from .passes.vm_devirtualize import run as vm_devirtualize_run
 from .passes.vm_lift import run as vm_lift_run
 
 LOG = logging.getLogger(__name__)
@@ -207,18 +208,13 @@ def _pass_vm_lift(ctx: Context) -> None:
 
 
 def _pass_vm_devirtualize(ctx: Context) -> None:
-    if ctx.vm_ir is None:
+    if ctx.ir_module is None:
         ctx.record_metadata("vm_devirtualize", {"skipped": True})
         return
-    deob = ctx.deobfuscator
-    assert deob is not None
-    version = ctx.detected_version
-    features = version.features if version and version.features else None
-    result = deob.devirtualize(ctx.vm_ir, version=version, features=features)
-    ctx.record_metadata("vm_devirtualize", dict(result.metadata))
-    if result.text:
-        ctx.stage_output = result.text
-        ctx.write_artifact("vm_devirtualize", result.text)
+    metadata = vm_devirtualize_run(ctx)
+    ctx.record_metadata("vm_devirtualize", dict(metadata))
+    if ctx.stage_output:
+        ctx.write_artifact("vm_devirtualize", ctx.stage_output)
 
 
 def _pass_cleanup(ctx: Context) -> None:
