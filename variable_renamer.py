@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 import logging
 import re
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple, cast
 
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -318,13 +318,13 @@ class VariableRenamer:
                 return candidate
 
     # -- Helpers --------------------------------------------------------
-    def _sort_key(self, name: str) -> Sequence[int | str]:
+    def _sort_key(self, name: str) -> Tuple[int, int, str]:
         match = re.match(r"([A-Z]+)(\d+)", name)
         if match:
             prefix, number = match.groups()
             prefix_order = {"UPVAL": 0, "R": 1, "T": 2}.get(prefix, 3)
-            return (prefix_order, int(number))
-        return (4, name)
+            return (prefix_order, int(number), "")
+        return (4, 0, name)
 
     def _seed_existing_names(self, state: ScopeState, text: str) -> None:
         for match in _IDENTIFIER_RE.finditer(text):
@@ -445,10 +445,11 @@ class VariableRenamer:
                         block = stack.pop()
                         kind = block["kind"]
                         if kind == "function":
-                            header = block.get("header")
+                            header = cast(Optional[HeaderInfo], block.get("header"))
+                            start_idx = cast(int, block.get("start"))
                             spans.append(
                                 FunctionSpan(
-                                    start=block["start"],
+                                    start=start_idx,
                                     end=j,
                                     header=header,
                                 )

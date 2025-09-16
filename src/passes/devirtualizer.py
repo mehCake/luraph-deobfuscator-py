@@ -14,13 +14,15 @@ from src.lua_ast import (
     Call,
     CallStmt,
     Chunk,
+    Expr,
     ForNumeric,
+    If,
     LocalAssign,
     Name,
     Number,
     Return,
+    Stmt,
     String,
-    If,
     render_chunk,
 )
 
@@ -32,9 +34,11 @@ def _register_name(index: int) -> str:
     return f"r{index}"
 
 
-def _literal(value: object):
+def _literal(value: object) -> Expr:
+    if isinstance(value, bool):
+        return Number(1 if value else 0)
     if isinstance(value, (int, float)):
-        return Number(int(value)) if isinstance(value, bool) is False else Number(int(value))
+        return Number(int(value))
     if isinstance(value, str):
         return String(value)
     return Name(str(value))
@@ -50,28 +54,30 @@ class Devirtualizer:
     """Translate VM programs into readable pseudo Lua."""
 
     def __init__(self, function: Any) -> None:
+        self.instructions: List[VMInstruction]
+        self._stack_vm: Any | None = None
+        self.defined: Dict[int, bool] = {}
+
         if isinstance(function, VMFunction):
             self.mode = "canonical"
             self.function = function
-            self.instructions = function.instructions
+            self.instructions = list(function.instructions)
             self.cfg = self._build_cfg()
-            self.defined: Dict[int, bool] = {}
-            self._stack_vm = None
             self._var_idx = 0
         else:
             # Stack-based compatibility path used by legacy helpers.
             self.mode = "stack"
             self._stack_vm = function
-            self.instructions: List[VMInstruction] = []
+            self.instructions = []
             self.cfg = nx.DiGraph()
-            self.defined = {}
             self._var_idx = 0
 
     # ------------------------------------------------------------------
     def render(self) -> str:
         if self.mode == "stack":
             return self._render_stack_vm()
-        chunk = Chunk(body=self._emit_block(0, len(self.instructions))[0])
+        body, _ = self._emit_block(0, len(self.instructions))
+        chunk = Chunk(body=body)
         return render_chunk(chunk)
 
     # ------------------------------------------------------------------
@@ -94,8 +100,8 @@ class Devirtualizer:
         return graph
 
     # ------------------------------------------------------------------
-    def _emit_block(self, start: int, end: int) -> Tuple[List[object], int]:
-        stmts: List[object] = []
+    def _emit_block(self, start: int, end: int) -> Tuple[List[Stmt], int]:
+        stmts: List[Stmt] = []
         idx = start
         while idx < end:
             instr = self.instructions[idx]
@@ -114,7 +120,7 @@ class Devirtualizer:
                 target = idx + 1 + int(instr.aux.get("offset", instr.b or 0))
                 body, new_idx = self._emit_block(idx + 1, target)
                 cond_reg = instr.a or 0
-                condition = Name(_register_name(cond_reg))
+                condition: Expr = Name(_register_name(cond_reg))
                 if instr.opcode == "JMPIFNOT":
                     condition = Call(Name("not"), [condition])  # invert via call expression
                 stmts.append(If(test=condition, body=body))
@@ -135,21 +141,21 @@ class Devirtualizer:
             idx += 1
         return stmts, idx
 
-    def _translate_instruction(self, instr: VMInstruction):
+    def _translate_instruction(self, instr: VMInstruction) -> Optional[Stmt]:
         if instr.opcode == "LOADK":
             value = instr.aux.get("const_b")
-            target = _register_name(instr.a or 0)
+            target_name = _register_name(instr.a or 0)
             if not self.defined.get(instr.a or 0):
                 self.defined[instr.a or 0] = True
-                return LocalAssign(targets=[target], values=[_literal(value)])
-            return Assign(targets=[Name(target)], values=[_literal(value)])
+                return LocalAssign(targets=[target_name], values=[_literal(value)])
+            return Assign(targets=[Name(target_name)], values=[_literal(value)])
         if instr.opcode == "MOVE":
             src = Name(_register_name(instr.b or 0))
-            target = _register_name(instr.a or 0)
+            target_name = _register_name(instr.a or 0)
             if not self.defined.get(instr.a or 0):
                 self.defined[instr.a or 0] = True
-                return LocalAssign(targets=[target], values=[src])
-            return Assign(targets=[Name(target)], values=[src])
+                return LocalAssign(targets=[target_name], values=[src])
+            return Assign(targets=[Name(target_name)], values=[src])
         if instr.opcode in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "BAND", "BOR", "BXOR"}:
             op_map = {
                 "ADD": "+",
@@ -164,25 +170,29 @@ class Devirtualizer:
             }
             left = Name(_register_name(instr.b or 0))
             right = Name(_register_name(instr.c or 0))
-            target = Name(_register_name(instr.a or 0))
-            expr = BinOp(left=left, op=op_map[instr.opcode], right=right)
+            target_name = _register_name(instr.a or 0)
+            target = Name(target_name)
+            result_expr = BinOp(left=left, op=op_map[instr.opcode], right=right)
             if not self.defined.get(instr.a or 0):
                 self.defined[instr.a or 0] = True
-                return LocalAssign(targets=[target.ident], values=[expr])
-            return Assign(targets=[target], values=[expr])
+                return LocalAssign(targets=[target_name], values=[result_expr])
+            return Assign(targets=[target], values=[result_expr])
         if instr.opcode == "CALL":
             func = Name(_register_name(instr.a or 0))
             arg_count = int(instr.aux.get("immediate_b", instr.b or 0))
-            args = [Name(_register_name((instr.a or 0) + i)) for i in range(1, max(arg_count, 1))]
+            args: List[Expr] = [
+                Name(_register_name((instr.a or 0) + i))
+                for i in range(1, max(arg_count, 1))
+            ]
             return CallStmt(call=Call(func=func, args=args))
         if instr.opcode == "GETGLOBAL":
             value = instr.aux.get("const_b")
-            target = _register_name(instr.a or 0)
+            target_name = _register_name(instr.a or 0)
             expr = Name(str(value)) if isinstance(value, str) else _literal(value)
             if not self.defined.get(instr.a or 0):
                 self.defined[instr.a or 0] = True
-                return LocalAssign(targets=[target], values=[expr])
-            return Assign(targets=[Name(target)], values=[expr])
+                return LocalAssign(targets=[target_name], values=[expr])
+            return Assign(targets=[Name(target_name)], values=[expr])
         return None
 
     # Stack VM compatibility -------------------------------------------------
@@ -192,10 +202,12 @@ class Devirtualizer:
         return name
 
     def _render_stack_vm(self) -> str:
-        if not hasattr(self._stack_vm, "state"):
+        vm = self._stack_vm
+        if vm is None or not hasattr(vm, "state"):
             return ""
-        bytecode = getattr(self._stack_vm.state, "bytecode", [])
-        constants = getattr(self._stack_vm.state, "constants", [])
+        state = getattr(vm, "state")
+        bytecode = getattr(state, "bytecode", [])
+        constants = getattr(state, "constants", [])
         lines: List[str] = []
         stack: List[Dict[str, Any]] = []
 

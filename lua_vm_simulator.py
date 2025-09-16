@@ -145,6 +145,8 @@ class LuaVMSimulator:
                 return instr.aux[key]
             return self._read_register(frame, raw)
         if mode == "upvalue":
+            if raw is None:
+                return None
             return frame.upvalues.get(raw)
         return raw
 
@@ -286,7 +288,13 @@ class LuaVMSimulator:
         table = self._operand_value(frame, instr, "b", instr.b)
         key = self._operand_value(frame, instr, "c", instr.c)
         self._write_register(frame, instr.a, table)
-        self._write_register(frame, instr.a + 1, None if table is None else getattr(table, key, None))
+        next_reg = None if instr.a is None else instr.a + 1
+        method = None
+        if isinstance(table, dict):
+            method = table.get(key)
+        elif table is not None:
+            method = getattr(table, key, None)
+        self._write_register(frame, next_reg, method)
 
     def _op_len(self, frame: VMFrame, instr: VMInstruction) -> None:
         value = self._operand_value(frame, instr, "b", instr.b)

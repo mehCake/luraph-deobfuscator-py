@@ -9,7 +9,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar, cast
 
 from .exceptions import VMEmulationError
 from .passes import Devirtualizer
@@ -503,8 +503,9 @@ def serialise_metadata(value: Any) -> Any:
         return [serialise_metadata(item) for item in value]
     if isinstance(value, Mapping):
         return {str(key): serialise_metadata(item) for key, item in value.items()}
-    if is_dataclass(value):
-        return {str(key): serialise_metadata(item) for key, item in asdict(value).items()}
+    if is_dataclass(value) and not isinstance(value, type):
+        data = asdict(cast(Any, value))
+        return {str(key): serialise_metadata(item) for key, item in data.items()}
     return repr(value)
 
 
