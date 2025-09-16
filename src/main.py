@@ -97,11 +97,21 @@ def _default_output_path(source: Path, fmt: str) -> Path:
     return source.with_name(f"{source.stem}_deob{suffix}")
 
 
-def _prepare_work_items(inputs: List[Path], override: Optional[Path], fmt: str) -> Iterable[WorkItem]:
-    if override is not None and len(inputs) > 1:
+def _prepare_work_items(
+    inputs: List[Path],
+    override: Optional[Path],
+    fmt: str,
+    treat_override_as_dir: bool,
+) -> Iterable[WorkItem]:
+    if override is not None and not treat_override_as_dir and len(inputs) > 1:
         raise ValueError("--out/--output can only be used with a single input file")
     for src in inputs:
-        dst = override if override is not None else _default_output_path(src, fmt)
+        if override is None:
+            dst = _default_output_path(src, fmt)
+        elif treat_override_as_dir:
+            dst = override / _default_output_path(src, fmt).name
+        else:
+            dst = override
         yield WorkItem(src, dst)
 
 
@@ -257,9 +267,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.getLogger(__name__).warning("no input files discovered for %s", target)
         return 0
 
-    override = Path(args.output) if args.output else None
+    override_raw = args.output
+    override = Path(override_raw) if override_raw else None
+    treat_override_as_dir = False
+    if override is not None:
+        if len(inputs) > 1:
+            treat_override_as_dir = True
+        elif override.exists() and override.is_dir():
+            treat_override_as_dir = True
+        elif override_raw is not None and override_raw.endswith(("/", "\\")):
+            treat_override_as_dir = True
+        elif override.suffix == "":
+            treat_override_as_dir = True
+        if treat_override_as_dir:
+            utils.ensure_directory(override)
     try:
-        work_items = list(_prepare_work_items(inputs, override, args.format))
+        work_items = list(
+            _prepare_work_items(inputs, override, args.format, treat_override_as_dir)
+        )
     except ValueError as exc:
         logging.getLogger(__name__).error(str(exc))
         return 2

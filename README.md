@@ -99,6 +99,11 @@ Run the variant end to end (with IR and trace dumps) using:
 python main.py init.json -o ./out --trace --dump-ir out/ir.txt
 ```
 
+When the `-o/--out` flag targets a directory (whether or not it already exists),
+the CLI will create a `<input>_deob.lua` file within that folder.  Supplying a
+path with an explicit suffix writes to that file instead, matching the pipeline
+logic used by the pass runner.【F:src/main.py†L95-L115】【F:src/main.py†L270-L287】
+
 ### Detection and overrides
 
 The high-priority `luraph_v14_2_json` handler looks for the short

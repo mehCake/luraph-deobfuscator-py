@@ -399,7 +399,10 @@ def decode_virtual_machine(content: Any, handler=None) -> Optional[str]:
         return None
     if handler is not None:
         handler.process(vm)
-    result = vm.run()
+    try:
+        result = vm.run()
+    except VMEmulationError:
+        return None
     if isinstance(result, (str, int, float)):
         result_str = str(result)
         if _is_printable(result_str):
