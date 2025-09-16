@@ -89,3 +89,30 @@ def test_cli_writes_artifacts(tmp_path):
 
     produced = list(artifacts.rglob("render.lua"))
     assert produced, "expected render.lua artifact"
+
+
+def test_cli_accepts_json_inputs(tmp_path):
+    payload = ["print('json pipeline')\n"]
+    source = tmp_path / "sample.json"
+    source.write_text(json.dumps(payload))
+
+    _run_cli(source, tmp_path)
+
+    output = source.with_name(f"{source.stem}_deob.lua")
+    assert output.exists()
+    text = output.read_text()
+    assert "json pipeline" in text
+
+
+def test_cli_dump_ir_creates_listing(tmp_path):
+    source = PROJECT_ROOT / "examples" / "json_wrapped.lua"
+    target = tmp_path / source.name
+    target.write_text(source.read_text())
+
+    dump_dir = tmp_path / "ir"
+    _run_cli(target, tmp_path, "--dump-ir", str(dump_dir))
+
+    listings = list(dump_dir.glob("*.ir"))
+    assert listings, "expected IR listing"
+    listing_text = listings[0].read_text()
+    assert listing_text.strip()

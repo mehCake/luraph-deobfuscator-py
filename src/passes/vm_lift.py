@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -40,6 +41,8 @@ class VMLifter:
         consts: ConstPool,
         *,
         endianness: str | None = None,
+        step_limit: int | None = None,
+        time_limit: float | None = None,
     ) -> IRModule:
         end_str = (endianness or self.default_endianness or "little").lower()
         endian_value: Endian = "big" if end_str == "big" else "little"
@@ -52,8 +55,22 @@ class VMLifter:
         offset = 0
         word_size = 4
         length = len(bytecode)
+        parsed = 0
+        cap = step_limit if step_limit and step_limit > 0 else None
+        timeout = time_limit if time_limit and time_limit > 0 else None
+        start_time = time.perf_counter()
 
         while offset < length:
+            if cap is not None and parsed >= cap:
+                warning = f"step limit {cap} reached during VM lift"
+                warnings.append(warning)
+                LOG.warning(warning)
+                break
+            if timeout is not None and (time.perf_counter() - start_time) >= timeout:
+                warning = f"time limit {timeout:.3f}s reached during VM lift"
+                warnings.append(warning)
+                LOG.warning(warning)
+                break
             start = offset
             remaining = length - start
             if remaining < 1:
@@ -97,6 +114,7 @@ class VMLifter:
                 )
             )
             pc += 1
+            parsed += 1
 
         blocks, order = self._build_blocks(instructions)
 
@@ -593,11 +611,31 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
     endianness = ctx.vm.meta.get("endianness") if ctx.vm.meta else None
 
     lifter = VMLifter()
+    options = ctx.options if isinstance(ctx.options, dict) else {}
+    raw_step_limit = options.get("vm_lift_step_limit")
+    raw_time_limit = options.get("vm_lift_time_limit")
+    step_limit: Optional[int] = None
+    time_limit: Optional[float] = None
+    if isinstance(raw_step_limit, int):
+        step_limit = raw_step_limit if raw_step_limit > 0 else None
+    elif isinstance(raw_step_limit, str) and raw_step_limit.isdigit():
+        value = int(raw_step_limit)
+        step_limit = value if value > 0 else None
+    if isinstance(raw_time_limit, (int, float)):
+        time_limit = float(raw_time_limit) if raw_time_limit > 0 else None
+    elif isinstance(raw_time_limit, str):
+        try:
+            parsed_time = float(raw_time_limit)
+        except ValueError:
+            parsed_time = 0.0
+        time_limit = parsed_time if parsed_time > 0 else None
     module = lifter.lift(
         ctx.vm.bytecode,
         op_table,
         ctx.vm.const_pool or [],
         endianness=endianness,
+        step_limit=step_limit,
+        time_limit=time_limit,
     )
 
     ctx.ir_module = module
@@ -608,8 +646,19 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
         "registers": len(module.register_types),
         "bytecode_size": module.bytecode_size,
     }
+    if step_limit is not None:
+        metadata["step_limit"] = step_limit
+    if time_limit is not None:
+        metadata["time_limit"] = time_limit
+    unknown_count = sum(1 for inst in module.instructions if inst.opcode == "Unknown")
+    if unknown_count:
+        metadata["unknown_opcodes"] = unknown_count
     if module.warnings:
         metadata["warnings"] = list(module.warnings)
+        if any("step limit" in warning for warning in module.warnings):
+            metadata["step_limit_hit"] = True
+        if any("time limit" in warning for warning in module.warnings):
+            metadata["time_limit_hit"] = True
 
     if ctx.artifacts and module.instructions:
         serialised = {

@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional, Sequence
 
 from . import pipeline, utils
 from .deobfuscator import LuaDeobfuscator
+from .utils.ir import IRModule
 from version_detector import VersionInfo
 
 LOG_FILE = Path("deobfuscator.log")
@@ -86,7 +87,7 @@ def _gather_inputs(target: Path) -> List[Path]:
     for candidate in target.rglob("*"):
         if not candidate.is_file():
             continue
-        if candidate.suffix.lower() in {".lua", ".txt"} or not candidate.suffix:
+        if candidate.suffix.lower() in {".lua", ".txt", ".json"} or not candidate.suffix:
             files.append(candidate)
     return sorted(files)
 
@@ -159,6 +160,45 @@ def _format_pipeline_output(
     return ctx.output or ctx.stage_output or ctx.raw_input
 
 
+def _render_ir_listing(module: IRModule) -> str:
+    lines: List[str] = []
+    lines.append(f"; entry: {module.entry}")
+    lines.append(f"; blocks: {module.block_count}, instructions: {module.instruction_count}")
+    if module.register_types:
+        registers = ", ".join(
+            f"R{reg}={typ}" for reg, typ in sorted(module.register_types.items())
+        )
+        lines.append(f"; registers: {registers}")
+    lines.append("")
+    for label in module.order:
+        block = module.blocks.get(label)
+        if block is None:
+            continue
+        successors = ", ".join(block.successors) if block.successors else "-"
+        lines.append(f"[{block.label}] start_pc={block.start_pc} -> {successors}")
+        for inst in block.instructions:
+            arg_items = ", ".join(
+                f"{key}={_format_ir_arg(value)}" for key, value in sorted(inst.args.items())
+            )
+            arg_suffix = f" {arg_items}" if arg_items else ""
+            dest_suffix = f" => R{inst.dest}" if inst.dest is not None else ""
+            lines.append(f"  {inst.pc:04d}: {inst.opcode}{arg_suffix}{dest_suffix}")
+        lines.append("")
+    if module.warnings:
+        lines.append("; warnings:")
+        for warning in module.warnings:
+            lines.append(f"; {warning}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_ir_arg(value: object) -> str:
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace("\n", "\\n")
+        return f'"{escaped}"'
+    return repr(value)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
     parser.add_argument("--in", dest="input_path", help="input file or directory")
@@ -174,7 +214,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--trace", dest="vm_trace", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--detect-only", action="store_true", help="only detect version information")
     parser.add_argument("--write-artifacts", metavar="DIR", help="write per-pass artifacts to DIR")
-    parser.add_argument("--version", help="override version detection with an explicit value")
+    parser.add_argument("--version", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--force-version",
+        dest="force_version",
+        help="bypass version detection with an explicit handler name",
+    )
+    parser.add_argument(
+        "--dump-ir",
+        metavar="PATH",
+        help="write a textual VM IR listing to PATH (file or directory)",
+    )
+    parser.add_argument(
+        "--step-limit",
+        type=int,
+        dest="step_limit",
+        help="cap the number of VM instructions processed during lifting",
+    )
+    parser.add_argument(
+        "--time-limit",
+        type=float,
+        dest="time_limit",
+        help="cap lifting time in seconds to prevent runaway decoding",
+    )
     parser.add_argument("--jobs", type=int, default=1, help="process inputs in parallel using N workers")
 
     args = parser.parse_args(argv)
@@ -202,6 +264,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.getLogger(__name__).error(str(exc))
         return 2
 
+    dump_ir_target: Optional[Path] = Path(args.dump_ir).resolve() if args.dump_ir else None
+    dump_ir_is_directory = False
+    if dump_ir_target is not None:
+        if dump_ir_target.exists() and dump_ir_target.is_dir():
+            dump_ir_is_directory = True
+        elif len(work_items) > 1:
+            dump_ir_is_directory = True
+        elif dump_ir_target.suffix == "":
+            dump_ir_is_directory = True
+        if dump_ir_is_directory:
+            utils.ensure_directory(dump_ir_target)
+        else:
+            utils.ensure_directory(dump_ir_target.parent)
+
     jobs = max(1, args.jobs)
     skip = _split_list(args.skip_passes)
     only = _split_list(args.only_passes)
@@ -227,7 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     input_path=item.source,
                     raw_input=previous,
                     stage_output=previous,
-                    version_override=args.version,
+                    version_override=args.force_version or getattr(args, "version", None),
                     artifacts=_artifact_dir(artifacts_root, item.source, iteration),
                     deobfuscator=deob,
                     iteration=iteration,
@@ -239,6 +315,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "render_output": str(item.destination),
                     }
                 )
+                if args.step_limit is not None:
+                    ctx.options["vm_lift_step_limit"] = max(0, args.step_limit)
+                if args.time_limit is not None:
+                    ctx.options["vm_lift_time_limit"] = max(0.0, args.time_limit)
                 only_selection: Optional[Iterable[str]] = only or None
                 if args.detect_only:
                     only_selection = ["detect"]
@@ -272,6 +352,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if not utils.safe_write_file(str(item.destination), output_text):
             return WorkResult(item, False, error="failed to write output")
+
+        if dump_ir_target and final_ctx:
+            if dump_ir_is_directory:
+                ir_path = dump_ir_target / f"{item.source.stem}.ir"
+            else:
+                ir_path = dump_ir_target
+            ir_module = final_ctx.ir_module
+            ir_text = _render_ir_listing(ir_module) if ir_module else "; no VM IR produced\n"
+            if not utils.safe_write_file(str(ir_path), ir_text):
+                logging.getLogger(__name__).warning(
+                    "failed to write IR listing to %s", ir_path
+                )
 
         summary_lines: List[str] = []
         if final_ctx.detected_version:

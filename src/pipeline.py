@@ -154,7 +154,26 @@ class PassRegistry:
             fn(ctx)
             duration = time.perf_counter() - start
             timings.append((name, duration))
-            LOG.debug("pass %s completed in %.3fs", name, duration)
+            metadata = ctx.pass_metadata.get(name)
+            summary_parts: List[str] = []
+            if isinstance(metadata, dict):
+                instructions = metadata.get("instructions")
+                blocks = metadata.get("blocks")
+                unknown = metadata.get("unknown_opcodes")
+                warnings = metadata.get("warnings")
+                if isinstance(instructions, int):
+                    summary_parts.append(f"ops={instructions}")
+                if isinstance(blocks, int):
+                    summary_parts.append(f"blocks={blocks}")
+                if isinstance(unknown, int):
+                    summary_parts.append(f"unknown={unknown}")
+                elif isinstance(warnings, list):
+                    summary_parts.append(f"warnings={len(warnings)}")
+                for key in ("step_limit_hit", "time_limit_hit", "skipped"):
+                    if metadata.get(key):
+                        summary_parts.append(f"{key}=true")
+            suffix = f" ({', '.join(summary_parts)})" if summary_parts else ""
+            LOG.info("pass %s completed in %.3fs%s", name, duration, suffix)
         return timings
 
 
