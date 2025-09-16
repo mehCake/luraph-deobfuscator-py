@@ -1,0 +1,8 @@
+[
+  "local script_key = script_key or getgenv().script_key",
+  "local init_fn = function(blob)",
+  "    local loaded = loadstring(blob)",
+  "    return loaded()",
+  "end",
+  "return init_fn(\"{\"constants\":[\"aGVsbG8gZnJvbSBsdXJhcGgganNvbiB2YXJpYW50\",\"print\",\"TsvKtr/F8BCDKMtX7j2Hxv/1uOViKYRCHkePN4Apz761XXgZQzYNCtq+tQfT1dwQjdjLX2mSCeeGVEwso5cNU7zAzKla72LyBOdnSnPAHIEm2Vb8+Qx+YWVVnKMgRuWj+D/3BtWk+l+40qu6GjnbRRoro9Vw+0akUFgvuVKrT7B+0dQVppsYgSZcHGBUg3LeK3GthKR65SBSJfaA1BYcIA==\"],\"bytecode\":[[1,0,0,0],[13,1,1,0],[0,2,0,0],[19,1,2,0],[21,0,1,0]],\"endianness\":\"little\"}\")"
+]
