@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar, cast
 
 from .exceptions import VMEmulationError
-from .passes import Devirtualizer
 from .vm import LuraphVM
 
 T = TypeVar("T")

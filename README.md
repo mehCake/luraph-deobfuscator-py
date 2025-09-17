@@ -93,16 +93,21 @@ reconstructed source is also written to a temporary `_reconstructed.lua` file or
 an artifacts directory so you can inspect the loader that ships with the JSON
 payload.【F:src/passes/preprocess.py†L16-L61】
 
-Run the variant end to end (with IR and trace dumps) using:
+Run the variant end to end (with VM tracing enabled) using:
 
 ```bash
-python main.py init.json -o ./out --trace --dump-ir out/ir.txt
+python main.py init.json -o ./out --trace
 ```
 
 When the `-o/--out` flag targets a directory (whether or not it already exists),
 the CLI will create a `<input>_deob.lua` file within that folder.  Supplying a
 path with an explicit suffix writes to that file instead, matching the pipeline
 logic used by the pass runner.【F:src/main.py†L95-L115】【F:src/main.py†L270-L287】
+
+The JSON handler extracts the encoded payload, decodes the bytecode and
+constant pool, inlines decrypted strings, and renames recovered registers so
+the resulting Lua chunk contains the true program logic with no residual
+obfuscation blobs.【F:src/passes/payload_decode.py†L16-L79】【F:src/passes/vm_devirtualize.py†L12-L84】【F:src/passes/devirtualizer.py†L1-L199】
 
 ### Detection and overrides
 

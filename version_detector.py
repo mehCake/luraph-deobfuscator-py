@@ -7,6 +7,12 @@ from typing import Dict, Iterable, Mapping, Tuple, FrozenSet
 from src.versions import iter_descriptors
 
 
+_JSON_INIT_RE = re.compile(r"(?:do\s+)?local\s+init_fn\s*=\s*function", re.IGNORECASE)
+_JSON_SCRIPT_KEY_RE = re.compile(
+    r"script_key\s*=\s*script_key\s*or\s*getgenv\(\)\.script_key",
+    re.IGNORECASE,
+)
+
 @dataclass(frozen=True)
 class VersionInfo:
     """Description of a detected Luraph VM version."""
@@ -41,7 +47,10 @@ class VersionDetector:
         self._descriptors: Dict[str, Mapping[str, object]] = dict(descriptors)
         self._all_features: FrozenSet[str] = self._collect_all_features()
 
-    def detect(self, content: str) -> VersionInfo:
+    def detect(self, content: str, *, from_json: bool = False) -> VersionInfo:
+        if from_json and _JSON_INIT_RE.search(content) and _JSON_SCRIPT_KEY_RE.search(content):
+            return self.info_for_name("luraph_v14_2_json")
+
         best = VersionInfo("unknown", 0, 0, frozenset(), 0.0, ())
         best_score = 0
         best_priority = -1
@@ -96,8 +105,8 @@ class VersionDetector:
                 best_priority = priority
         return best
 
-    def detect_version(self, content: str) -> VersionInfo:
-        return self.detect(content)
+    def detect_version(self, content: str, *, from_json: bool = False) -> VersionInfo:
+        return self.detect(content, from_json=from_json)
 
     @property
     def all_features(self) -> FrozenSet[str]:
