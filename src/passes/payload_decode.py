@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, TYPE_CHECKING
 
+from .. import utils
 from ..deobfuscator import VMIR
 from ..versions import PayloadInfo, VersionHandler, get_handler
 
@@ -30,7 +32,7 @@ def run(ctx: "Context") -> Dict[str, Any]:
         ctx.stage_output = ""
         return {"empty": True}
 
-    version = ctx.detected_version or deob.detect_version(text)
+    version = ctx.detected_version or deob.detect_version(text, from_json=ctx.from_json)
     ctx.detected_version = version
     features = version.features if version.features else None
 
@@ -77,6 +79,8 @@ def _populate_v142_json_payload(ctx: "Context", text: str) -> Dict[str, Any]:
     except Exception as exc:  # pragma: no cover - defensive
         LOG.debug("failed to extract v14.2 JSON bytecode: %s", exc, exc_info=True)
         return {"handler_bytecode_error": str(exc)}
+
+    _write_opcode_dump(raw_bytes)
 
     data = _payload_mapping(payload)
 
@@ -139,6 +143,16 @@ def _populate_v142_json_payload(ctx: "Context", text: str) -> Dict[str, Any]:
         metadata["handler_opcode_max"] = max(opcodes)
 
     return metadata
+
+
+def _write_opcode_dump(data: bytes) -> None:
+    try:
+        out_dir = Path("out")
+        utils.ensure_directory(out_dir)
+        hex_text = " ".join(f"{byte:02X}" for byte in data)
+        (out_dir / "opcodes.hex").write_text(hex_text, encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - debugging aid only
+        LOG.debug("failed to write opcode dump: %s", exc)
 
 
 def _payload_mapping(payload: PayloadInfo) -> Dict[str, Any]:

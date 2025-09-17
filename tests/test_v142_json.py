@@ -24,8 +24,7 @@ class _NoLoaderLuaDeobfuscator(LuaDeobfuscator):
 
 
 def _fixture_text() -> str:
-    data = json.loads(FIXTURE_PATH.read_text())
-    return flatten_json_to_lua(data)
+    return flatten_json_to_lua(FIXTURE_PATH)
 
 
 def _get_handler() -> VersionHandler:

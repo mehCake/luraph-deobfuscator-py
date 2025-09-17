@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional, Sequence
 
 from . import pipeline, utils
 from .deobfuscator import LuaDeobfuscator
+from .passes.preprocess import flatten_json_to_lua
 from .utils_pkg.ir import IRModule
 from version_detector import VersionInfo
 
@@ -324,7 +325,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return WorkResult(item, False, error="unable to read input file")
 
         deob = LuaDeobfuscator(vm_trace=args.vm_trace)
+        source_suffix = item.source.suffix.lower()
+        is_json_input = source_suffix == ".json"
+        reconstructed_lua: Optional[str] = None
         previous = content
+        if is_json_input:
+            try:
+                reconstructed_lua = flatten_json_to_lua(item.source)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("failed to flatten JSON input %s: %s", item.source, exc)
+            else:
+                previous = reconstructed_lua
         final_ctx: Optional[pipeline.Context] = None
         final_timings: List[tuple[str, float]] = []
 
@@ -334,10 +345,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     input_path=item.source,
                     raw_input=previous,
                     stage_output=previous,
+                    original_text=previous,
+                    working_text=previous,
                     version_override=args.force_version or getattr(args, "version", None),
                     artifacts=_artifact_dir(artifacts_root, item.source, iteration),
                     deobfuscator=deob,
                     iteration=iteration,
+                    from_json=is_json_input,
+                    reconstructed_lua=reconstructed_lua or "",
                 )
                 ctx.options.update(
                     {

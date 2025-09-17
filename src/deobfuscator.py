@@ -66,10 +66,16 @@ class LuaDeobfuscator:
         self._vm_trace = vm_trace
 
     # --- Pipeline stages -------------------------------------------------
-    def detect_version(self, text: str) -> VersionInfo:
+    def detect_version(
+        self,
+        text: str,
+        *,
+        from_json: bool | None = None,
+    ) -> VersionInfo:
         """Return heuristically detected Luraph version information."""
 
-        return self._version_detector.detect_version(text)
+        flag = self._looks_like_json(text) if from_json is None else from_json
+        return self._version_detector.detect_version(text, from_json=flag)
 
     def preprocess(self, text: str) -> str:
         """Normalise line endings and trim trailing whitespace."""
@@ -296,7 +302,11 @@ class LuaDeobfuscator:
         current = content
         for _ in range(iterations):
             processed = self.preprocess(current)
-            version = self._resolve_version(processed, version_override)
+            version = self._resolve_version(
+                processed,
+                version_override,
+                from_json=self._looks_like_json(current),
+            )
             output = self._run_strategies(processed, version)
             if output == current:
                 return output
@@ -322,7 +332,13 @@ class LuaDeobfuscator:
         )
 
     # --- Internal helpers ------------------------------------------------
-    def _resolve_version(self, text: str, override: str | None) -> VersionInfo:
+    def _resolve_version(
+        self,
+        text: str,
+        override: str | None,
+        *,
+        from_json: bool | None = None,
+    ) -> VersionInfo:
         if override:
             info = self._version_detector.info_for_name(override)
             features = info.features or self._all_features
@@ -335,7 +351,7 @@ class LuaDeobfuscator:
                 confidence=confidence,
                 matched_categories=info.matched_categories,
             )
-        return self.detect_version(text)
+        return self.detect_version(text, from_json=from_json)
 
     def _run_strategies(self, processed: str, version: VersionInfo) -> str:
         best_output = processed

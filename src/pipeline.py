@@ -69,10 +69,18 @@ class Context:
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
     ir_module: "IRModule | None" = None
+    from_json: bool = False
+    reconstructed_lua: str = ""
 
     def __post_init__(self) -> None:
         if self.deobfuscator is None:
             self.deobfuscator = LuaDeobfuscator()
+        try:
+            suffix = self.input_path.suffix.lower()
+        except AttributeError:
+            suffix = ""
+        if suffix == ".json":
+            self.from_json = True
         if self.raw_input:
             if not self.original_text:
                 self.original_text = self.raw_input
@@ -80,16 +88,32 @@ class Context:
                 self.working_text = self.raw_input
             if not self.stage_output:
                 self.stage_output = self.raw_input
+        elif self.reconstructed_lua:
+            self.raw_input = self.reconstructed_lua
+            self.stage_output = self.reconstructed_lua
+            self.working_text = self.reconstructed_lua
+            if not self.original_text:
+                self.original_text = self.reconstructed_lua
         if self.artifacts:
             utils.ensure_directory(self.artifacts)
 
     # ------------------------------------------------------------------
     def ensure_raw_input(self) -> None:
+        if self.input_path.suffix.lower() == ".json":
+            self.from_json = True
+
         if self.raw_input:
             if not self.original_text:
                 self.original_text = self.raw_input
             if not self.working_text:
                 self.working_text = self.raw_input
+            return
+        if self.reconstructed_lua:
+            self.raw_input = self.reconstructed_lua
+            self.stage_output = self.reconstructed_lua
+            self.working_text = self.reconstructed_lua
+            if not self.original_text:
+                self.original_text = self.reconstructed_lua
             return
         data = utils.safe_read_file(str(self.input_path))
         self.raw_input = data or ""
@@ -190,9 +214,13 @@ def _pass_detect(ctx: Context) -> None:
     assert deob is not None
 
     if ctx.version_override:
-        version = deob._resolve_version(ctx.raw_input, ctx.version_override)  # type: ignore[attr-defined]
+        version = deob._resolve_version(  # type: ignore[attr-defined]
+            ctx.raw_input,
+            ctx.version_override,
+            from_json=ctx.from_json,
+        )
     else:
-        version = deob.detect_version(ctx.raw_input)
+        version = deob.detect_version(ctx.raw_input, from_json=ctx.from_json)
     ctx.detected_version = version
 
     metadata: Dict[str, Any] = {
