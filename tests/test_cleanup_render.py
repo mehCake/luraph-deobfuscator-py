@@ -36,6 +36,30 @@ return result
     assert metadata["vm_trampolines"] >= 1
 
 
+def test_cleanup_strips_bootstrap_scaffolding(tmp_path) -> None:
+    snippet = """
+local script_key = script_key or getgenv().script_key
+local init_fn = function(blob)
+    while true do
+        break
+    end
+    return blob
+end
+
+return init_fn("payload")
+""".strip()
+
+    ctx = _make_context(tmp_path, snippet)
+    metadata = cleanup_run(ctx)
+
+    assert "script_key" not in ctx.stage_output
+    assert "init_fn" not in ctx.stage_output
+    assert metadata["bootstrap_keys"] >= 1
+    assert metadata["bootstrap_init_fn"] >= 1
+    assert metadata["bootstrap_init_call"] >= 1
+    assert "while true do" not in ctx.stage_output
+
+
 def test_render_writes_output_file(tmp_path) -> None:
     code = "return 42"
     ctx = _make_context(tmp_path, code)

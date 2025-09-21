@@ -15,12 +15,18 @@ FIXTURE_PATH = Path("tests/fixtures/v142_init.json")
 class _NoLoaderLuaDeobfuscator(LuaDeobfuscator):
     """Test helper that skips executing the VM during payload decoding."""
 
-    def decode_payload(self, text, *, version, features=None):  # type: ignore[override]
+    def decode_payload(self, text, *, version, features=None, script_key=None, bootstrapper=None):  # type: ignore[override]
         base = features if features is not None else version.features
         filtered = frozenset(base or ())
         if "loader" in filtered:
             filtered = frozenset(flag for flag in filtered if flag != "loader")
-        return super().decode_payload(text, version=version, features=filtered)
+        return super().decode_payload(
+            text,
+            version=version,
+            features=filtered,
+            script_key=script_key,
+            bootstrapper=bootstrapper,
+        )
 
 
 def _fixture_text() -> str:

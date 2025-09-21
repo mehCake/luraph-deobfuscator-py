@@ -86,6 +86,10 @@ INSTRUCTION_SIGNATURES: Dict[str, InstructionSignature] = {
     "TESTSET": InstructionSignature(["a", "b", "c"], {"a": "register", "b": "register", "c": "immediate"}),
     "FORPREP": InstructionSignature(["a", "offset"], {"a": "register", "offset": "offset"}),
     "FORLOOP": InstructionSignature(["a", "offset"], {"a": "register", "offset": "offset"}),
+    "TFORLOOP": InstructionSignature(
+        ["a", "offset", "c"],
+        {"a": "register", "offset": "offset", "c": "immediate"},
+    ),
     "CALL": InstructionSignature(["a", "b", "c"], {"a": "register", "b": "immediate", "c": "immediate"}),
     "TAILCALL": InstructionSignature(["a", "b", "c"], {"a": "register", "b": "immediate", "c": "immediate"}),
     "RETURN": InstructionSignature(["a", "b"], {"a": "register", "b": "immediate"}),
@@ -198,6 +202,9 @@ class OpcodeLifter:
                     elif isinstance(entry, (list, tuple)) and len(entry) == 2:
                         formatted.append({"type": str(entry[0]), "index": int(entry[1])})
                 aux["upvalues"] = formatted
+        target = data.get("target")
+        if isinstance(target, int):
+            aux["target"] = target
         else:
             aux["operands"] = data
 

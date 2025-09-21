@@ -18,6 +18,24 @@
       },
       "known_traps": []
     },
+    "luraph_v14_4_initv4": {
+      "module": "luraph_v14_4_1",
+      "priority": 80,
+      "opcode_map": {
+        "LOADK": "0x01",
+        "CALL": "0x13",
+        "RETURN": "0x15",
+        "JMP": "0x28"
+      },
+      "heuristics": {
+        "signatures": ["Luraph\\s+v14\\.4", "init_fn\\s*\\("],
+        "constants": ["script_key\\s*=\\s*script_key"],
+        "long_strings": ["[A-Za-z0-9+/=]{200,}", "s8W-[!-~]{64,}"],
+        "prologues": ["script_key\\s*=\\s*script_key", "init_fn\\\\s*\\\\([^)]*\\\\)\\\\s*;\\\\s*script_key"],
+        "alphabet": ["[\\\\\"'][0-9A-Za-z!#$%&()*+,-./:;<=>?@\\\\[\\\\]^_`{|}~]{85,}[\\\\\"']"]
+      },
+      "known_traps": []
+    },
     "v14.0.2": {
       "module": "v14_0",
       "opcode_map": {

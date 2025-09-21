@@ -15,9 +15,9 @@ BANNED_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
-DEFAULT_MARKERS = ("script_key", "hello", "luraph v", "version")
+DEFAULT_MARKERS = ("hello", "luraph v", "version", "function", "return")
 EXPECTED_MARKERS = {
-    "complex_obfuscated": ("script_key",),
+    "complex_obfuscated": ("function",),
 }
 
 

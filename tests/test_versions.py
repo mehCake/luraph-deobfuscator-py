@@ -17,11 +17,21 @@ def test_detect_version_examples() -> None:
 
     assert detector.detect_version(json_wrapped).name == 'v14.0.2'
     assert detector.detect_version(simple).name == 'v14.1'
-    assert detector.detect_version(complex_payload).name in {'v14.2', 'luraph_v14_2_json'}
+    assert detector.detect_version(complex_payload).name in {
+        'v14.2',
+        'luraph_v14_2_json',
+        'luraph_v14_4_initv4',
+        'v14.4.1',
+    }
 
     deob = LuaDeobfuscator()
     assert deob.detect_version(json_wrapped).name == 'v14.0.2'
-    assert deob.detect_version(complex_payload).name in {'v14.2', 'luraph_v14_2_json'}
+    assert deob.detect_version(complex_payload).name in {
+        'v14.2',
+        'luraph_v14_2_json',
+        'luraph_v14_4_initv4',
+        'v14.4.1',
+    }
 
 
 def test_v142_pcall_bypass() -> None:

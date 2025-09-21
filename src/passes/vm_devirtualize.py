@@ -6,6 +6,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from variable_renamer import VariableRenamer
+
+from .. import utils
 from ..utils_pkg import ast as lua_ast
 from ..utils_pkg.ir import IRInstruction, IRModule
 from ..versions import VersionHandler, decode_constant_pool, get_handler
@@ -28,7 +31,7 @@ class _RegisterNamer:
 
     def name(self, index: int) -> str:
         if index not in self._cache:
-            self._cache[index] = f"var_{index + 1}"
+            self._cache[index] = f"R{index}"
         return self._cache[index]
 
 
@@ -60,6 +63,7 @@ class IRDevirtualizer:
             "Test": self._handle_test,
             "ForPrep": self._handle_forprep,
             "ForLoop": self._handle_forloop,
+            "TForLoop": self._handle_tforloop,
             "VarArg": self._handle_vararg,
             "UpvalGet": self._handle_upval_get,
             "UpvalSet": self._handle_upval_set,
@@ -464,10 +468,43 @@ class IRDevirtualizer:
             return idx + 1
         cond = self._condition_expr(ctx, inst)
         conditional = inst.args.get("conditional")
-        if conditional == "JMPIFNOT":
+        if conditional == "JMPIF":
             cond = self._negate(cond)
+
         branch_ctx = ctx.clone()
         body, _ = self._lower_range(branch_ctx, idx + 1, target_idx)
+
+        jump_idx = target_idx - 1 if target_idx - 1 >= 0 else None
+        if jump_idx is not None:
+            jump_inst = self.instructions[jump_idx]
+            if jump_inst.opcode == "Jump":
+                jump_target_pc = jump_inst.args.get("target")
+                jump_target_idx = (
+                    self._pc_to_index.get(jump_target_pc)
+                    if jump_target_pc is not None
+                    else None
+                )
+                if jump_target_idx is not None:
+                    if jump_target_idx <= idx:
+                        loop_ctx = branch_ctx
+                        out.append(lua_ast.While(test=cond, body=body))
+                        ctx.registers.update(loop_ctx.registers)
+                        ctx.defined.update(loop_ctx.defined)
+                        self._loop_count += 1
+                        return target_idx
+                    if jump_target_idx > target_idx:
+                        else_ctx = ctx.clone()
+                        else_body, _ = self._lower_range(
+                            else_ctx, target_idx, jump_target_idx
+                        )
+                        out.append(lua_ast.If(test=cond, body=body, orelse=else_body))
+                        ctx.registers.update(branch_ctx.registers)
+                        ctx.registers.update(else_ctx.registers)
+                        ctx.defined.update(branch_ctx.defined)
+                        ctx.defined.update(else_ctx.defined)
+                        self._branch_count += 1
+                        return jump_target_idx
+
         out.append(lua_ast.If(test=cond, body=body, orelse=[]))
         ctx.registers.update(branch_ctx.registers)
         ctx.defined.update(branch_ctx.defined)
@@ -521,6 +558,48 @@ class IRDevirtualizer:
         out: List[lua_ast.Stmt],
     ) -> int:
         return idx + 1
+
+    def _handle_tforloop(
+        self,
+        ctx: _LoweringContext,
+        idx: int,
+        end: int,
+        out: List[lua_ast.Stmt],
+    ) -> int:
+        # Luraph v14.4.1 introduces iterator loops that reach the VM as
+        # ``TForLoop`` instructions.  We reconstruct them as generic ``for``
+        # statements so the rendered Lua matches what the bootstrap would have
+        # executed after decrypting the payload.
+        inst = self.instructions[idx]
+        base = inst.args.get("base")
+        target_pc = inst.args.get("target")
+        target_idx = self._pc_to_index.get(target_pc) if target_pc is not None else None
+        if target_idx is None or target_idx <= idx:
+            return idx + 1
+        count = inst.args.get("nvars")
+        var_count = count if isinstance(count, int) and count > 0 else 1
+        loop_ctx = ctx.clone()
+        body, _ = self._lower_range(loop_ctx, idx + 1, target_idx)
+        var_names = [
+            self._register_name((base or 0) + 3 + offset)
+            for offset in range(var_count)
+        ]
+        iterables = [
+            self._expr_for_register(ctx, base),
+            self._expr_for_register(ctx, (base or 0) + 1),
+            self._expr_for_register(ctx, (base or 0) + 2),
+        ]
+        out.append(
+            lua_ast.GenericFor(
+                vars=var_names,
+                iterables=iterables,
+                body=body,
+            )
+        )
+        ctx.registers.update(loop_ctx.registers)
+        ctx.defined.update(loop_ctx.defined)
+        self._loop_count += 1
+        return target_idx
 
     def _handle_vararg(
         self,
@@ -651,11 +730,22 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
 
     devirt = IRDevirtualizer(module, constants)
     chunk, metadata = devirt.lower()
-    source = lua_ast.to_source(chunk)
-    ctx.stage_output = source
+    raw_source = lua_ast.to_source(chunk)
     if ctx.artifacts:
-        ctx.write_artifact("vm_devirtualize_ast", source)
-    return metadata | {"lines": len(source.splitlines())}
+        ctx.write_artifact("vm_devirtualize_ast", raw_source)
+
+    renamer = VariableRenamer()
+    renamed = renamer.rename_variables(raw_source)
+    formatter = utils.LuaFormatter()
+    pretty = formatter.format_source(renamed)
+
+    metadata["renamed_identifiers"] = renamed != raw_source
+    metadata["formatted"] = pretty != renamed
+
+    ctx.stage_output = pretty
+    if ctx.artifacts:
+        ctx.write_artifact("vm_devirtualize_pretty", pretty)
+    return metadata | {"lines": len(pretty.splitlines())}
 
 
 __all__ = ["run", "IRDevirtualizer"]

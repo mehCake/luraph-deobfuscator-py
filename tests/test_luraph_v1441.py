@@ -1,0 +1,356 @@
+import base64
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from version_detector import VersionDetector
+
+from src.pipeline import Context, PIPELINE
+from src.passes.payload_decode import run as payload_decode_run
+from src.versions import get_handler
+from src.versions.initv4 import InitV4Decoder
+from src.versions.luraph_v14_4_1 import (
+    LuraphV1441,
+    _apply_script_key_transform,
+    _encode_base91,
+    decode_blob,
+    decode_blob_with_metadata,
+)
+from src.deobfuscator import LuaDeobfuscator
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_V1441 = PROJECT_ROOT / "examples" / "v1441_hello.lua"
+GOLDEN_V1441 = PROJECT_ROOT / "tests" / "golden" / "v1441_hello.lua.out"
+EXAMPLE_SCRIPT_KEY = "KeyForTests"
+
+
+def _make_sample(raw: bytes | None = None, *, script_key: str = "SuperSecretKey") -> tuple[str, bytes, str, str]:
+    payload = raw if raw is not None else bytes(range(256))
+    key_bytes = script_key.encode("utf-8")
+    masked = _apply_script_key_transform(payload, key_bytes)
+    blob = _encode_base91(masked)
+    script = (
+        "-- Luraph v14.4.1 bootstrap\n"
+        "local script_key = script_key or \""
+        + script_key
+        + "\"\n"
+        "local init_fn = function(blob)\n"
+        "    return blob\n"
+        "end\n"
+        "local payload = \""
+        + blob
+        + "\"\n"
+        "return init_fn(payload)\n"
+    )
+    return script, payload, script_key, blob
+
+
+def _write_bootstrap_stub(tmp_path: Path) -> Path:
+    fixture = Path("tests/fixtures/initv4_stub/initv4.lua")
+    dest_dir = tmp_path / "bootstrap"
+    dest_dir.mkdir()
+    dest = dest_dir / "initv4.lua"
+    dest.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    return dest_dir
+
+
+def test_decode_blob_roundtrip() -> None:
+    _, raw, script_key, blob = _make_sample()
+    assert decode_blob(blob, script_key) == raw
+
+
+def test_decode_blob_known_vector() -> None:
+    blob = "qx6zfmk8qigsbzcd3bv64"
+    expected = bytes([102, 209, 205, 163, 47, 244, 211, 159, 195, 91, 12, 93, 25, 94, 37, 43, 114])
+    assert decode_blob(blob, "KeyForTests") == expected
+
+
+def test_decode_blob_wrong_key_changes_payload() -> None:
+    _, raw, script_key, blob = _make_sample()
+    assert decode_blob(blob, script_key + "!") != raw
+
+
+def test_decode_blob_base64_fallback() -> None:
+    _, raw, script_key, _ = _make_sample()
+    key_bytes = script_key.encode("utf-8")
+    masked = _apply_script_key_transform(raw, key_bytes)
+    blob = base64.b64encode(masked).decode("ascii")
+    data, meta = decode_blob_with_metadata(blob, script_key)
+    assert data == raw
+    assert meta["decode_method"] in {"base64", "base64-relaxed"}
+    assert meta.get("index_xor") is True
+
+
+def test_v1441_handler_locates_payload() -> None:
+    script, raw, script_key, blob = _make_sample()
+    handler = LuraphV1441()
+    assert handler.matches(script)
+    payload = handler.locate_payload(script)
+    assert payload is not None
+    assert payload.text == blob
+    assert payload.metadata["script_key"] == script_key
+    assert handler.extract_bytecode(payload) == raw
+    assert payload.metadata.get("decode_method") == "base91"
+    assert payload.metadata.get("index_xor") is True
+
+
+def test_v1441_handler_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    script, raw, script_key, blob = _make_sample()
+    script = script.replace(f'"{script_key}"', "getgenv().script_key")
+    handler = LuraphV1441()
+    payload = handler.locate_payload(script)
+    assert payload is not None
+    assert payload.text == blob
+    assert "script_key" not in payload.metadata
+    monkeypatch.setenv("LURAPH_SCRIPT_KEY", script_key)
+    try:
+        assert handler.extract_bytecode(payload) == raw
+        assert payload.metadata.get("decode_method") == "base91"
+        assert payload.metadata.get("index_xor") is True
+    finally:
+        monkeypatch.delenv("LURAPH_SCRIPT_KEY", raising=False)
+
+
+def test_v1441_handler_requires_script_key() -> None:
+    script, _, script_key, _ = _make_sample()
+    script = script.replace(f'"{script_key}"', "getgenv().script_key")
+    handler = LuraphV1441()
+    payload = handler.locate_payload(script)
+    assert payload is not None
+    with pytest.raises(RuntimeError):
+        handler.extract_bytecode(payload)
+
+
+def test_v1441_handler_uses_bootstrapper_metadata(tmp_path: Path) -> None:
+    stub_dir = _write_bootstrap_stub(tmp_path)
+    handler = LuraphV1441()
+    meta = handler.set_bootstrapper(stub_dir)
+    assert meta["path"].endswith("initv4.lua")
+    table = handler.opcode_table()
+    assert table[0x10].mnemonic == "MOVE"
+    assert table[0x2A].mnemonic == "FORLOOP"
+
+
+def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
+    script, raw, script_key, blob = _make_sample()
+    stub_dir = _write_bootstrap_stub(tmp_path)
+    ctx = SimpleNamespace(script_key=script_key, bootstrapper_path=stub_dir)
+    decoder = InitV4Decoder(ctx)
+
+    assert decoder.alphabet is not None and len(decoder.alphabet) >= 85
+
+    payloads = decoder.locate_payload(script)
+    assert blob in payloads
+
+    decoded = decoder.extract_bytecode(payloads[0])
+    assert decoded == raw
+
+    opcode_table = decoder.opcode_table()
+    assert opcode_table.get(0x10) == "MOVE"
+    assert opcode_table.get(0x2A) == "FORLOOP"
+
+
+def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:
+    stub_dir = _write_bootstrap_stub(tmp_path)
+    handler = LuraphV1441()
+    handler.set_bootstrapper(stub_dir)
+    script, raw, _, _ = _make_sample()
+    payload = handler.locate_payload(script)
+    assert payload is not None
+    data = handler.extract_bytecode(payload)
+    assert data == raw
+    meta = payload.metadata.get("bootstrapper")
+    assert isinstance(meta, dict)
+    assert meta.get("path", "").endswith("initv4.lua")
+    assert payload.metadata.get("alphabet_length", 0) >= 85
+
+
+def test_payload_decode_requires_script_key(tmp_path: Path) -> None:
+    script, _, script_key, _ = _make_sample()
+    script = script.replace(f'"{script_key}"', "getgenv().script_key")
+    payload_dir = tmp_path / "payload_missing_key"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    path = payload_dir / "sample.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(input_path=path, raw_input=script, stage_output=script)
+    metadata = payload_decode_run(ctx)
+
+    assert "handler_bytecode_error" in metadata
+    assert "script key" in metadata["handler_bytecode_error"].lower()
+
+
+def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
+    script, raw, script_key, _ = _make_sample()
+    script = script.replace(f'"{script_key}"', "getgenv().script_key")
+    payload_dir = tmp_path / "payload_with_key"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    path = payload_dir / "sample.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=script,
+        stage_output=script,
+        script_key=script_key,
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    assert ctx.version is not None and ctx.version.name in {
+        "luraph_v14_4_initv4",
+        "v14.4.1",
+    }
+    assert metadata.get("handler_bytecode_bytes") == len(raw)
+    assert ctx.vm.bytecode == raw
+    payload_meta = metadata.get("handler_payload_meta", {})
+    assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("decode_method") == "base91"
+    assert payload_meta.get("index_xor") is True
+    assert ctx.vm.meta.get("handler") in {"luraph_v14_4_initv4", "v14.4.1"}
+
+
+def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
+    script = EXAMPLE_V1441.read_text(encoding="utf-8")
+    expected = GOLDEN_V1441.read_text(encoding="utf-8")
+    path = tmp_path / "v1441.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=script,
+        stage_output=script,
+        script_key=EXAMPLE_SCRIPT_KEY,
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    assert ctx.stage_output.strip() == expected.strip()
+    assert metadata.get("handler_decoded_json") is True
+    assert metadata.get("script_payload") is True
+    assert not ctx.vm.bytecode
+    payload_meta = metadata.get("handler_payload_meta", {})
+    assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("decode_method") == "base91"
+    assert payload_meta.get("index_xor") is True
+
+
+def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:
+    script = EXAMPLE_V1441.read_text(encoding="utf-8")
+    path = tmp_path / "wrong_key.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=script,
+        stage_output=script,
+        script_key="incorrect",
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    assert ctx.stage_output.startswith("-- Example Luraph")
+    assert metadata.get("handler_decoded_json") is not True
+    assert "script_payload" not in metadata or not metadata["script_payload"]
+    payload_meta = metadata.get("handler_payload_meta", {})
+    assert payload_meta.get("decode_method") in {"base91", "base64", "base64-relaxed"}
+
+
+def test_payload_decode_handles_empty_bootstrap() -> None:
+    script = (
+        "-- Luraph v14.4.1 bootstrap without payload\n"
+        "local script_key = script_key or getgenv().script_key\n"
+        "local init_fn = function(blob)\n    return blob\nend\n"
+    )
+
+    ctx = Context(input_path=Path("dummy.lua"), raw_input=script, stage_output=script)
+
+    metadata = payload_decode_run(ctx)
+
+    assert "handler_payload_offset" not in metadata
+    assert ctx.stage_output.startswith("-- Luraph v14.4.1")
+
+
+def test_version_detector_reports_v1441() -> None:
+    script, _, _, _ = _make_sample()
+    detector = VersionDetector()
+    detected = detector.detect(script)
+    assert detected.name == "luraph_v14_4_initv4"
+    handler = get_handler("luraph_v14_4_initv4")
+    assert isinstance(handler, LuraphV1441)
+    assert handler.matches(script)
+
+    legacy = get_handler("v14.4.1")
+    assert isinstance(legacy, LuraphV1441)
+    assert legacy.matches(script)
+
+
+def test_pipeline_deobfuscates_v1441_example(tmp_path: Path) -> None:
+    script = EXAMPLE_V1441.read_text(encoding="utf-8")
+    expected = GOLDEN_V1441.read_text(encoding="utf-8")
+    source = tmp_path / "v1441.lua"
+    source.write_text(script, encoding="utf-8")
+    output = tmp_path / "out.lua"
+
+    ctx = Context(
+        input_path=source,
+        raw_input=script,
+        stage_output=script,
+        script_key=EXAMPLE_SCRIPT_KEY,
+    )
+    ctx.options["render_output"] = str(output)
+    ctx.deobfuscator = LuaDeobfuscator(script_key=EXAMPLE_SCRIPT_KEY)
+
+    PIPELINE.run_passes(ctx)
+
+    assert ctx.detected_version is not None and ctx.detected_version.name in {
+        "luraph_v14_4_initv4",
+        "v14.4.1",
+    }
+    assert ctx.pass_metadata.get("vm_lift", {}).get("available") is False
+    payload_meta = ctx.pass_metadata.get("payload_decode", {}).get("handler_payload_meta", {})
+    assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("decode_method") == "base91"
+    assert payload_meta.get("index_xor") is True
+    assert output.read_text(encoding="utf-8").strip() == expected.strip()
+
+
+def test_pipeline_processes_initv4_bytecode(tmp_path: Path) -> None:
+    handler = LuraphV1441()
+    table = handler.opcode_table()
+    return_opcode = next(
+        opcode for opcode, spec in table.items() if spec.mnemonic.upper() == "RETURN"
+    )
+
+    raw = bytes([return_opcode, 0x00, 0x01, 0x00] * 64)
+    script, _, script_key, _ = _make_sample(raw, script_key="PipelineKey")
+
+    path = tmp_path / "bytecode.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=script,
+        stage_output=script,
+        script_key=script_key,
+    )
+    ctx.options["render_output"] = str(tmp_path / "bytecode_out.lua")
+    ctx.deobfuscator = LuaDeobfuscator(script_key=script_key)
+
+    PIPELINE.run_passes(ctx)
+
+    assert ctx.detected_version is not None and ctx.detected_version.name in {
+        "luraph_v14_4_initv4",
+        "v14.4.1",
+    }
+    vm_lift_meta = ctx.pass_metadata.get("vm_lift", {})
+    assert vm_lift_meta.get("instructions", 0) >= 1
+    assert ctx.ir_module is not None
+    devirt_meta = ctx.pass_metadata.get("vm_devirtualize", {})
+    assert not devirt_meta.get("skipped", False)
+    render_meta = ctx.pass_metadata.get("render", {})
+    assert render_meta.get("written") is True
+    output_path = Path(render_meta.get("output_path", ""))
+    assert output_path.exists()
+    assert ctx.output

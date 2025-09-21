@@ -36,7 +36,17 @@ def run(ctx: "Context") -> Dict[str, Any]:
     ctx.detected_version = version
     features = version.features if version.features else None
 
-    result = deob.decode_payload(text, version=version, features=features)
+    script_key: Any = getattr(ctx, "script_key", None)
+    if not isinstance(script_key, str) and isinstance(ctx.options, dict):
+        script_key = ctx.options.get("script_key")
+
+    result = deob.decode_payload(
+        text,
+        version=version,
+        features=features,
+        script_key=script_key if isinstance(script_key, str) else None,
+        bootstrapper=ctx.bootstrapper_path,
+    )
     output_text = result.text or ""
     ctx.stage_output = output_text
     if output_text:
@@ -56,6 +66,8 @@ def run(ctx: "Context") -> Dict[str, Any]:
         handler_meta = _populate_v142_json_payload(ctx, text)
         if handler_meta:
             metadata.update(handler_meta)
+
+    _apply_vm_bytecode(ctx, metadata, version.name)
 
     return metadata
 
@@ -143,6 +155,27 @@ def _populate_v142_json_payload(ctx: "Context", text: str) -> Dict[str, Any]:
         metadata["handler_opcode_max"] = max(opcodes)
 
     return metadata
+
+
+def _apply_vm_bytecode(ctx: "Context", metadata: Dict[str, Any], version_name: str) -> None:
+    """Populate ``ctx.vm`` with handler-provided bytecode metadata."""
+
+    script_payload = bool(metadata.get("script_payload"))
+    raw_bytes = metadata.pop("handler_vm_bytecode", None)
+    if not script_payload and isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+        if not ctx.vm.bytecode:
+            ctx.vm.bytecode = bytes(raw_bytes)
+        elif ctx.vm.bytecode != bytes(raw_bytes):
+            ctx.vm.meta.setdefault("alternate_bytecode", True)
+
+    payload_meta = metadata.get("handler_payload_meta")
+    if isinstance(payload_meta, dict):
+        clean_meta = {key: value for key, value in payload_meta.items() if key != "script_key"}
+        if clean_meta:
+            for key, value in clean_meta.items():
+                ctx.vm.meta.setdefault(key, value)
+    if ctx.vm.bytecode:
+        ctx.vm.meta.setdefault("handler", version_name)
 
 
 def _write_opcode_dump(data: bytes) -> None:

@@ -4,6 +4,26 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GOLDEN_DIR = PROJECT_ROOT / "tests" / "golden"
+V1441_SOURCE = PROJECT_ROOT / "examples" / "v1441_hello.lua"
+V1441_GOLDEN = GOLDEN_DIR / "v1441_hello.lua.out"
+INITV4_STUB = PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua"
+
+
+def _prepare_v1441_source(tmp_path: Path, *, literal_key: bool = False) -> Path:
+    text = V1441_SOURCE.read_text(encoding="utf-8")
+    if literal_key:
+        text = text.replace("getgenv().script_key", '"KeyForTests"')
+    target = tmp_path / V1441_SOURCE.name
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+def _prepare_bootstrapper(tmp_path: Path) -> Path:
+    stub_dir = tmp_path / "stub"
+    stub_dir.mkdir()
+    (stub_dir / "initv4.lua").write_text(INITV4_STUB.read_text(encoding="utf-8"), encoding="utf-8")
+    return stub_dir
 
 
 def _run_cli(target: Path, workdir: Path, *extra: str) -> subprocess.CompletedProcess:
@@ -116,3 +136,74 @@ def test_cli_dump_ir_creates_listing(tmp_path):
     assert listings, "expected IR listing"
     listing_text = listings[0].read_text()
     assert listing_text.strip()
+
+
+def test_cli_v1441_script_key_only(tmp_path):
+    target = _prepare_v1441_source(tmp_path)
+    _run_cli(target, tmp_path, "--script-key", "KeyForTests", "--format", "json")
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["output"].strip() == V1441_GOLDEN.read_text(encoding="utf-8").strip()
+    decoded = [entry.strip() for entry in data.get("decoded_payloads", [])]
+    assert any("print(" in entry for entry in decoded)
+
+    payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
+    assert payload_meta.get("script_key_provider") == "override"
+    assert "bootstrapper" not in payload_meta
+
+
+def test_cli_v1441_bootstrapper_only(tmp_path):
+    target = _prepare_v1441_source(tmp_path, literal_key=True)
+    stub_dir = _prepare_bootstrapper(tmp_path)
+    _run_cli(target, tmp_path, "--bootstrapper", str(stub_dir), "--format", "json")
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["output"].strip() == V1441_GOLDEN.read_text(encoding="utf-8").strip()
+
+    payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
+    assert payload_meta.get("script_key_provider") == "literal"
+    bootstrap_meta = payload_meta.get("bootstrapper") or {}
+    assert bootstrap_meta.get("path", "").endswith("initv4.lua")
+    assert bootstrap_meta.get("alphabet_length", 0) >= 85
+    assert bootstrap_meta.get("opcode_map_entries", 0) >= 4
+
+
+def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
+    target = _prepare_v1441_source(tmp_path)
+    stub_dir = _prepare_bootstrapper(tmp_path)
+    _run_cli(
+        target,
+        tmp_path,
+        "--script-key",
+        "KeyForTests",
+        "--bootstrapper",
+        str(stub_dir),
+        "--format",
+        "json",
+    )
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["output"].strip() == V1441_GOLDEN.read_text(encoding="utf-8").strip()
+
+    payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
+    assert payload_meta.get("script_key_provider") == "override"
+    bootstrap_meta = payload_meta.get("bootstrapper") or {}
+    assert bootstrap_meta.get("alphabet_length", 0) >= 85
+    assert bootstrap_meta.get("path", "").endswith("initv4.lua")
+    assert payload_meta.get("decode_method") == "base91"
+
+
+def test_cli_reports_missing_script_key(tmp_path):
+    target = tmp_path / V1441_SOURCE.name
+    target.write_text(V1441_SOURCE.read_text())
+
+    _run_cli(target, tmp_path, "--format", "json")
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text())
+    payload_meta = data.get("passes", {}).get("payload_decode", {})
+    error_text = payload_meta.get("handler_bytecode_error", "")
+    assert "script key" in error_text.lower()

@@ -238,6 +238,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="bypass version detection with an explicit handler name",
     )
     parser.add_argument(
+        "--script-key",
+        dest="script_key",
+        help="script key to decrypt initv4 payloads (e.g. Luraph v14.4.1)",
+    )
+    parser.add_argument(
+        "--bootstrapper",
+        dest="bootstrapper_path",
+        help="Path to an init bootstrap stub (file or directory)",
+    )
+    parser.add_argument(
         "--dump-ir",
         metavar="PATH",
         help="write a textual VM IR listing to PATH (file or directory)",
@@ -324,7 +334,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if content is None:
             return WorkResult(item, False, error="unable to read input file")
 
-        deob = LuaDeobfuscator(vm_trace=args.vm_trace)
+        bootstrapper_path = args.bootstrapper_path
+        deob = LuaDeobfuscator(
+            vm_trace=args.vm_trace,
+            script_key=args.script_key,
+            bootstrapper=bootstrapper_path,
+        )
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
         reconstructed_lua: Optional[str] = None
@@ -353,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     iteration=iteration,
                     from_json=is_json_input,
                     reconstructed_lua=reconstructed_lua or "",
+                    script_key=args.script_key,
+                    bootstrapper_path=bootstrapper_path,
                 )
                 ctx.options.update(
                     {
@@ -361,6 +378,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "render_output": str(item.destination),
                     }
                 )
+                if bootstrapper_path:
+                    ctx.options.setdefault("bootstrapper", bootstrapper_path)
                 if args.step_limit is not None:
                     ctx.options["vm_lift_step_limit"] = max(0, args.step_limit)
                 if args.time_limit is not None:
