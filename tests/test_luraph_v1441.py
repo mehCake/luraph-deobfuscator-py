@@ -1,5 +1,6 @@
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,7 @@ from version_detector import VersionDetector
 from src.pipeline import Context, PIPELINE
 from src.passes.payload_decode import run as payload_decode_run
 from src.versions import get_handler
+from src.versions.initv4 import InitV4Decoder
 from src.versions.luraph_v14_4_1 import (
     LuraphV1441,
     _apply_script_key_transform,
@@ -123,6 +125,25 @@ def test_v1441_handler_uses_bootstrapper_metadata(tmp_path: Path) -> None:
     table = handler.opcode_table()
     assert table[0x10].mnemonic == "MOVE"
     assert table[0x2A].mnemonic == "FORLOOP"
+
+
+def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
+    script, raw, script_key, blob = _make_sample()
+    stub_dir = _write_bootstrap_stub(tmp_path)
+    ctx = SimpleNamespace(script_key=script_key, bootstrapper_path=stub_dir)
+    decoder = InitV4Decoder(ctx)
+
+    assert decoder.alphabet is not None and len(decoder.alphabet) >= 85
+
+    payloads = decoder.locate_payload(script)
+    assert blob in payloads
+
+    decoded = decoder.extract_bytecode(payloads[0])
+    assert decoded == raw
+
+    opcode_table = decoder.opcode_table()
+    assert opcode_table.get(0x10) == "MOVE"
+    assert opcode_table.get(0x2A) == "FORLOOP"
 
 
 def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:

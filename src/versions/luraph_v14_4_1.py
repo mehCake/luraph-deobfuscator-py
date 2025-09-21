@@ -6,13 +6,14 @@ import base64
 import json
 import os
 import re
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..utils_pkg import strings as string_utils
 from . import OpSpec, PayloadInfo, VersionHandler, register_handler
 from .luraph_v14_2_json import LuraphV142JSON
-from .initv4 import InitV4Bootstrap
+from .initv4 import InitV4Bootstrap, InitV4Decoder
 
 _INITV4_ALPHABET = (
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -392,15 +393,37 @@ class LuraphV1441(VersionHandler):
         alphabet = bootstrap.alphabet()
         mapping = bootstrap.opcode_mapping(_BASE_OPCODE_TABLE)
         table = bootstrap.build_opcode_table(_BASE_OPCODE_TABLE)
+
+        ctx = SimpleNamespace(script_key=None, bootstrapper_path=bootstrap.path)
+        decoder = InitV4Decoder(ctx, bootstrap=bootstrap)
+
+        if decoder.alphabet:
+            alphabet = decoder.alphabet
         self._alphabet_override = alphabet
-        self._opcode_override = dict(table)
+
+        override_table: Dict[int, OpSpec] = dict(table)
+        if decoder.has_custom_opcodes() and decoder.opcode_map:
+            for opcode, name in decoder.opcode_map.items():
+                for base_opcode, base_spec in _BASE_OPCODE_TABLE.items():
+                    if base_spec.mnemonic.upper() == name.upper():
+                        override_table[opcode] = base_spec
+                        break
+        self._opcode_override = dict(sorted(override_table.items()))
+
         meta: Dict[str, object] = {"path": str(bootstrap.path)}
         if alphabet:
             meta["alphabet_length"] = len(alphabet)
-        if mapping:
+
+        if decoder.has_custom_opcodes():
+            extracted_map = decoder.opcode_map or {}
+            meta["opcode_map_entries"] = len(extracted_map)
+            meta["opcode_map"] = dict(sorted(extracted_map.items()))
+        elif mapping:
             meta["opcode_map_entries"] = len(mapping)
+
         for key, value in bootstrap.iter_metadata():
             meta.setdefault(key, value)
+
         self._bootstrap_meta = meta
         return dict(meta)
 
