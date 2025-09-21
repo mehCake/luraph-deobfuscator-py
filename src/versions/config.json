@@ -30,8 +30,9 @@
       "heuristics": {
         "signatures": ["Luraph\\s+v14\\.4", "init_fn\\s*\\("],
         "constants": ["script_key\\s*=\\s*script_key"],
-        "long_strings": ["[A-Za-z0-9+/=]{200,}"],
-        "prologues": ["script_key\\s*=\\s*script_key"]
+        "long_strings": ["[A-Za-z0-9+/=]{200,}", "s8W-[!-~]{64,}"],
+        "prologues": ["script_key\\s*=\\s*script_key", "init_fn\\\\s*\\\\([^)]*\\\\)\\\\s*;\\\\s*script_key"],
+        "alphabet": ["[\\\\\"'][0-9A-Za-z!#$%&()*+,-./:;<=>?@\\\\[\\\\]^_`{|}~]{85,}[\\\\\"']"]
       },
       "known_traps": []
     },

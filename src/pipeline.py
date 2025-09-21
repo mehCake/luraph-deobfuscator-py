@@ -67,6 +67,7 @@ class Context:
     iteration: int = 0
     options: Dict[str, Any] = field(default_factory=dict)
     script_key: str | None = None
+    bootstrapper_path: Path | None = None
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
     ir_module: "IRModule | None" = None
@@ -75,7 +76,10 @@ class Context:
 
     def __post_init__(self) -> None:
         if self.deobfuscator is None:
-            self.deobfuscator = LuaDeobfuscator(script_key=self.script_key)
+            self.deobfuscator = LuaDeobfuscator(
+                script_key=self.script_key,
+                bootstrapper=self.bootstrapper_path,
+            )
         try:
             suffix = self.input_path.suffix.lower()
         except AttributeError:

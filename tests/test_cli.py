@@ -124,8 +124,21 @@ def test_cli_dump_ir_creates_listing(tmp_path):
 def test_cli_handles_v1441_script_key(tmp_path):
     target = tmp_path / V1441_SOURCE.name
     target.write_text(V1441_SOURCE.read_text())
+    stub_dir = tmp_path / "stub"
+    stub_dir.mkdir()
+    (stub_dir / "initv4.lua").write_text(
+        (PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua").read_text(),
+        encoding="utf-8",
+    )
 
-    _run_cli(target, tmp_path, "--script-key", "KeyForTests")
+    _run_cli(
+        target,
+        tmp_path,
+        "--script-key",
+        "KeyForTests",
+        "--bootstrapper",
+        str(stub_dir),
+    )
 
     output = target.with_name(f"{target.stem}_deob.lua")
     assert output.exists()

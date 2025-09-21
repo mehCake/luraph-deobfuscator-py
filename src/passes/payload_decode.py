@@ -45,6 +45,7 @@ def run(ctx: "Context") -> Dict[str, Any]:
         version=version,
         features=features,
         script_key=script_key if isinstance(script_key, str) else None,
+        bootstrapper=ctx.bootstrapper_path,
     )
     output_text = result.text or ""
     ctx.stage_output = output_text

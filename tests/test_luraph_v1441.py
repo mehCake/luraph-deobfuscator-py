@@ -44,6 +44,15 @@ def _make_sample() -> tuple[str, bytes, str, str]:
     return script, raw, script_key, blob
 
 
+def _write_bootstrap_stub(tmp_path: Path) -> Path:
+    fixture = Path("tests/fixtures/initv4_stub/initv4.lua")
+    dest_dir = tmp_path / "bootstrap"
+    dest_dir.mkdir()
+    dest = dest_dir / "initv4.lua"
+    dest.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    return dest_dir
+
+
 def test_decode_blob_roundtrip() -> None:
     _, raw, script_key, blob = _make_sample()
     assert decode_blob(blob, script_key) == raw
@@ -100,6 +109,31 @@ def test_v1441_handler_requires_script_key() -> None:
     assert payload is not None
     with pytest.raises(RuntimeError):
         handler.extract_bytecode(payload)
+
+
+def test_v1441_handler_uses_bootstrapper_metadata(tmp_path: Path) -> None:
+    stub_dir = _write_bootstrap_stub(tmp_path)
+    handler = LuraphV1441()
+    meta = handler.set_bootstrapper(stub_dir)
+    assert meta["path"].endswith("initv4.lua")
+    table = handler.opcode_table()
+    assert table[0x10].mnemonic == "MOVE"
+    assert table[0x2A].mnemonic == "FORLOOP"
+
+
+def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:
+    stub_dir = _write_bootstrap_stub(tmp_path)
+    handler = LuraphV1441()
+    handler.set_bootstrapper(stub_dir)
+    script, raw, _, _ = _make_sample()
+    payload = handler.locate_payload(script)
+    assert payload is not None
+    data = handler.extract_bytecode(payload)
+    assert data == raw
+    meta = payload.metadata.get("bootstrapper")
+    assert isinstance(meta, dict)
+    assert meta.get("path", "").endswith("initv4.lua")
+    assert payload.metadata.get("alphabet_length", 0) >= 85
 
 
 def test_payload_decode_requires_script_key(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Tuple
 
 from lph_handler import extract_vm_ir
@@ -56,7 +57,13 @@ class DeobResult:
 class LuaDeobfuscator:
     """Coordinate the individual stages of the deobfuscation pipeline."""
 
-    def __init__(self, *, vm_trace: bool = False, script_key: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        vm_trace: bool = False,
+        script_key: str | None = None,
+        bootstrapper: str | os.PathLike[str] | Path | None = None,
+    ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
         self._all_features = self._version_detector.all_features
@@ -66,6 +73,7 @@ class LuaDeobfuscator:
         self._vm_timeout = 5.0
         self._vm_trace = vm_trace
         self._script_key = script_key.strip() if script_key else None
+        self._bootstrapper_path = self._normalise_bootstrapper(bootstrapper)
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -92,6 +100,7 @@ class LuaDeobfuscator:
         version: VersionInfo,
         features: FrozenSet[str] | None = None,
         script_key: str | None = None,
+        bootstrapper: str | os.PathLike[str] | Path | None = None,
     ) -> DeobResult:
         """Decode known payload formats and return a :class:`DeobResult`."""
 
@@ -110,6 +119,12 @@ class LuaDeobfuscator:
             metadata["script_key_override"] = True
         override_key = (self._script_key or "").strip()
 
+        bootstrapper_path = self._normalise_bootstrapper(bootstrapper)
+        if bootstrapper_path is not None:
+            self._bootstrapper_path = bootstrapper_path
+        if self._bootstrapper_path is not None:
+            metadata["bootstrapper_path"] = str(self._bootstrapper_path)
+
         def feature_enabled(flag: str) -> bool:
             return active_features is None or flag in active_features
 
@@ -124,6 +139,16 @@ class LuaDeobfuscator:
                 handler = None
         if isinstance(handler, VersionHandler):
             handler_instance = handler
+            if self._bootstrapper_path is not None:
+                setter = getattr(handler_instance, "set_bootstrapper", None)
+                if callable(setter):
+                    try:
+                        bootstrap_meta = setter(self._bootstrapper_path)
+                    except Exception as exc:  # pragma: no cover - best effort
+                        metadata["bootstrapper_error"] = str(exc)
+                    else:
+                        if isinstance(bootstrap_meta, dict) and bootstrap_meta:
+                            metadata.setdefault("bootstrapper", bootstrap_meta)
 
         payload_dict: Optional[Dict[str, Any]] = None
         embedded: Optional[str] = None
@@ -266,6 +291,25 @@ class LuaDeobfuscator:
 
         text = utils.decode_simple_obfuscations(text)
         return DeobResult(text, metadata)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalise_bootstrapper(
+        path: str | os.PathLike[str] | Path | None,
+    ) -> Path | None:
+        if path is None:
+            return None
+        if isinstance(path, Path):
+            candidate = path
+        else:
+            text = os.fspath(path)
+            if not text:
+                return None
+            candidate = Path(text)
+        try:
+            return candidate.expanduser().resolve()
+        except OSError:
+            return candidate.expanduser()
 
     def devirtualize(
         self,

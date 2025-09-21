@@ -6,11 +6,13 @@ import base64
 import json
 import os
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..utils_pkg import strings as string_utils
 from . import OpSpec, PayloadInfo, VersionHandler, register_handler
 from .luraph_v14_2_json import LuraphV142JSON
+from .initv4 import InitV4Bootstrap
 
 _INITV4_ALPHABET = (
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -18,6 +20,7 @@ _INITV4_ALPHABET = (
 )
 _INITV4_DECODE = {symbol: index for index, symbol in enumerate(_INITV4_ALPHABET)}
 _INITV4_BASE = len(_INITV4_ALPHABET)
+_ALPHABET_CACHE: Dict[str, Tuple[str, Dict[str, int], int]] = {}
 
 _BASE64_CHARSET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
 
@@ -33,9 +36,24 @@ _JSON_BLOCKS = (
 )
 
 
-def _decode_base91(blob: str) -> bytes:
+def _prepare_alphabet(
+    override: Optional[str],
+) -> Tuple[str, Dict[str, int], int]:
+    if override:
+        if override in _ALPHABET_CACHE:
+            return _ALPHABET_CACHE[override]
+        if len(override) >= 85 and len(set(override)) == len(override):
+            table = {symbol: index for index, symbol in enumerate(override)}
+            prepared = (override, table, len(override))
+            _ALPHABET_CACHE[override] = prepared
+            return prepared
+    return _INITV4_ALPHABET, _INITV4_DECODE, _INITV4_BASE
+
+
+def _decode_base91(blob: str, *, alphabet: Optional[str] = None) -> bytes:
     """Decode a base91-like blob using the initv4 alphabet."""
 
+    _, decode_map, alphabet_base = _prepare_alphabet(alphabet)
     value = -1
     buffer = 0
     bits = 0
@@ -44,14 +62,14 @@ def _decode_base91(blob: str) -> bytes:
     for char in blob:
         if char.isspace():
             continue
-        if char not in _INITV4_DECODE:
+        if char not in decode_map:
             raise ValueError(f"invalid initv4 symbol: {char!r}")
-        symbol = _INITV4_DECODE[char]
+        symbol = decode_map[char]
         if value < 0:
             value = symbol
             continue
 
-        value += symbol * _INITV4_BASE
+        value += symbol * alphabet_base
         buffer |= value << bits
         if value & 0x1FFF > 88:
             bits += 13
@@ -131,7 +149,10 @@ def _score_decoded_bytes(data: bytes) -> float:
 
 
 def _decode_attempts(
-    blob: str, script_key: str
+    blob: str,
+    script_key: str,
+    *,
+    alphabet: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, object]]:
     """Try multiple decode strategies and pick the most plausible result."""
 
@@ -159,7 +180,7 @@ def _decode_attempts(
     allow_base91 = cleaned and any(ch not in _BASE64_CHARSET for ch in cleaned)
     if allow_base91:
         try:
-            decoded = _decode_base91(cleaned)
+            decoded = _decode_base91(cleaned, alphabet=alphabet)
         except ValueError as exc:
             errors["base91"] = str(exc)
         else:
@@ -224,19 +245,31 @@ def _decode_attempts(
     return best["data"], metadata
 
 
-def decode_blob(encoded_blob: str, script_key: str) -> bytes:
+def decode_blob(
+    encoded_blob: str,
+    script_key: str,
+    *,
+    alphabet: Optional[str] = None,
+) -> bytes:
     """Decode an ``initv4`` payload using base91 + XOR heuristics."""
 
-    data, _ = decode_blob_with_metadata(encoded_blob, script_key)
+    data, _ = decode_blob_with_metadata(
+        encoded_blob,
+        script_key,
+        alphabet=alphabet,
+    )
     return data
 
 
 def decode_blob_with_metadata(
-    encoded_blob: str, script_key: str
+    encoded_blob: str,
+    script_key: str,
+    *,
+    alphabet: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, object]]:
     """Decode *encoded_blob* and return both data and decode metadata."""
 
-    return _decode_attempts(encoded_blob, script_key)
+    return _decode_attempts(encoded_blob, script_key, alphabet=alphabet)
 
 
 def _extract_script_key(text: str) -> Tuple[Optional[str], Dict[str, str]]:
@@ -315,12 +348,37 @@ class LuraphV1441(VersionHandler):
     name = "v14.4.1"
     priority = 80
 
+    def __init__(self) -> None:
+        self._bootstrapper: InitV4Bootstrap | None = None
+        self._bootstrap_meta: Dict[str, object] = {}
+        self._alphabet_override: Optional[str] = None
+        self._opcode_override: Dict[int, OpSpec] | None = None
+
     def matches(self, text: str) -> bool:
         return (
             _HIGH_ENTROPY_RE.search(text) is not None
             and _INIT_STUB_RE.search(text) is not None
             and _SCRIPT_KEY_ASSIGN_RE.search(text) is not None
         )
+
+    # ------------------------------------------------------------------
+    def set_bootstrapper(self, path: Path | str) -> Dict[str, object]:
+        bootstrap = InitV4Bootstrap.load(path)
+        self._bootstrapper = bootstrap
+        alphabet = bootstrap.alphabet()
+        mapping = bootstrap.opcode_mapping(_BASE_OPCODE_TABLE)
+        table = bootstrap.build_opcode_table(_BASE_OPCODE_TABLE)
+        self._alphabet_override = alphabet
+        self._opcode_override = dict(table)
+        meta: Dict[str, object] = {"path": str(bootstrap.path)}
+        if alphabet:
+            meta["alphabet_length"] = len(alphabet)
+        if mapping:
+            meta["opcode_map_entries"] = len(mapping)
+        for key, value in bootstrap.iter_metadata():
+            meta.setdefault(key, value)
+        self._bootstrap_meta = meta
+        return dict(meta)
 
     def locate_payload(self, text: str) -> PayloadInfo | None:
         script_key, key_meta = _extract_script_key(text)
@@ -370,7 +428,15 @@ class LuraphV1441(VersionHandler):
                 "Luraph v14.4.1 payloads require a script key. Supply one via --script-key or the LURAPH_SCRIPT_KEY environment variable."
             )
 
-        raw, decode_meta = decode_blob_with_metadata(payload.text, script_key)
+        alphabet = self._alphabet_override
+        if alphabet:
+            metadata.setdefault("alphabet_length", len(alphabet))
+
+        raw, decode_meta = decode_blob_with_metadata(
+            payload.text,
+            script_key,
+            alphabet=alphabet,
+        )
         metadata["decoded_bytes"] = len(raw)
         metadata.update({key: value for key, value in decode_meta.items() if key != "decode_attempts"})
         if decode_meta.get("decode_attempts"):
@@ -378,6 +444,8 @@ class LuraphV1441(VersionHandler):
         if provider:
             metadata["script_key_provider"] = provider
         metadata.setdefault("format", metadata.get("format", "base64"))
+        if self._bootstrap_meta:
+            metadata.setdefault("bootstrapper", dict(self._bootstrap_meta))
 
         try:
             decoded_text = raw.decode("utf-8")
@@ -399,6 +467,8 @@ class LuraphV1441(VersionHandler):
         return raw
 
     def opcode_table(self) -> Dict[int, OpSpec]:
+        if self._opcode_override:
+            return dict(self._opcode_override)
         return dict(_BASE_OPCODE_TABLE)
 
 
