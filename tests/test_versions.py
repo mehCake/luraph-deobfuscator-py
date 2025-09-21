@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Iterable
 
 import base64
+import json
 
 from version_detector import VersionDetector
 from src.deobfuscator import LuaDeobfuscator
@@ -82,3 +83,20 @@ def test_luraph_v142_json_handler_detection() -> None:
 
     deob = LuaDeobfuscator()
     assert deob.detect_version(sample).name == "luraph_v14_2_json"
+
+
+def test_version_detector_initv4_heuristics_trigger() -> None:
+    detector = VersionDetector()
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+,-./:;<=>?@[]^_`{|}~"
+    blob = "s8W-" + "!" * 256
+    payload_json = json.dumps({"bytecode": [blob], "metadata": {"alphabet": alphabet}})
+    script = (
+        "local script_key = script_key or \"KeyForInit\"\n"
+        "local init_fn = function(blob)\n    return blob\nend\n"
+        f"local alphabet = \"{alphabet}\"\n"
+        f"local payload = [[{payload_json}]]\n"
+        "return init_fn(payload)\n"
+    )
+
+    detected = detector.detect(script)
+    assert detected.name == "luraph_v14_4_initv4"

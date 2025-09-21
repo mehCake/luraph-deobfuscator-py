@@ -13,6 +13,22 @@ _JSON_SCRIPT_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_INITV4_INIT_RE = re.compile(r"\binit_fn\s*\(", re.IGNORECASE)
+_INITV4_SCRIPT_KEY_RE = re.compile(
+    r"\bscript_key\s*=\s*(?:script_key\s*or\s*)?(?:getgenv\(\)\.script_key|['\"]([^'\"]*)['\"])",
+    re.IGNORECASE,
+)
+_INITV4_BLOB_RE = re.compile(r"s8W-[!-~]{64,}")
+_INITV4_JSON_BLOB_RE = re.compile(r"\[\s*['\"](s8W-[!-~]{128,})['\"]", re.IGNORECASE)
+_INITV4_ALPHABET_RE = re.compile(
+    r"alphabet\s*=\s*['\"]([0-9A-Za-z!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]{85,})['\"]",
+    re.IGNORECASE,
+)
+_INITV4_JSON_ARRAY_KEY_RE = re.compile(
+    r"\"(?:bytecode|payload|chunks)\"\s*:\s*\[[^\]]*\"s8W-",
+    re.IGNORECASE,
+)
+
 @dataclass(frozen=True)
 class VersionInfo:
     """Description of a detected Luraph VM version."""
@@ -50,6 +66,9 @@ class VersionDetector:
     def detect(self, content: str, *, from_json: bool = False) -> VersionInfo:
         if from_json and _JSON_INIT_RE.search(content) and _JSON_SCRIPT_KEY_RE.search(content):
             return self.info_for_name("luraph_v14_2_json")
+
+        if _looks_like_initv4(content):
+            return self.info_for_name("luraph_v14_4_initv4")
 
         best = VersionInfo("unknown", 0, 0, frozenset(), 0.0, ())
         best_score = 0
@@ -156,6 +175,37 @@ def _parse_version_numbers(name: str) -> Tuple[int, int]:
     major = int(matches[0])
     minor = int(matches[1]) if len(matches) > 1 else 0
     return major, minor
+
+
+def _looks_like_initv4(content: str) -> bool:
+    if not _INITV4_INIT_RE.search(content):
+        return False
+    if not _INITV4_SCRIPT_KEY_RE.search(content):
+        return False
+
+    blob_matches = list(_INITV4_BLOB_RE.finditer(content))
+    if not blob_matches:
+        return False
+
+    longest_blob = max(len(match.group(0)) for match in blob_matches)
+    json_blob_length = max(
+        (len(match.group(1)) for match in _INITV4_JSON_BLOB_RE.finditer(content)),
+        default=0,
+    )
+
+    if _INITV4_ALPHABET_RE.search(content):
+        return True
+
+    if _INITV4_JSON_ARRAY_KEY_RE.search(content):
+        return True
+
+    if json_blob_length >= 512:
+        return True
+
+    if longest_blob >= 160:
+        return True
+
+    return False
 
 
 __all__ = ["VersionDetector", "VersionInfo"]

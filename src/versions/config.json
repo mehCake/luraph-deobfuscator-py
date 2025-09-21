@@ -20,7 +20,7 @@
     },
     "luraph_v14_4_initv4": {
       "module": "luraph_v14_4_1",
-      "priority": 80,
+      "priority": 90,
       "opcode_map": {
         "LOADK": "0x01",
         "CALL": "0x13",
@@ -28,11 +28,26 @@
         "JMP": "0x28"
       },
       "heuristics": {
-        "signatures": ["Luraph\\s+v14\\.4", "init_fn\\s*\\("],
-        "constants": ["script_key\\s*=\\s*script_key"],
-        "long_strings": ["[A-Za-z0-9+/=]{200,}", "s8W-[!-~]{64,}"],
-        "prologues": ["script_key\\s*=\\s*script_key", "init_fn\\\\s*\\\\([^)]*\\\\)\\\\s*;\\\\s*script_key"],
-        "alphabet": ["[\\\\\"'][0-9A-Za-z!#$%&()*+,-./:;<=>?@\\\\[\\\\]^_`{|}~]{85,}[\\\\\"']"]
+        "signatures": [
+          "Luraph\\s+v14\\.4",
+          "init_fn\\s*\\("
+        ],
+        "constants": [
+          "script_key\\s*=\\s*script_key\\s*or\\s*getgenv\\(\\)\\.script_key",
+          "script_key\\s*=\\s*script_key\\s*or\\s*['\"]"
+        ],
+        "long_strings": [
+          "s8W-[!-~]{64,}",
+          "\\\"s8W-[!-~]{512,}\\\"",
+          "\\[\\s*['\"]s8W-[!-~]{128,}['\"]"
+        ],
+        "prologues": [
+          "script_key\\s*=\\s*script_key",
+          "init_fn\\s*\\([^)]*\\)"
+        ],
+        "alphabet": [
+          "alphabet\\s*=\\s*['\"][0-9A-Za-z!#$%&()*+,-./:;<=>?@\\[\\]^_`{|}~]{85,}['\"]"
+        ]
       },
       "known_traps": []
     },
