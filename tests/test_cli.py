@@ -150,6 +150,7 @@ def test_cli_v1441_script_key_only(tmp_path):
 
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("alphabet_source") == "default"
     assert "bootstrapper" not in payload_meta
 
 
@@ -164,6 +165,7 @@ def test_cli_v1441_bootstrapper_only(tmp_path):
 
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "literal"
+    assert payload_meta.get("alphabet_source") == "bootstrapper"
     bootstrap_meta = payload_meta.get("bootstrapper") or {}
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
@@ -190,6 +192,7 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
 
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("alphabet_source") == "bootstrapper"
     bootstrap_meta = payload_meta.get("bootstrapper") or {}
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")

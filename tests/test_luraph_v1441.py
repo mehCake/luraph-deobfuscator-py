@@ -12,6 +12,7 @@ from src.versions import get_handler
 from src.versions.initv4 import InitV4Decoder
 from src.versions.luraph_v14_4_1 import (
     LuraphV1441,
+    _INITV4_ALPHABET,
     _apply_script_key_transform,
     _encode_base91,
     decode_blob,
@@ -82,6 +83,22 @@ def test_decode_blob_base64_fallback() -> None:
     assert meta.get("index_xor") is True
 
 
+def test_decode_blob_falls_back_to_default_alphabet() -> None:
+    raw = b'{"bytecode": [], "constants": []}'
+    script_key = EXAMPLE_SCRIPT_KEY
+    key_bytes = script_key.encode("utf-8")
+    masked = _apply_script_key_transform(raw, key_bytes)
+    blob = _encode_base91(masked)
+
+    wrong_alphabet = "".join(reversed(_INITV4_ALPHABET))
+    data, meta = decode_blob_with_metadata(blob, script_key, alphabet=wrong_alphabet)
+
+    assert data == raw
+    assert meta.get("alphabet_source") == "default"
+    attempts = meta.get("decode_attempts", [])
+    assert any(entry.get("alphabet_source") == "bootstrapper" for entry in attempts)
+
+
 def test_v1441_handler_locates_payload() -> None:
     script, raw, script_key, blob = _make_sample()
     handler = LuraphV1441()
@@ -93,6 +110,7 @@ def test_v1441_handler_locates_payload() -> None:
     assert handler.extract_bytecode(payload) == raw
     assert payload.metadata.get("decode_method") == "base91"
     assert payload.metadata.get("index_xor") is True
+    assert payload.metadata.get("alphabet_source") == "default"
 
 
 def test_v1441_handler_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,6 +126,7 @@ def test_v1441_handler_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         assert handler.extract_bytecode(payload) == raw
         assert payload.metadata.get("decode_method") == "base91"
         assert payload.metadata.get("index_xor") is True
+        assert payload.metadata.get("alphabet_source") == "default"
     finally:
         monkeypatch.delenv("LURAPH_SCRIPT_KEY", raising=False)
 
@@ -164,6 +183,7 @@ def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:
     assert isinstance(meta, dict)
     assert meta.get("path", "").endswith("initv4.lua")
     assert payload.metadata.get("alphabet_length", 0) >= 85
+    assert payload.metadata.get("alphabet_source") == "bootstrapper"
 
 
 def test_payload_decode_requires_script_key(tmp_path: Path) -> None:
@@ -208,6 +228,7 @@ def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
+    assert payload_meta.get("alphabet_source") == "default"
     assert ctx.vm.meta.get("handler") in {"luraph_v14_4_initv4", "v14.4.1"}
 
 
@@ -234,6 +255,7 @@ def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
+    assert payload_meta.get("alphabet_source") == "default"
 
 
 def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:
@@ -255,6 +277,7 @@ def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None
     assert "script_payload" not in metadata or not metadata["script_payload"]
     payload_meta = metadata.get("handler_payload_meta", {})
     assert payload_meta.get("decode_method") in {"base91", "base64", "base64-relaxed"}
+    assert payload_meta.get("alphabet_source") in {"default", "bootstrapper"}
 
 
 def test_payload_decode_handles_empty_bootstrap() -> None:
@@ -313,6 +336,7 @@ def test_pipeline_deobfuscates_v1441_example(tmp_path: Path) -> None:
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
+    assert payload_meta.get("alphabet_source") == "default"
     assert output.read_text(encoding="utf-8").strip() == expected.strip()
 
 

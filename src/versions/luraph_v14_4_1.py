@@ -8,7 +8,7 @@ import os
 import re
 from types import SimpleNamespace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from ..utils_pkg import strings as string_utils
 from . import OpSpec, PayloadInfo, VersionHandler, register_handler
@@ -187,13 +187,19 @@ def _decode_attempts(
     attempts: List[Dict[str, object]] = []
     errors: Dict[str, str] = {}
 
-    def _record(method: str, raw: Optional[bytes]) -> None:
+    def _record(
+        method: str,
+        raw: Optional[bytes],
+        *,
+        alphabet_source: str = "n/a",
+    ) -> None:
         if raw is None:
             return
         decoded = _apply_script_key_transform(raw, key_bytes)
         attempts.append(
             {
                 "method": method,
+                "alphabet_source": alphabet_source,
                 "data": decoded,
                 "size": len(decoded),
                 "score": _score_decoded_bytes(decoded),
@@ -204,12 +210,23 @@ def _decode_attempts(
     allow_base91 = len(cleaned) >= 2
     forced_base91 = allow_base91 and not prefer_base91
     if allow_base91:
-        try:
-            decoded = _decode_base91(cleaned, alphabet=alphabet)
-        except ValueError as exc:
-            errors["base91"] = str(exc)
-        else:
-            _record("base91", decoded)
+        alphabet_candidates: List[Tuple[str, Optional[str]]] = []
+        if alphabet:
+            alphabet_candidates.append(("bootstrapper", alphabet))
+        alphabet_candidates.append(("default", None))
+
+        seen_alphabets: Set[str] = set()
+        for source, candidate in alphabet_candidates:
+            actual_alphabet, _, _ = _prepare_alphabet(candidate)
+            if actual_alphabet in seen_alphabets:
+                continue
+            seen_alphabets.add(actual_alphabet)
+            try:
+                decoded = _decode_base91(cleaned, alphabet=candidate)
+            except ValueError as exc:
+                errors[f"base91[{source}]"] = str(exc)
+            else:
+                _record("base91", decoded, alphabet_source=source)
 
     base_candidate = string_utils.maybe_base64(cleaned)
     if base_candidate:
@@ -261,11 +278,13 @@ def _decode_attempts(
                 "method": entry["method"],
                 "size": entry["size"],
                 "score": round(float(entry["score"]), 4),
+                "alphabet_source": entry.get("alphabet_source", "n/a"),
             }
             for entry in attempts
         ],
         "script_key_length": len(key_bytes),
         "index_xor": True,
+        "alphabet_source": best.get("alphabet_source", "n/a"),
     }
     if best["score"] < 0.25:
         metadata["low_confidence"] = True
