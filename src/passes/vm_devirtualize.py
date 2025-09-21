@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -10,7 +11,7 @@ from variable_renamer import VariableRenamer
 
 from .. import utils
 from ..utils_pkg import ast as lua_ast
-from ..utils_pkg.ir import IRInstruction, IRModule
+from ..utils_pkg.ir import IRBasicBlock, IRInstruction, IRModule
 from ..versions import VersionHandler, decode_constant_pool, get_handler
 
 LOG = logging.getLogger(__name__)
@@ -43,10 +44,28 @@ class IRDevirtualizer:
         self.constants = list(constants)
         self.instructions: List[IRInstruction] = list(module.instructions)
         self._pc_to_index: Dict[int, int] = {inst.pc: idx for idx, inst in enumerate(self.instructions)}
+        self.blocks: Dict[str, IRBasicBlock] = dict(module.blocks or {})
+        self.block_order: List[str] = list(module.order or [])
+        entry: Optional[str] = module.entry if module.entry in self.blocks else None
+        if entry is None and self.block_order:
+            candidate = self.block_order[0]
+            entry = candidate if candidate in self.blocks else None
+        if entry is None and self.blocks:
+            entry = next(iter(self.blocks))
+        self.entry_block: Optional[str] = entry
         self._namer = _RegisterNamer()
         self._unknown = 0
         self._loop_count = 0
         self._branch_count = 0
+        self._closure_count = 0
+        self._prototype_modules: Dict[int, IRModule] = getattr(module, "prototypes", {}) or {}
+        self._prototype_cache: Dict[int, List[lua_ast.Stmt]] = {}
+        self._closure_aliases: Dict[int, str] = {}
+        self._reachable_blocks, self._reachable_pcs = self._analyse_cfg()
+        self._unreachable_blocks = set(self.blocks) - self._reachable_blocks
+        self._unreachable_pcs = {
+            inst.pc for inst in self.instructions if inst.pc not in self._reachable_pcs
+        }
 
         self._handlers = {
             "LoadK": self._handle_loadk,
@@ -73,6 +92,51 @@ class IRDevirtualizer:
         }
 
     # ------------------------------------------------------------------
+    def _analyse_cfg(self) -> Tuple[set[str], set[int]]:
+        blocks = self.blocks
+        if not blocks:
+            pcs = {inst.pc for inst in self.instructions}
+            return set(), pcs
+
+        start = self.entry_block
+        if start is None:
+            for label in self.block_order:
+                if label in blocks:
+                    start = label
+                    break
+        if start is None and blocks:
+            start = next(iter(blocks))
+
+        reachable_blocks: set[str] = set()
+        reachable_pcs: set[int] = set()
+
+        if start is None:
+            for inst in self.instructions:
+                reachable_pcs.add(inst.pc)
+            return reachable_blocks, reachable_pcs
+
+        stack: List[str] = [start]
+        while stack:
+            label = stack.pop()
+            if label in reachable_blocks:
+                continue
+            block = blocks.get(label)
+            if block is None:
+                continue
+            reachable_blocks.add(label)
+            for inst in block.instructions:
+                reachable_pcs.add(inst.pc)
+            for succ in block.successors:
+                if succ not in reachable_blocks and succ in blocks:
+                    stack.append(succ)
+
+        if not reachable_pcs:
+            for inst in self.instructions:
+                reachable_pcs.add(inst.pc)
+
+        return reachable_blocks, reachable_pcs
+
+    # ------------------------------------------------------------------
     def lower(self) -> Tuple[lua_ast.Chunk, Dict[str, Any]]:
         ctx = _LoweringContext()
         body, _ = self._lower_range(ctx, 0, len(self.instructions))
@@ -83,6 +147,15 @@ class IRDevirtualizer:
             "loops": self._loop_count,
             "branches": self._branch_count,
         }
+        if self.blocks:
+            metadata["reachable_blocks"] = len(self._reachable_blocks)
+            if self._unreachable_blocks:
+                metadata["unreachable_blocks"] = len(self._unreachable_blocks)
+        eliminated = len(self._unreachable_pcs)
+        if eliminated:
+            metadata["eliminated_instructions"] = eliminated
+        if self._closure_count:
+            metadata["closures"] = self._closure_count
         return chunk, metadata
 
     # ------------------------------------------------------------------
@@ -96,6 +169,9 @@ class IRDevirtualizer:
         idx = start
         while idx < end:
             inst = self.instructions[idx]
+            if self.blocks and inst.pc not in self._reachable_pcs:
+                idx += 1
+                continue
             handler = self._handlers.get(inst.opcode)
             if handler is None:
                 self._unknown += 1
@@ -163,6 +239,22 @@ class IRDevirtualizer:
         if is_local:
             ctx.defined.add(reg)
         return lua_ast.Assignment(targets=[lua_ast.Name(name)], values=[expr], is_local=is_local)
+
+    def _lower_prototype_body(self, proto_index: int | None) -> List[lua_ast.Stmt]:
+        if not isinstance(proto_index, int):
+            return []
+        cached = self._prototype_cache.get(proto_index)
+        if cached is not None:
+            return [copy.deepcopy(stmt) for stmt in cached]
+        module = self._prototype_modules.get(proto_index)
+        if not isinstance(module, IRModule):
+            self._prototype_cache[proto_index] = []
+            return []
+        nested = IRDevirtualizer(module, module.constants)
+        chunk, _ = nested.lower()
+        body = chunk.body
+        self._prototype_cache[proto_index] = body
+        return [copy.deepcopy(stmt) for stmt in body]
 
     def _fetch_constant(self, index: int | None) -> Any:
         if index is None:
@@ -449,6 +541,8 @@ class IRDevirtualizer:
         target_idx = self._pc_to_index.get(target_pc) if target_pc is not None else None
         if target_idx is None:
             return idx + 1
+        if self.blocks and isinstance(target_pc, int) and target_pc not in self._reachable_pcs:
+            return end
         if target_idx <= idx:
             # Backwards jump – treat as loop terminator.
             return end
@@ -470,6 +564,16 @@ class IRDevirtualizer:
         conditional = inst.args.get("conditional")
         if conditional == "JMPIF":
             cond = self._negate(cond)
+
+        if self.blocks and isinstance(target_pc, int) and target_pc not in self._reachable_pcs:
+            branch_ctx = ctx.clone()
+            body, _ = self._lower_range(branch_ctx, idx + 1, target_idx)
+            if body:
+                out.append(lua_ast.If(test=cond, body=body, orelse=[]))
+                ctx.registers.update(branch_ctx.registers)
+                ctx.defined.update(branch_ctx.defined)
+                self._branch_count += 1
+            return target_idx
 
         branch_ctx = ctx.clone()
         body, _ = self._lower_range(branch_ctx, idx + 1, target_idx)
@@ -691,12 +795,31 @@ class IRDevirtualizer:
         out: List[lua_ast.Stmt],
     ) -> int:
         inst = self.instructions[idx]
-        dest = inst.args.get("dest") or inst.dest
+        dest = inst.args.get("dest") if inst.args.get("dest") is not None else inst.dest
         proto = inst.args.get("proto")
-        expr = lua_ast.Name(f"closure_{proto}")
-        assign = self._assign_register(ctx, dest, expr)
-        if assign:
-            out.append(assign)
+        reg_index = dest if isinstance(dest, int) else None
+        target_name = self._register_name(reg_index if reg_index is not None else 0)
+        alias = self._closure_aliases.get(proto) if isinstance(proto, int) else None
+        if alias is None:
+            self._closure_count += 1
+            if isinstance(proto, int):
+                self._closure_aliases[proto] = target_name
+            body = self._lower_prototype_body(proto if isinstance(proto, int) else None)
+            func_def = lua_ast.FunctionDef(
+                name=lua_ast.Name(target_name),
+                params=[],
+                body=body,
+                is_local=True,
+            )
+            out.append(func_def)
+            if reg_index is not None:
+                ctx.registers[reg_index] = lua_ast.Name(target_name)
+                ctx.defined.add(reg_index)
+        else:
+            expr = lua_ast.Name(alias)
+            assign = self._assign_register(ctx, reg_index, expr)
+            if assign:
+                out.append(assign)
         return idx + 1
 
 

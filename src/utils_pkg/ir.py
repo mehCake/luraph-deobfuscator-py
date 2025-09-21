@@ -39,6 +39,7 @@ class IRModule:
     instructions: List[IRInstruction] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     bytecode_size: int = 0
+    prototypes: Dict[int, "IRModule"] = field(default_factory=dict)
 
     @property
     def instruction_count(self) -> int:

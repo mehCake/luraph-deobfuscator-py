@@ -1,19 +1,30 @@
 from src.pipeline import Context
 from src.passes.vm_devirtualize import IRDevirtualizer, run as vm_devirtualize_run
 from src.utils_pkg import ast as lua_ast
-from src.utils_pkg.ir import IRInstruction, IRModule
+from src.utils_pkg.ir import IRBasicBlock, IRInstruction, IRModule
 
 
-def _make_module(instructions: list[IRInstruction]) -> IRModule:
+def _make_module(
+    instructions: list[IRInstruction],
+    *,
+    blocks: dict[str, IRBasicBlock] | None = None,
+    order: list[str] | None = None,
+    entry: str = "entry",
+    constants: list[object] | None = None,
+    prototypes: dict[int, IRModule] | None = None,
+) -> IRModule:
+    block_map = blocks or {}
+    block_order = order or (list(block_map.keys()) if block_map else [])
     return IRModule(
-        blocks={},
-        order=[],
-        entry="entry",
+        blocks=block_map,
+        order=block_order,
+        entry=entry,
         register_types={},
-        constants=[],
+        constants=constants or [],
         instructions=instructions,
         warnings=[],
         bytecode_size=len(instructions),
+        prototypes=prototypes or {},
     )
 
 
@@ -83,6 +94,51 @@ def test_ir_devirtualizer_emits_generic_for() -> None:
     assert "for R3 in" in source
     assert "'iter', 'state', 'seed'" in source
     assert "R4 =" in source
+
+
+def test_ir_devirtualizer_skips_unreachable_blocks() -> None:
+    live0 = IRInstruction(pc=0, opcode="LoadK", args={"dest": 0, "const_value": "alive"}, dest=0)
+    live1 = IRInstruction(pc=1, opcode="Return", args={"base": 0, "count": 1})
+    trap0 = IRInstruction(pc=2, opcode="LoadK", args={"dest": 1, "const_value": "trap"}, dest=1)
+    trap1 = IRInstruction(pc=3, opcode="Jump", args={"target": 2})
+
+    entry_block = IRBasicBlock(label="entry", start_pc=0, instructions=[live0, live1], successors=[])
+    trap_block = IRBasicBlock(label="trap", start_pc=2, instructions=[trap0, trap1], successors=["trap"])
+
+    module = _make_module(
+        [live0, live1, trap0, trap1],
+        blocks={"entry": entry_block, "trap": trap_block},
+        order=["entry", "trap"],
+    )
+
+    devirt = IRDevirtualizer(module, module.constants)
+    chunk, metadata = devirt.lower()
+    source = lua_ast.to_source(chunk)
+
+    assert "trap" not in source
+    assert metadata.get("unreachable_blocks") == 1
+    assert metadata.get("eliminated_instructions") == 2
+
+
+def test_ir_devirtualizer_lowers_closures() -> None:
+    proto_instructions = [
+        IRInstruction(pc=0, opcode="LoadK", args={"dest": 0, "const_value": 42}, dest=0),
+        IRInstruction(pc=1, opcode="Return", args={"base": 0, "count": 1}),
+    ]
+    proto_module = _make_module(proto_instructions, entry="proto")
+
+    main_instructions = [
+        IRInstruction(pc=0, opcode="Closure", args={"dest": 0, "proto": 0}, dest=0),
+        IRInstruction(pc=1, opcode="Return", args={"base": 0, "count": 1}),
+    ]
+    module = _make_module(main_instructions, prototypes={0: proto_module})
+
+    chunk, _ = IRDevirtualizer(module, module.constants).lower()
+    source = lua_ast.to_source(chunk)
+
+    assert "local function R0()" in source
+    assert "local R0 = 42" in source
+    assert "return R0" in source
 
 
 def test_vm_devirtualize_pass_renames_and_formats(tmp_path) -> None:
