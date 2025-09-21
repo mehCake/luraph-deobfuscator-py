@@ -8,12 +8,14 @@ GOLDEN_DIR = PROJECT_ROOT / "tests" / "golden"
 V1441_SOURCE = PROJECT_ROOT / "examples" / "v1441_hello.lua"
 V1441_GOLDEN = GOLDEN_DIR / "v1441_hello.lua.out"
 INITV4_STUB = PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua"
+COMPLEX_SOURCE = PROJECT_ROOT / "examples" / "complex_obfuscated"
+SCRIPT_KEY = "ncbmxnbs6wrpkpaitt6dwj"
 
 
 def _prepare_v1441_source(tmp_path: Path, *, literal_key: bool = False) -> Path:
     text = V1441_SOURCE.read_text(encoding="utf-8")
     if literal_key:
-        text = text.replace("getgenv().script_key", '"ncbmxnbs6wrpkpaitt6dwj"')
+        text = text.replace("getgenv().script_key", f'"{SCRIPT_KEY}"')
     target = tmp_path / V1441_SOURCE.name
     target.write_text(text, encoding="utf-8")
     return target
@@ -24,6 +26,12 @@ def _prepare_bootstrapper(tmp_path: Path) -> Path:
     stub_dir.mkdir()
     (stub_dir / "initv4.lua").write_text(INITV4_STUB.read_text(encoding="utf-8"), encoding="utf-8")
     return stub_dir
+
+
+def _prepare_complex_json(tmp_path: Path) -> Path:
+    target = tmp_path / "complex.json"
+    target.write_text(COMPLEX_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
 
 
 def _run_cli(target: Path, workdir: Path, *extra: str) -> subprocess.CompletedProcess:
@@ -140,7 +148,7 @@ def test_cli_dump_ir_creates_listing(tmp_path):
 
 def test_cli_v1441_script_key_only(tmp_path):
     target = _prepare_v1441_source(tmp_path)
-    _run_cli(target, tmp_path, "--script-key", "ncbmxnbs6wrpkpaitt6dwj", "--format", "json")
+    _run_cli(target, tmp_path, "--script-key", SCRIPT_KEY, "--format", "json")
 
     output = target.with_name(f"{target.stem}_deob.json")
     data = json.loads(output.read_text(encoding="utf-8"))
@@ -179,7 +187,7 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
         target,
         tmp_path,
         "--script-key",
-        "ncbmxnbs6wrpkpaitt6dwj",
+        SCRIPT_KEY,
         "--bootstrapper",
         str(stub_dir),
         "--format",
@@ -210,3 +218,30 @@ def test_cli_reports_missing_script_key(tmp_path):
     payload_meta = data.get("passes", {}).get("payload_decode", {})
     error_text = payload_meta.get("handler_bytecode_error", "")
     assert "script key" in error_text.lower()
+
+
+def test_cli_complex_initv4_with_key_and_bootstrapper(tmp_path):
+    source = _prepare_complex_json(tmp_path)
+    stub_dir = _prepare_bootstrapper(tmp_path)
+
+    _run_cli(
+        source,
+        tmp_path,
+        "--script-key",
+        SCRIPT_KEY,
+        "--bootstrapper",
+        str(stub_dir),
+        "--format",
+        "json",
+    )
+
+    output = source.with_name(f"{source.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    text = data.get("output", "")
+    assert "Aimbot" in text
+    assert "ESP" in text
+
+    payload_meta = data.get("passes", {}).get("payload_decode", {})
+    assert payload_meta.get("script_key_override") is True
+    handler_name = payload_meta.get("handler")
+    assert handler_name in {"luraph_v14_4_initv4", "luraph_v14_2_json"}
