@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 from src.exceptions import VMEmulationError
 from src.ir import VMFunction, VMInstruction
@@ -44,20 +44,29 @@ class LuaVMSimulator:
         trace: bool = False,
         trace_hook: Optional[Callable[[VMInstruction, VMFrame], None]] = None,
         env: Optional[Dict[str, Any]] = None,
+        loop_threshold: int = 64,
     ) -> None:
         self.max_steps = max_steps
         self.trace_enabled = trace
         self.trace_hook = trace_hook
         self.trace_log: List[str] = []
-        self._globals: Dict[str, Any] = {"print": lambda *args: None}
+        self._globals: Dict[str, Any] = {}
+        self._loop_threshold = max(1, loop_threshold)
+        self._install_default_globals()
         if env:
             self._globals.update(env)
         self._frames: List[VMFrame] = []
+        self.analysis: Dict[str, Any] = {}
+        self._halt_reason: Optional[str] = None
+        self._recorded_dummy_pcs: Set[int] = set()
+        self._recorded_anti_debug: Set[str] = set()
 
     # ------------------------------------------------------------------
     def run(self, function: VMFunction, args: Optional[Sequence[Any]] = None) -> Any:
         """Execute ``function`` and return the last ``RETURN`` value."""
 
+        self._reset_analysis()
+        self.trace_log = []
         self._frames = [self._create_frame(function, list(args or []))]
         result: Any = None
         steps = 0
@@ -75,19 +84,28 @@ class LuaVMSimulator:
                 if self.trace_hook:
                     self.trace_hook(instr, frame)
 
+            current_pc = frame.pc
             frame.pc += 1
             handler = getattr(self, f"_op_{instr.opcode.lower()}", None)
             if handler is None:
                 raise VMEmulationError(f"unsupported opcode: {instr.opcode}")
             result = handler(frame, instr)
 
+            self._update_loop_analysis(instr, current_pc)
+
             steps += 1
             if steps > self.max_steps:
+                self._mark_dummy_loop(frame.pc, instr.opcode, "step_limit")
                 raise VMEmulationError("step limit exceeded")
 
             if result is not None and not self._frames:
+                self._finalize_analysis()
                 return result
 
+            if self._halt_reason:
+                break
+
+        self._finalize_analysis()
         return result
 
     # ------------------------------------------------------------------
@@ -110,6 +128,145 @@ class LuaVMSimulator:
         return None
 
     # ------------------------------------------------------------------
+    def _reset_analysis(self) -> None:
+        self.analysis = {"dummy_loops": [], "anti_debug_checks": []}
+        self._halt_reason = None
+        self._self_loop_counter = 0
+        self._recorded_dummy_pcs = set()
+        self._recorded_anti_debug = set()
+
+    def _install_default_globals(self) -> None:
+        def stub_print(*_: Any) -> None:
+            return None
+
+        def stub_pcall(func: Any, *args: Any) -> Any:
+            self._mark_anti_debug("pcall")
+            if not callable(func):
+                return (False, "pcall: not callable")
+            try:
+                result = func(*args)
+            except Exception as exc:  # pragma: no cover - defensive
+                return (False, exc)
+            if isinstance(result, tuple):
+                return (True, *result)
+            if isinstance(result, list):
+                return (True, *result)
+            if result is None:
+                return (True,)
+            return (True, result)
+
+        def stub_xpcall(func: Any, err_handler: Any, *args: Any) -> Any:
+            self._mark_anti_debug("xpcall")
+            if not callable(func):
+                return (False, "xpcall: not callable")
+            try:
+                result = func(*args)
+            except Exception as exc:  # pragma: no cover - defensive
+                if callable(err_handler):
+                    handled = err_handler(exc)
+                    if isinstance(handled, tuple):
+                        return (False, *handled)
+                    if isinstance(handled, list):
+                        return (False, *handled)
+                    if handled is None:
+                        return (False,)
+                    return (False, handled)
+                return (False, exc)
+            if isinstance(result, tuple):
+                return (True, *result)
+            if isinstance(result, list):
+                return (True, *result)
+            if result is None:
+                return (True,)
+            return (True, result)
+
+        def stub_debug_getinfo(*_: Any) -> Dict[str, Any]:
+            self._mark_anti_debug("debug.getinfo")
+            return {"currentline": 0, "what": "Lua"}
+
+        def stub_debug_traceback(*_: Any) -> str:
+            self._mark_anti_debug("debug.traceback")
+            return ""
+
+        def stub_debug_sethook(*_: Any) -> None:
+            self._mark_anti_debug("debug.sethook")
+            return None
+
+        def stub_debug_gethook(*_: Any) -> None:
+            self._mark_anti_debug("debug.gethook")
+            return None
+
+        def stub_collectgarbage(*_: Any) -> int:
+            self._mark_anti_debug("collectgarbage")
+            return 0
+
+        def stub_coroutine_running(*_: Any) -> tuple[Any, bool]:
+            self._mark_anti_debug("coroutine.running")
+            return None, False
+
+        def stub_os_clock(*_: Any) -> float:
+            self._mark_anti_debug("os.clock")
+            return 0.0
+
+        def stub_string_dump(*_: Any) -> str:
+            self._mark_anti_debug("string.dump")
+            return ""
+
+        def stub_getfenv(*_: Any) -> Dict[str, Any]:
+            self._mark_anti_debug("getfenv")
+            return {}
+
+        self._globals["print"] = stub_print
+        self._globals["pcall"] = stub_pcall
+        self._globals["xpcall"] = stub_xpcall
+        self._globals["collectgarbage"] = stub_collectgarbage
+        self._globals["getfenv"] = stub_getfenv
+        self._globals.setdefault("debug", {})
+        self._globals["debug"].update(
+            {
+                "getinfo": stub_debug_getinfo,
+                "traceback": stub_debug_traceback,
+                "sethook": stub_debug_sethook,
+                "gethook": stub_debug_gethook,
+            }
+        )
+        self._globals.setdefault("coroutine", {})
+        self._globals["coroutine"].update({"running": stub_coroutine_running})
+        self._globals.setdefault("os", {})
+        self._globals["os"].update({"clock": stub_os_clock})
+        self._globals.setdefault("string", {})
+        self._globals["string"].update({"dump": stub_string_dump})
+
+    def _mark_dummy_loop(self, pc: int, opcode: str, reason: str) -> None:
+        if pc not in self._recorded_dummy_pcs:
+            self.analysis.setdefault("dummy_loops", []).append(
+                {"pc": pc, "opcode": opcode, "reason": reason}
+            )
+            self._recorded_dummy_pcs.add(pc)
+        self._halt_reason = "dummy_loop"
+
+    def _mark_anti_debug(self, name: str) -> None:
+        if name not in self._recorded_anti_debug:
+            self.analysis.setdefault("anti_debug_checks", []).append(name)
+            self._recorded_anti_debug.add(name)
+
+    def _update_loop_analysis(self, instr: VMInstruction, original_pc: int) -> None:
+        if instr.opcode == "JMP" and self._frames:
+            frame = self._frames[-1]
+            if frame.pc == original_pc:
+                self._self_loop_counter += 1
+                if self._self_loop_counter >= self._loop_threshold:
+                    self._mark_dummy_loop(original_pc, instr.opcode, "self_loop")
+                    self._frames.clear()
+            else:
+                self._self_loop_counter = 0
+        elif instr.opcode not in {"TEST", "TESTSET"}:
+            self._self_loop_counter = 0
+
+    def _finalize_analysis(self) -> None:
+        if self._halt_reason and "halt_reason" not in self.analysis:
+            self.analysis["halt_reason"] = self._halt_reason
+
     # Operand helpers
     def _read_register(self, frame: VMFrame, index: Optional[int]) -> Any:
         if index is None:

@@ -346,8 +346,15 @@ class LuaDeobfuscator:
                 result = simulator.run(canonical)
             except VMEmulationError:  # pragma: no cover - fallback
                 result = None
+            analysis = getattr(simulator, "analysis", {})
             if simulator.trace_log:
                 metadata["vm_trace"] = simulator.trace_log
+            if analysis.get("dummy_loops"):
+                metadata["vm_dummy_loops"] = analysis["dummy_loops"]
+            if analysis.get("anti_debug_checks"):
+                metadata["vm_anti_debug"] = analysis["anti_debug_checks"]
+            if analysis.get("halt_reason"):
+                metadata["vm_halt_reason"] = analysis["halt_reason"]
             if isinstance(result, (str, int, float)):
                 return DeobResult(str(result), {**metadata, "vm_result": result})
             pseudo = Devirtualizer(canonical).render()

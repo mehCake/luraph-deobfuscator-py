@@ -1,5 +1,6 @@
 from opcode_lifter import OpcodeLifter
 from lua_vm_simulator import LuaVMSimulator
+from src.ir import VMFunction, VMInstruction
 
 
 def test_simulator_executes_numeric_for_loop():
@@ -47,3 +48,57 @@ def test_simulator_handles_generic_for_loop():
     simulator = LuaVMSimulator()
     result = simulator.run(program)
     assert result == 6
+
+
+def test_simulator_detects_self_loop_dummy():
+    program = VMFunction(
+        constants=[],
+        instructions=[VMInstruction("JMP", aux={"offset": -1})],
+    )
+
+    simulator = LuaVMSimulator(loop_threshold=3)
+    result = simulator.run(program)
+
+    assert result is None
+    assert simulator.analysis["dummy_loops"]
+    assert simulator.analysis["dummy_loops"][0]["reason"] == "self_loop"
+    assert simulator.analysis.get("halt_reason") == "dummy_loop"
+
+
+def test_simulator_marks_anti_debug_checks():
+    def payload_function() -> int:
+        return 123
+
+    program = VMFunction(
+        constants=[],
+        instructions=[
+            VMInstruction("GETGLOBAL", a=0, aux={"b_mode": "const", "const_b": "pcall"}),
+            VMInstruction("LOADK", a=1, aux={"b_mode": "const", "const_b": payload_function}),
+            VMInstruction(
+                "CALL",
+                a=0,
+                b=2,
+                c=2,
+                aux={
+                    "b_mode": "immediate",
+                    "immediate_b": 2,
+                    "c_mode": "immediate",
+                    "immediate_c": 2,
+                },
+            ),
+            VMInstruction(
+                "RETURN",
+                a=0,
+                b=1,
+                aux={"b_mode": "immediate", "immediate_b": 1},
+            ),
+        ],
+        register_count=2,
+    )
+
+    simulator = LuaVMSimulator()
+    result = simulator.run(program)
+
+    assert result is True
+    assert "pcall" in simulator.analysis["anti_debug_checks"]
+    assert not simulator.analysis["dummy_loops"]
