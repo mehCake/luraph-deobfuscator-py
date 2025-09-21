@@ -32,3 +32,21 @@ def test_variable_names_are_stable():
     first = renamer.rename_variables(SAMPLE_SOURCE)
     second = VariableRenamer().rename_variables(SAMPLE_SOURCE)
     assert first == second
+
+
+def test_nested_function_scope_isolated():
+    code = """
+function R0(R1)
+  local R2 = 1
+  local function R3(R4)
+    local R5 = R4 + R2
+    return R5
+  end
+  return R3(R2)
+end
+"""
+    renamed = VariableRenamer().rename_variables(code)
+    assert "local function c(arg1)" in renamed
+    assert "return c(b)" in renamed
+    assert "arg1 + b" in renamed
+    assert "R0" not in renamed and "R2" not in renamed and "R3" not in renamed

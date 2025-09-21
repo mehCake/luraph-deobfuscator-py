@@ -24,7 +24,7 @@ match the recognised register patterns are left untouched.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 import logging
 import re
@@ -39,6 +39,10 @@ _GENERIC_FOR_RE = re.compile(
 )
 _LENGTH_RE = re.compile(r"#\s*([A-Za-z_][A-Za-z0-9_]*)")
 _INDEX_RE = re.compile(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]")
+_LOCAL_DECL_RE = re.compile(r"\blocal\s+(?!function)([RT]\d+(?:\s*,\s*[RT]\d+)*)")
+_LOCAL_FUNC_RE = re.compile(r"\blocal\s+function\s+([RT]\d+)")
+_FUNCTION_DECL_RE = re.compile(r"\bfunction\s+([RT]\d+)\s*\(")
+_FUNCTION_ASSIGN_RE = re.compile(r"\b([RT]\d+)\s*=\s*function\b")
 
 _HEADER_RE = re.compile(
     r"function\s*(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*)(?:[:.][A-Za-z_][A-Za-z0-9_]*)?)?\s*\((?P<params>[^)]*)\)",
@@ -127,10 +131,11 @@ class FunctionSpan:
 class SymbolInfo:
     parameter_positions: List[int]
     tags: Set[str]
+    defines_local: bool = False
 
     @classmethod
     def empty(cls) -> "SymbolInfo":
-        return cls(parameter_positions=[], tags=set())
+        return cls(parameter_positions=[], tags=set(), defines_local=False)
 
 
 @dataclass
@@ -138,13 +143,27 @@ class ScopeState:
     used_names: Set[str]
     role_counters: Dict[str, int]
     alpha_index: int = 0
+    bindings: Dict[str, str] = field(default_factory=dict)
+    parent: "ScopeState | None" = None
 
     @classmethod
     def root(cls) -> "ScopeState":
-        return cls(set(), defaultdict(int), 0)
+        return cls(set(), defaultdict(int), 0, {}, None)
 
     def child(self) -> "ScopeState":
-        return ScopeState(set(self.used_names), defaultdict(int), 0)
+        return ScopeState(set(), defaultdict(int), 0, {}, self)
+
+    def lookup(self, name: str) -> Optional[str]:
+        state: Optional["ScopeState"] = self
+        while state is not None:
+            if name in state.bindings:
+                return state.bindings[name]
+            state = state.parent
+        return None
+
+    def remember(self, name: str, alias: str) -> None:
+        self.bindings[name] = alias
+        self.used_names.add(alias)
 
 
 class VariableRenamer:
@@ -173,7 +192,7 @@ class VariableRenamer:
         children = self._direct_child_functions(text, skip_self=header is not None)
         masked = self._mask_children(text, children)
         self._seed_existing_names(state, masked)
-        mapping = self._build_mapping(masked, header, state)
+        mapping = self._build_mapping(masked, header, state, children)
 
         if not children:
             return self._replace_identifiers(text, mapping)
@@ -198,6 +217,7 @@ class VariableRenamer:
         text: str,
         header: Optional[HeaderInfo],
         state: ScopeState,
+        children: Sequence[FunctionSpan],
     ) -> Dict[str, str]:
         candidates = sorted({match.group(0) for match in _CANDIDATE_RE.finditer(text)}, key=self._sort_key)
         if not candidates:
@@ -206,14 +226,18 @@ class VariableRenamer:
         info = {name: SymbolInfo.empty() for name in candidates}
         if header is not None:
             if header.name and header.name in info:
-                info[header.name].tags.add("function")
+                details = info[header.name]
+                details.tags.add("function")
+                details.defines_local = True
             for position, param in enumerate(header.params, start=1):
                 if param in info:
                     details = info[param]
                     details.parameter_positions.append(position)
                     details.tags.add("parameter")
+                    details.defines_local = True
 
         self._apply_role_heuristics(info, text)
+        self._mark_definitions(info, text, children)
 
         mapping: Dict[str, str] = {}
         for candidate in candidates:
@@ -227,7 +251,9 @@ class VariableRenamer:
         for match in _NUMERIC_FOR_RE.finditer(text):
             name = match.group(1)
             if name in info:
-                info[name].tags.add("loop_index")
+                details = info[name]
+                details.tags.add("loop_index")
+                details.defines_local = True
 
         for match in _GENERIC_FOR_RE.finditer(text):
             groups = [g for g in match.groups() if g]
@@ -235,10 +261,14 @@ class VariableRenamer:
                 continue
             first, *rest = groups
             if first in info:
-                info[first].tags.add("key")
+                details = info[first]
+                details.tags.add("key")
+                details.defines_local = True
             for name in rest:
                 if name in info:
-                    info[name].tags.add("value")
+                    details = info[name]
+                    details.tags.add("value")
+                    details.defines_local = True
 
         for match in _LENGTH_RE.finditer(text):
             name = match.group(1)
@@ -250,23 +280,73 @@ class VariableRenamer:
             if name in info:
                 info[name].tags.add("key")
 
+    def _mark_definitions(
+        self,
+        info: Dict[str, SymbolInfo],
+        text: str,
+        children: Sequence[FunctionSpan],
+    ) -> None:
+        if not info:
+            return
+
+        for match in _LOCAL_DECL_RE.finditer(text):
+            names = re.findall(r"[RT]\d+", match.group(1))
+            for name in names:
+                if name in info:
+                    info[name].defines_local = True
+
+        for match in _LOCAL_FUNC_RE.finditer(text):
+            name = match.group(1)
+            if name in info:
+                entry = info[name]
+                entry.tags.add("function")
+                entry.defines_local = True
+
+        for match in _FUNCTION_DECL_RE.finditer(text):
+            name = match.group(1)
+            if name in info:
+                entry = info[name]
+                entry.tags.add("function")
+                entry.defines_local = True
+
+        for match in _FUNCTION_ASSIGN_RE.finditer(text):
+            name = match.group(1)
+            if name in info:
+                info[name].defines_local = True
+
+        for child in children:
+            header = child.header
+            if header and header.name and header.name in info:
+                entry = info[header.name]
+                entry.tags.add("function")
+                entry.defines_local = True
+
     # -- Name allocation ------------------------------------------------
     def _assign_name(self, name: str, details: Optional[SymbolInfo], state: ScopeState) -> str:
-        if name.startswith("UPVAL"):
-            return self._assign_upvalue(name, state)
-
         info = details or SymbolInfo.empty()
-        if "parameter" in info.tags:
-            return self._assign_parameter(info, state)
-        if "loop_index" in info.tags:
-            return self._assign_role("idx", state, plain_first=True)
-        if "length" in info.tags:
-            return self._assign_role("len", state, plain_first=True)
-        if "key" in info.tags:
-            return self._assign_role("key", state, plain_first=True)
-        if "value" in info.tags:
-            return self._assign_role("value", state, plain_first=True)
-        return self._assign_register(state)
+        existing = state.lookup(name)
+        if existing is not None:
+            if not (info.defines_local and "function" not in info.tags):
+                state.remember(name, existing)
+                return existing
+
+        if name.startswith("UPVAL"):
+            alias = self._assign_upvalue(name, state)
+        elif "parameter" in info.tags:
+            alias = self._assign_parameter(info, state)
+        elif "loop_index" in info.tags:
+            alias = self._assign_role("idx", state, plain_first=True)
+        elif "length" in info.tags:
+            alias = self._assign_role("len", state, plain_first=True)
+        elif "key" in info.tags:
+            alias = self._assign_role("key", state, plain_first=True)
+        elif "value" in info.tags:
+            alias = self._assign_role("value", state, plain_first=True)
+        else:
+            alias = self._assign_register(state)
+
+        state.remember(name, alias)
+        return alias
 
     def _assign_upvalue(self, name: str, state: ScopeState) -> str:
         try:
@@ -278,7 +358,6 @@ class VariableRenamer:
         while candidate in state.used_names or candidate in self._reserved_words:
             suffix += 1
             candidate = f"uv{index}_{suffix}"
-        state.used_names.add(candidate)
         return candidate
 
     def _assign_parameter(self, info: SymbolInfo, state: ScopeState) -> str:
