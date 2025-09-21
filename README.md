@@ -55,6 +55,7 @@ Frequently used flags:
 | `--skip-passes` / `--only-passes` | Comma separated pass names to disable or exclusively enable |
 | `--profile` | Print a timing table for the executed passes |
 | `--script-key KEY` | Provide the decryption key required by Luraph v14.4.x payloads |
+| `--bootstrapper PATH` | Load an initv4 stub to recover its alphabet/opcode table automatically |
 | `--verbose` | Enable colourised console logging alongside `deobfuscator.log` |
 | `--vm-trace`/`--trace` | Capture VM instruction traces when the simulator runs |
 | `--detect-only` | Stop after version detection and emit a textual report |
@@ -81,6 +82,38 @@ detected version details, and the per-pass timing information shown above.
 Supplying `--write-artifacts DIR` produces files such as `preprocess.lua` or
 `vm_devirtualize.lua` for each processed input, which greatly simplifies
 debugging new samples.
+
+### Luraph v14.4.1 bootstrap workflows
+
+Luraph v14.4.1 ships an `initv4` bootstrapper that hides VM bytecode inside
+high-entropy blobs and decrypts them with the user-visible `script_key`.  The
+CLI exposes two options that mirror this workflow:
+
+- `--script-key` – supply the key handed out with the protected download.
+- `--bootstrapper` – point at the accompanying `initv4.lua` (or a directory
+  containing it) so the deobfuscator can harvest the custom alphabet and opcode
+  dispatch table automatically.
+
+When both arguments are present the CLI favours the script key on the command
+line but still uses the bootstrapper metadata to remap opcodes.  If the key is
+embedded in the obfuscated script the detector reuses it and the
+`--bootstrapper` flag can focus purely on opcode/alphabet extraction.
+
+Practical combinations look like:
+
+```bash
+# Decode a standalone payload with the script key that Luraph provided
+python main.py --script-key KeyForTests examples/v1441_hello.lua
+
+# Reuse the script key embedded in the file but supply a bootstrapper directory
+# so opcode mappings and the alphabet are recovered from initv4.lua automatically
+python main.py --bootstrapper tests/fixtures/initv4_stub examples/v1441_hello.lua
+
+# Provide both arguments – the explicit key wins while the bootstrapper enriches
+# metadata and remaps opcodes for custom builds
+python main.py --script-key KeyForTests --bootstrapper tests/fixtures/initv4_stub/initv4.lua \
+    examples/v1441_hello.lua
+```
 
 The `examples/` directory contains small samples that can be used for quick
 testing.  The CLI remains a thin wrapper around
