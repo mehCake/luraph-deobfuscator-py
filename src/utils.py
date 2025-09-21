@@ -4,6 +4,8 @@ import binascii
 import json
 import logging
 import re
+import shutil
+import subprocess
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -210,7 +212,8 @@ class LuaFormatter:
         if not normalised:
             return ""
         tables = self._format_tables(normalised)
-        indented = self._apply_indentation(tables.split("\n"))
+        spaced = self._normalise_spacing(tables)
+        indented = self._apply_indentation(spaced.split("\n"))
         cleaned = self._strip_trailing_blank_lines(indented)
         rendered = "\n".join(cleaned).rstrip()
         return rendered
@@ -292,6 +295,93 @@ class LuaFormatter:
             trimmed.pop()
         return trimmed
 
+    # -- Operator spacing -------------------------------------------
+    def _normalise_spacing(self, text: str) -> str:
+        lines = text.split("\n")
+        result: List[str] = []
+        for line in lines:
+            result.append(self._normalise_spacing_line(line))
+        return "\n".join(result)
+
+    def _normalise_spacing_line(self, line: str) -> str:
+        if not line.strip():
+            return ""
+        code, comment = self._split_comment(line)
+        leading_len = len(code) - len(code.lstrip())
+        leading = code[:leading_len]
+        code_body = code[leading_len:]
+        masked, placeholders = self._mask_literals(code_body)
+        spaced = self._apply_spacing_rules(masked)
+        for key, value in placeholders.items():
+            spaced = spaced.replace(key, value)
+        spaced = spaced.strip()
+        rebuilt = f"{leading}{spaced}" if spaced else leading.rstrip()
+        if comment:
+            comment_text = comment.lstrip()
+            if rebuilt and not rebuilt.endswith(" "):
+                rebuilt += "  "
+            rebuilt += comment_text
+        return rebuilt.rstrip()
+
+    def _split_comment(self, line: str) -> Tuple[str, str]:
+        idx = self._find_comment_index(line)
+        if idx is None:
+            return line, ""
+        return line[:idx], line[idx:]
+
+    def _find_comment_index(self, line: str) -> Optional[int]:
+        in_single = False
+        in_double = False
+        i = 0
+        length = len(line)
+        while i < length - 1:
+            ch = line[i]
+            nxt = line[i + 1]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if ch == "\\":
+                i += 2
+                continue
+            if not in_single and not in_double and ch == "-" and nxt == "-":
+                return i
+            i += 1
+        return None
+
+    def _mask_literals(self, text: str) -> Tuple[str, Dict[str, str]]:
+        placeholders: Dict[str, str] = {}
+
+        def repl(match: re.Match[str]) -> str:
+            key = f"__LUA_LITERAL_{len(placeholders)}__"
+            placeholders[key] = match.group(0)
+            return key
+
+        pattern = re.compile(
+            r"\[(=*)\[(.*?)\]\1\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'",
+            re.S,
+        )
+        masked = pattern.sub(repl, text)
+        return masked, placeholders
+
+    def _apply_spacing_rules(self, text: str) -> str:
+        text = re.sub(r"\s*,\s*", ", ", text)
+        text = re.sub(r"(?<!\.)\s*\.\.\s*(?!\.)", " .. ", text)
+        text = re.sub(r"\s*(==|~=|<=|>=)\s*", r" \1 ", text)
+        text = re.sub(r"\s*(?<![<>=~])=(?![=~])\s*", " = ", text)
+        text = re.sub(r"\s*([<>])\s*", r" \1 ", text)
+        text = re.sub(r"(?<=\S)\s*([+*/%^])\s*(?=\S)", r" \1 ", text)
+        text = re.sub(r"(?<!\d[eE])(?<=\S)\s*-\s*(?=\S)", " - ", text)
+        text = re.sub(r"\(\s+", "(", text)
+        text = re.sub(r"\s+\)", ")", text)
+        text = re.sub(r"\[\s+", "[", text)
+        text = re.sub(r"\s+\]", "]", text)
+        return text
+
     # -- Table formatting -------------------------------------------
     def _format_tables(self, text: str) -> str:
         table_re = re.compile(r"\{([^{}\n]*)\}")
@@ -311,6 +401,83 @@ class LuaFormatter:
             return "{ " + ", ".join(formatted) + " }"
 
         return table_re.sub(repl, text)
+
+
+class LuaSyntaxValidator:
+    """Best-effort Lua syntax checker using the system ``lua`` binary."""
+
+    _SCRIPT = (
+        "local src = io.read('*a');"
+        " local fn, err = load(src);"
+        " if not fn then io.stderr:write(err .. '\n'); os.exit(1) end"
+    )
+
+    def __init__(
+        self,
+        executable: Optional[Sequence[str]] = None,
+        *,
+        timeout: float = 5.0,
+    ) -> None:
+        self.logger = logging.getLogger(__name__)
+        self.timeout = timeout
+        self._command: Optional[List[str]] = None
+        self._unavailable_reason: Optional[str] = None
+        if executable:
+            self._command = list(executable)
+        else:
+            self._command = self._detect_command()
+        if self._command is not None:
+            self._command = [*self._command, "-e", self._SCRIPT]
+
+    def _detect_command(self) -> Optional[List[str]]:
+        for candidate in ("lua", "lua5.4", "lua5.3", "lua5.2", "luajit"):
+            path = shutil.which(candidate)
+            if path:
+                return [path]
+        self._unavailable_reason = "lua interpreter not found"
+        return None
+
+    @property
+    def available(self) -> bool:
+        return self._command is not None
+
+    def check(self, source: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"available": self.available}
+        if not self._command:
+            if self._unavailable_reason:
+                result["reason"] = self._unavailable_reason
+            return result
+
+        try:
+            proc = subprocess.run(
+                self._command,
+                input=source,
+                text=True,
+                capture_output=True,
+                timeout=self.timeout,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            self._command = None
+            self._unavailable_reason = str(exc)
+            result.update({"available": False, "reason": str(exc)})
+            return result
+        except subprocess.TimeoutExpired:
+            result.update({"valid": False, "error": "timeout"})
+            return result
+        except OSError as exc:
+            result.update({"valid": False, "error": str(exc)})
+            return result
+
+        if proc.returncode != 0:
+            error = proc.stderr.strip() or proc.stdout.strip()
+            if not error:
+                error = f"lua exited with status {proc.returncode}"
+            result.update({"valid": False, "error": error})
+            return result
+
+        result["valid"] = True
+        return result
 
 
 def extract_embedded_json(content: str) -> Optional[str]:

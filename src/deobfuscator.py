@@ -69,11 +69,13 @@ class LuaDeobfuscator:
         self._all_features = self._version_detector.all_features
         self._opcode_lifter = OpcodeLifter()
         self._formatter = utils.LuaFormatter()
+        self._lua_validator = utils.LuaSyntaxValidator()
         self._vm_max_steps = 100_000
         self._vm_timeout = 5.0
         self._vm_trace = vm_trace
         self._script_key = script_key.strip() if script_key else None
         self._bootstrapper_path = self._normalise_bootstrapper(bootstrapper)
+        self._last_render_validation: Dict[str, Any] = {}
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -400,7 +402,22 @@ class LuaDeobfuscator:
 
         renamer = VariableRenamer()
         renamed = renamer.rename_variables(lua_src)
-        return self._formatter.format_source(renamed)
+        formatted = self._formatter.format_source(renamed)
+        self._last_render_validation = {}
+        try:
+            validation = self._lua_validator.check(formatted)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.debug("lua syntax validation error: %s", exc)
+            validation = {"available": False, "error": str(exc)}
+        self._last_render_validation = validation
+        if validation.get("available") and validation.get("valid") is False:
+            error = validation.get("error", "unknown syntax error")
+            self.logger.warning("rendered Lua failed syntax validation: %s", error)
+        return formatted
+
+    @property
+    def last_render_validation(self) -> Dict[str, Any]:
+        return dict(self._last_render_validation)
 
     # --- Public convenience API -----------------------------------------
     def deobfuscate_content(

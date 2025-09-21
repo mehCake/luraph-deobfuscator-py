@@ -44,6 +44,9 @@ def run(ctx: "Context") -> Dict[str, object]:
         "encoding": "utf-8",
         "written": success,
     }
+    validation = getattr(deob, "last_render_validation", None)
+    if isinstance(validation, dict) and validation:
+        metadata["lua_syntax"] = validation
 
     if not success:
         LOG.warning("failed writing render output to %s", destination)
