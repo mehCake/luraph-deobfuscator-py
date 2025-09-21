@@ -90,6 +90,28 @@ def _decode_base91(blob: str, *, alphabet: Optional[str] = None) -> bytes:
     return bytes(output)
 
 
+def _apply_script_key_transform(data: bytes, key_bytes: bytes) -> bytes:
+    """Apply the initv4 XOR/index mixing to *data* using *key_bytes*.
+
+    The bootstrapper feeds the decoded blob through a simple XOR pipeline: the
+    payload bytes are XORed with the repeating script key and then XORed with
+    the current byte index.  This helper mirrors that routine so both the
+    handler and tests can share the logic.
+    """
+
+    if not data:
+        return b""
+
+    key_len = len(key_bytes)
+    output = bytearray(len(data))
+    for index, value in enumerate(data):
+        if key_len:
+            value ^= key_bytes[index % key_len]
+        value ^= index & 0xFF
+        output[index] = value & 0xFF
+    return bytes(output)
+
+
 def _encode_base91(data: bytes) -> str:
     """Encode *data* using the initv4 alphabet (for fixtures/tests)."""
 
@@ -167,7 +189,7 @@ def _decode_attempts(
     def _record(method: str, raw: Optional[bytes]) -> None:
         if raw is None:
             return
-        decoded = string_utils.xor_bytes(raw, key_bytes) if key_bytes else raw
+        decoded = _apply_script_key_transform(raw, key_bytes)
         attempts.append(
             {
                 "method": method,
@@ -234,6 +256,8 @@ def _decode_attempts(
             }
             for entry in attempts
         ],
+        "script_key_length": len(key_bytes),
+        "index_xor": True,
     }
     if best["score"] < 0.25:
         metadata["low_confidence"] = True
@@ -251,7 +275,7 @@ def decode_blob(
     *,
     alphabet: Optional[str] = None,
 ) -> bytes:
-    """Decode an ``initv4`` payload using base91 + XOR heuristics."""
+    """Decode an ``initv4`` payload using base91 + script-key/index XOR."""
 
     data, _ = decode_blob_with_metadata(
         encoded_blob,

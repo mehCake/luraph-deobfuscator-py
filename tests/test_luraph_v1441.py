@@ -10,6 +10,7 @@ from src.passes.payload_decode import run as payload_decode_run
 from src.versions import get_handler
 from src.versions.luraph_v14_4_1 import (
     LuraphV1441,
+    _apply_script_key_transform,
     _encode_base91,
     decode_blob,
     decode_blob_with_metadata,
@@ -26,7 +27,7 @@ def _make_sample() -> tuple[str, bytes, str, str]:
     script_key = "SuperSecretKey"
     raw = bytes(range(256))
     key_bytes = script_key.encode("utf-8")
-    masked = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(raw))
+    masked = _apply_script_key_transform(raw, key_bytes)
     blob = _encode_base91(masked)
     script = (
         "-- Luraph v14.4.1 bootstrap\n"
@@ -66,11 +67,12 @@ def test_decode_blob_wrong_key_changes_payload() -> None:
 def test_decode_blob_base64_fallback() -> None:
     _, raw, script_key, _ = _make_sample()
     key_bytes = script_key.encode("utf-8")
-    masked = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(raw))
+    masked = _apply_script_key_transform(raw, key_bytes)
     blob = base64.b64encode(masked).decode("ascii")
     data, meta = decode_blob_with_metadata(blob, script_key)
     assert data == raw
     assert meta["decode_method"] in {"base64", "base64-relaxed"}
+    assert meta.get("index_xor") is True
 
 
 def test_v1441_handler_locates_payload() -> None:
@@ -83,6 +85,7 @@ def test_v1441_handler_locates_payload() -> None:
     assert payload.metadata["script_key"] == script_key
     assert handler.extract_bytecode(payload) == raw
     assert payload.metadata.get("decode_method") == "base91"
+    assert payload.metadata.get("index_xor") is True
 
 
 def test_v1441_handler_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,6 +100,7 @@ def test_v1441_handler_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     try:
         assert handler.extract_bytecode(payload) == raw
         assert payload.metadata.get("decode_method") == "base91"
+        assert payload.metadata.get("index_xor") is True
     finally:
         monkeypatch.delenv("LURAPH_SCRIPT_KEY", raising=False)
 
@@ -173,6 +177,8 @@ def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
     assert ctx.vm.bytecode == raw
     payload_meta = metadata.get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("decode_method") == "base91"
+    assert payload_meta.get("index_xor") is True
     assert ctx.vm.meta.get("handler") == "v14.4.1"
 
 
@@ -198,6 +204,7 @@ def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
     payload_meta = metadata.get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
+    assert payload_meta.get("index_xor") is True
 
 
 def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:
@@ -268,4 +275,6 @@ def test_pipeline_deobfuscates_v1441_example(tmp_path: Path) -> None:
     assert ctx.pass_metadata.get("vm_lift", {}).get("available") is False
     payload_meta = ctx.pass_metadata.get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("decode_method") == "base91"
+    assert payload_meta.get("index_xor") is True
     assert output.read_text(encoding="utf-8").strip() == expected.strip()
