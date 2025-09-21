@@ -36,6 +36,23 @@ return result
     assert metadata["vm_trampolines"] >= 1
 
 
+def test_cleanup_constant_folding_and_strings(tmp_path) -> None:
+    snippet = """
+local sum = 2 + 2 * 3
+local other = (10 - 4) / 3
+return "hello" .. " world" -- concatenation left intact for string decryptor
+""".strip()
+
+    ctx = _make_context(tmp_path, snippet)
+    metadata = cleanup_run(ctx)
+
+    assert "2 + 2 * 3" not in ctx.stage_output
+    assert "(10 - 4) / 3" not in ctx.stage_output
+    assert "sum = 8" in ctx.stage_output
+    assert "other = 2" in ctx.stage_output or "other = 2.0" in ctx.stage_output
+    assert metadata["constant_expressions"] >= 2
+
+
 def test_cleanup_strips_bootstrap_scaffolding(tmp_path) -> None:
     snippet = """
 local script_key = script_key or getgenv().script_key
@@ -58,6 +75,29 @@ return init_fn("payload")
     assert metadata["bootstrap_init_fn"] >= 1
     assert metadata["bootstrap_init_call"] >= 1
     assert "while true do" not in ctx.stage_output
+
+
+def test_cleanup_strips_traps_and_flattens_blocks(tmp_path) -> None:
+    snippet = """
+assert(false, "debug trap")
+while true do
+    task.wait()
+end
+do return value end
+do print("noop") end
+repeat until false
+""".strip()
+
+    ctx = _make_context(tmp_path, snippet)
+    metadata = cleanup_run(ctx)
+
+    assert "assert(" not in ctx.stage_output
+    assert "task.wait" not in ctx.stage_output
+    assert "do return" not in ctx.stage_output
+    assert "do print" not in ctx.stage_output
+    assert metadata["assert_traps"] >= 1
+    assert metadata["dummy_loops"] >= 1
+    assert metadata["flattened_blocks"] >= 1
 
 
 def test_render_writes_output_file(tmp_path) -> None:

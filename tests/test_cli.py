@@ -13,7 +13,7 @@ INITV4_STUB = PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua"
 def _prepare_v1441_source(tmp_path: Path, *, literal_key: bool = False) -> Path:
     text = V1441_SOURCE.read_text(encoding="utf-8")
     if literal_key:
-        text = text.replace("getgenv().script_key", '"KeyForTests"')
+        text = text.replace("getgenv().script_key", '"ncbmxnbs6wrpkpaitt6dwj"')
     target = tmp_path / V1441_SOURCE.name
     target.write_text(text, encoding="utf-8")
     return target
@@ -140,7 +140,7 @@ def test_cli_dump_ir_creates_listing(tmp_path):
 
 def test_cli_v1441_script_key_only(tmp_path):
     target = _prepare_v1441_source(tmp_path)
-    _run_cli(target, tmp_path, "--script-key", "KeyForTests", "--format", "json")
+    _run_cli(target, tmp_path, "--script-key", "ncbmxnbs6wrpkpaitt6dwj", "--format", "json")
 
     output = target.with_name(f"{target.stem}_deob.json")
     data = json.loads(output.read_text(encoding="utf-8"))
@@ -179,7 +179,7 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
         target,
         tmp_path,
         "--script-key",
-        "KeyForTests",
+        "ncbmxnbs6wrpkpaitt6dwj",
         "--bootstrapper",
         str(stub_dir),
         "--format",

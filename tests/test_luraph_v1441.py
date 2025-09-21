@@ -23,7 +23,7 @@ from src.deobfuscator import LuaDeobfuscator
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_V1441 = PROJECT_ROOT / "examples" / "v1441_hello.lua"
 GOLDEN_V1441 = PROJECT_ROOT / "tests" / "golden" / "v1441_hello.lua.out"
-EXAMPLE_SCRIPT_KEY = "KeyForTests"
+EXAMPLE_SCRIPT_KEY = "ncbmxnbs6wrpkpaitt6dwj"
 
 
 def _make_sample(raw: bytes | None = None, *, script_key: str = "SuperSecretKey") -> tuple[str, bytes, str, str]:
@@ -63,8 +63,8 @@ def test_decode_blob_roundtrip() -> None:
 
 def test_decode_blob_known_vector() -> None:
     blob = "qx6zfmk8qigsbzcd3bv64"
-    expected = bytes([102, 209, 205, 163, 47, 244, 211, 159, 195, 91, 12, 93, 25, 94, 37, 43, 114])
-    assert decode_blob(blob, "KeyForTests") == expected
+    expected = bytes([67, 215, 214, 136, 56, 232, 229, 137, 134, 88, 13, 102, 23, 87, 2, 45, 116])
+    assert decode_blob(blob, "ncbmxnbs6wrpkpaitt6dwj") == expected
 
 
 def test_decode_blob_wrong_key_changes_payload() -> None:
