@@ -141,6 +141,18 @@ class NumericFor(Stmt):
 
 
 @dataclass(slots=True)
+class GenericFor(Stmt):
+    vars: List[str]
+    iterables: List[Expr]
+    body: List[Stmt]
+
+
+@dataclass(slots=True)
+class DoBlock(Stmt):
+    body: List[Stmt] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class FunctionDef(Stmt):
     name: Expr | None
     params: List[str]
@@ -213,6 +225,18 @@ def _render_block(statements: Sequence[Stmt], indent: str, level: int) -> List[s
             lines.append(header)
             lines.extend(_render_block(stmt.body, indent, level + 1))
             lines.append(f"{pad}end")
+        elif isinstance(stmt, GenericFor):
+            header = (
+                f"{pad}for {', '.join(stmt.vars)} in "
+                f"{', '.join(render_expr(expr) for expr in stmt.iterables)} do"
+            )
+            lines.append(header)
+            lines.extend(_render_block(stmt.body, indent, level + 1))
+            lines.append(f"{pad}end")
+        elif isinstance(stmt, DoBlock):
+            lines.append(f"{pad}do")
+            lines.extend(_render_block(stmt.body, indent, level + 1))
+            lines.append(f"{pad}end")
         elif isinstance(stmt, FunctionDef):
             name = render_expr(stmt.name) if stmt.name is not None else ""
             params = ", ".join(stmt.params)
@@ -245,6 +269,8 @@ __all__ = [
     "Literal",
     "Name",
     "NumericFor",
+    "GenericFor",
+    "DoBlock",
     "Return",
     "Stmt",
     "TableAccess",

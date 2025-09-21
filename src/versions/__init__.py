@@ -179,3 +179,7 @@ try:  # pragma: no cover - import side effect
     from . import luraph_v14_2_json  # noqa: F401
 except Exception:  # pragma: no cover - optional handler may fail to load
     pass
+try:  # pragma: no cover - import side effect
+    from . import luraph_v14_4_1  # noqa: F401
+except Exception:  # pragma: no cover - optional handler may fail to load
+    pass

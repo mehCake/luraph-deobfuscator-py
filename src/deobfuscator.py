@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Tuple
@@ -55,7 +56,7 @@ class DeobResult:
 class LuaDeobfuscator:
     """Coordinate the individual stages of the deobfuscation pipeline."""
 
-    def __init__(self, *, vm_trace: bool = False) -> None:
+    def __init__(self, *, vm_trace: bool = False, script_key: str | None = None) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
         self._all_features = self._version_detector.all_features
@@ -64,6 +65,7 @@ class LuaDeobfuscator:
         self._vm_max_steps = 100_000
         self._vm_timeout = 5.0
         self._vm_trace = vm_trace
+        self._script_key = script_key.strip() if script_key else None
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -89,6 +91,7 @@ class LuaDeobfuscator:
         *,
         version: VersionInfo,
         features: FrozenSet[str] | None = None,
+        script_key: str | None = None,
     ) -> DeobResult:
         """Decode known payload formats and return a :class:`DeobResult`."""
 
@@ -99,6 +102,13 @@ class LuaDeobfuscator:
         active_features = self._normalise_features(features)
         if active_features is not None:
             metadata["active_features"] = sorted(active_features)
+
+        override_token = "_script_key_override"
+        provided_key = (script_key or "").strip()
+        if provided_key:
+            self._script_key = provided_key
+            metadata["script_key_override"] = True
+        override_key = (self._script_key or "").strip()
 
         def feature_enabled(flag: str) -> bool:
             return active_features is None or flag in active_features
@@ -135,21 +145,74 @@ class LuaDeobfuscator:
             payload_info = handler_instance.locate_payload(text)
             if payload_info is not None:
                 metadata["handler_payload_offset"] = payload_info.start
-                if payload_info.metadata:
-                    metadata["handler_payload_meta"] = dict(payload_info.metadata)
-                payload_dict = payload_info.data
-                if payload_dict is None:
+                data_candidate = payload_info.data
+                if data_candidate is None:
                     try:
-                        payload_dict = json.loads(payload_info.text)
+                        data_candidate = json.loads(payload_info.text)
                     except json.JSONDecodeError as exc:
                         metadata["handler_payload_error"] = str(exc)
-                if payload_dict is not None:
-                    try:
-                        raw_bytes = handler_instance.extract_bytecode(payload_info)
-                    except Exception as exc:  # pragma: no cover - best effort
-                        metadata["handler_bytecode_error"] = str(exc)
-                    else:
-                        metadata["handler_bytecode_bytes"] = len(raw_bytes)
+
+                if override_key:
+                    payload_info.metadata[override_token] = override_key
+                raw_bytes: bytes | None = None
+                try:
+                    raw_bytes = handler_instance.extract_bytecode(payload_info)
+                except Exception as exc:  # pragma: no cover - best effort
+                    message = str(exc)
+                    metadata["handler_bytecode_error"] = message
+                    payload_meta = payload_info.metadata or {}
+                    literal_key = bool(payload_meta.get("script_key"))
+                    env_key = os.environ.get("LURAPH_SCRIPT_KEY", "")
+                    if (
+                        version.name == "v14.4.1"
+                        and not override_key
+                        and not literal_key
+                        and not env_key
+                    ):
+                        self.logger.error(
+                            "script key required to decode %s payload: %s",
+                            version.name,
+                            message,
+                        )
+                else:
+                    metadata["handler_bytecode_bytes"] = len(raw_bytes)
+                    metadata["handler_vm_bytecode"] = raw_bytes
+                    if payload_dict is None:
+                        decoded_text = raw_bytes.decode("utf-8", errors="ignore")
+                        cleaned_text = utils.strip_non_printable(decoded_text)
+                        mapping: Any = None
+                        if cleaned_text:
+                            stripped = cleaned_text.lstrip()
+                            if stripped.startswith("{") or stripped.startswith("["):
+                                try:
+                                    mapping = json.loads(cleaned_text)
+                                except json.JSONDecodeError:
+                                    mapping = None
+                            if mapping is None:
+                                mapping = extract_vm_ir(cleaned_text)
+                        if isinstance(mapping, dict):
+                            payload_dict = mapping
+                            payload_info.data = mapping
+                            metadata["handler_decoded_json"] = True
+                        elif isinstance(mapping, list):
+                            converted = extract_vm_ir(json.dumps(mapping))
+                            if isinstance(converted, dict):
+                                payload_dict = converted
+                                payload_info.data = converted
+                                metadata["handler_decoded_json"] = True
+                finally:
+                    if override_key:
+                        payload_info.metadata.pop(override_token, None)
+
+                cleaned_meta = dict(payload_info.metadata)
+                cleaned_meta.pop(override_token, None)
+                if cleaned_meta:
+                    metadata["handler_payload_meta"] = cleaned_meta
+
+                if data_candidate is not None:
+                    payload_dict = data_candidate
+                elif payload_info.data is not None:
+                    payload_dict = payload_info.data
 
         constant_rendered: Optional[str] = None
         vm_ir: Optional[VMIR] = None

@@ -42,6 +42,31 @@ _TRAMPOLINE_RE = re.compile(
 
 _DO_RETURN_RE = re.compile(r"\bdo\s+return\s+end\b", re.IGNORECASE)
 
+_SCRIPT_KEY_ASSIGN_RE = re.compile(
+    r"^\s*(?:local\s+)?script_key\s*=\s*script_key\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_INIT_FN_ASSIGN_RE = re.compile(
+    r"^\s*local\s+init_fn\s*=\s*function\s*\([^)]*\)\s*(?:.|\n)*?\bend\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_INIT_FN_DEF_RE = re.compile(
+    r"^\s*(?:local\s+)?function\s+init_fn\s*\([^)]*\)\s*(?:.|\n)*?\bend\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_INIT_FN_CALL_RE = re.compile(
+    r"^\s*return\s+init_fn\s*\([^\n]*\)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_DUMMY_LOOP_RE = re.compile(
+    r"while\s+true\s+do\s*(?:--[^\n]*\n|\s)*(?:break\s*;?\s*)+(?:--[^\n]*\n|\s)*end",
+    re.IGNORECASE,
+)
+
 
 def _constant_fold(source: str) -> Tuple[str, bool]:
     decryptor = StringDecryptor()
@@ -128,6 +153,47 @@ def _strip_do_return(source: str) -> Tuple[str, int]:
     return rewritten, count
 
 
+def _strip_script_key(source: str) -> Tuple[str, int]:
+    rewritten, count = _SCRIPT_KEY_ASSIGN_RE.subn("", source)
+    return rewritten, count
+
+
+def _strip_init_fn(source: str) -> Tuple[str, int]:
+    removed = 0
+
+    def _rewrite_assign(match: re.Match[str]) -> str:
+        nonlocal removed
+        removed += 1
+        return ""
+
+    updated = _INIT_FN_ASSIGN_RE.sub(_rewrite_assign, source)
+
+    def _rewrite_func(match: re.Match[str]) -> str:
+        nonlocal removed
+        removed += 1
+        return ""
+
+    updated = _INIT_FN_DEF_RE.sub(_rewrite_func, updated)
+    return updated, removed
+
+
+def _strip_init_fn_calls(source: str) -> Tuple[str, int]:
+    rewritten, count = _INIT_FN_CALL_RE.subn("", source)
+    return rewritten, count
+
+
+def _strip_dummy_loops(source: str) -> Tuple[str, int]:
+    removed = 0
+
+    def _rewrite(match: re.Match[str]) -> str:
+        nonlocal removed
+        removed += 1
+        return ""
+
+    rewritten = _DUMMY_LOOP_RE.sub(_rewrite, source)
+    return rewritten, removed
+
+
 def run(ctx: "Context") -> Dict[str, object]:
     ctx.ensure_raw_input()
     text = ctx.stage_output or ctx.working_text or ctx.raw_input
@@ -152,6 +218,18 @@ def run(ctx: "Context") -> Dict[str, object]:
 
     text, trampolines_removed = _strip_trampolines(text)
     metadata["vm_trampolines"] = trampolines_removed
+
+    text, script_key_removed = _strip_script_key(text)
+    metadata["bootstrap_keys"] = script_key_removed
+
+    text, init_fn_removed = _strip_init_fn(text)
+    metadata["bootstrap_init_fn"] = init_fn_removed
+
+    text, init_fn_calls_removed = _strip_init_fn_calls(text)
+    metadata["bootstrap_init_call"] = init_fn_calls_removed
+
+    text, dummy_loops_removed = _strip_dummy_loops(text)
+    metadata["dummy_loops"] = dummy_loops_removed
 
     cleaned = utils.decode_simple_obfuscations(text)
     cleaned = utils.strip_non_printable(cleaned)

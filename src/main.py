@@ -238,6 +238,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="bypass version detection with an explicit handler name",
     )
     parser.add_argument(
+        "--script-key",
+        dest="script_key",
+        help="script key to decrypt initv4 payloads (e.g. Luraph v14.4.1)",
+    )
+    parser.add_argument(
         "--dump-ir",
         metavar="PATH",
         help="write a textual VM IR listing to PATH (file or directory)",
@@ -324,7 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if content is None:
             return WorkResult(item, False, error="unable to read input file")
 
-        deob = LuaDeobfuscator(vm_trace=args.vm_trace)
+        deob = LuaDeobfuscator(vm_trace=args.vm_trace, script_key=args.script_key)
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
         reconstructed_lua: Optional[str] = None
@@ -353,6 +358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     iteration=iteration,
                     from_json=is_json_input,
                     reconstructed_lua=reconstructed_lua or "",
+                    script_key=args.script_key,
                 )
                 ctx.options.update(
                     {

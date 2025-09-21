@@ -14,7 +14,8 @@ to reconstruct readable Lua from simple bytecode traces.
 Heuristics in `src/deobfuscator.py` attempt to detect the Luraph version used
 in a script.  Version specific tweaks live in `src/versions/` and are applied
 automatically when the virtual machine executes embedded bytecode (currently
-covering v14.0.2 through v14.2).
+covering v14.0.2 through v14.4.1, including the ``initv4`` bootstrap that ships
+encrypted script payloads).
 
 ## Installation
 
@@ -53,6 +54,7 @@ Frequently used flags:
 | `--max-iterations N` | Re-run the pipeline until convergence or the limit is reached |
 | `--skip-passes` / `--only-passes` | Comma separated pass names to disable or exclusively enable |
 | `--profile` | Print a timing table for the executed passes |
+| `--script-key KEY` | Provide the decryption key required by Luraph v14.4.x payloads |
 | `--verbose` | Enable colourised console logging alongside `deobfuscator.log` |
 | `--vm-trace`/`--trace` | Capture VM instruction traces when the simulator runs |
 | `--detect-only` | Stop after version detection and emit a textual report |
@@ -321,4 +323,24 @@ new opcode:
 
 Pull requests are validated by continuous integration which runs `py_compile`,
 `mypy`, and `pytest` on every push.
+
+### Luraph v14.4.1 initv4 payloads
+
+Luraph 14.4.1 distributes bytecode through an `initv4` bootstrap that stores
+the VM program inside a high-entropy blob.  The bootstrap XORs that blob with a
+per-script `script_key` prior to handing it to the VM.  When running the
+deobfuscator you must supply that key so the payload decoder can recover the
+embedded bytecode:
+
+```bash
+python main.py --script-key <your_key> examples/v1441_hello.lua
+```
+
+Keys are issued alongside protected scripts by Luraph.  For automated runs you
+can also set the `LURAPH_SCRIPT_KEY` environment variable.  Successful decoding
+produces readable Lua just like earlier versions, with the VM scaffolding
+removed and the recovered script formatted via the built-in beautifier.  The
+`examples/v1441_hello.lua` sample together with the corresponding golden output
+under `tests/golden/` can be used as a quick smoke test when validating the
+pipeline.
 

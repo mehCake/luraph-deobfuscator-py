@@ -393,6 +393,26 @@ class VMLifter:
                 args={"reg": loop_reg, "target": target, "offset": offset_value},
             )
 
+        if op == "TFORLOOP":
+            base_value = operands.get("a")
+            base = base_value if isinstance(base_value, int) else None
+            raw_offset = operands.get("offset")
+            offset_value = raw_offset if isinstance(raw_offset, int) else 0
+            target = pc + 1 + offset_value
+            count = operands.get("c")
+            nvars = count if isinstance(count, int) else 0
+            self._note_register(base, register_types)
+            return IRInstruction(
+                pc=pc,
+                opcode="TForLoop",
+                args={
+                    "base": base,
+                    "target": target,
+                    "offset": offset_value,
+                    "nvars": nvars,
+                },
+            )
+
         if op in {"CALL", "TAILCALL"}:
             base = operands.get("a")
             nargs = operands.get("b")

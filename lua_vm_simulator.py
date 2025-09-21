@@ -430,6 +430,37 @@ class LuaVMSimulator:
         if (step >= 0 and value <= limit) or (step < 0 and value >= limit):
             frame.pc += int(instr.aux.get("offset", instr.b or 0))
 
+    def _op_tforloop(self, frame: VMFrame, instr: VMInstruction) -> None:
+        base = instr.a or 0
+        iterator = self._read_register(frame, base)
+        state = self._read_register(frame, base + 1)
+        control = self._read_register(frame, base + 2)
+        if not callable(iterator):
+            raise VMEmulationError("iterator not callable")
+        result = iterator(state, control)
+        if isinstance(result, tuple):
+            values = list(result)
+        elif isinstance(result, list):
+            values = list(result)
+        elif result is None:
+            values = []
+        else:
+            values = [result]
+        if not values or values[0] is None:
+            target = instr.aux.get("target")
+            if isinstance(target, int):
+                frame.pc = target
+            return
+        control_value = values[0]
+        self._write_register(frame, base + 2, control_value)
+        count = int(instr.aux.get("immediate_c", instr.c or len(values)))
+        for idx in range(count):
+            value = values[idx] if idx < len(values) else None
+            self._write_register(frame, base + 3 + idx, value)
+        offset = int(instr.aux.get("offset", instr.b or 0))
+        if offset:
+            frame.pc += offset
+
     def _op_call(self, frame: VMFrame, instr: VMInstruction) -> None:
         base = instr.a or 0
         arg_count = int(instr.aux.get("immediate_b", instr.b or 0))

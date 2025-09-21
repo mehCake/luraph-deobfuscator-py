@@ -4,6 +4,9 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GOLDEN_DIR = PROJECT_ROOT / "tests" / "golden"
+V1441_SOURCE = PROJECT_ROOT / "examples" / "v1441_hello.lua"
+V1441_GOLDEN = GOLDEN_DIR / "v1441_hello.lua.out"
 
 
 def _run_cli(target: Path, workdir: Path, *extra: str) -> subprocess.CompletedProcess:
@@ -116,3 +119,27 @@ def test_cli_dump_ir_creates_listing(tmp_path):
     assert listings, "expected IR listing"
     listing_text = listings[0].read_text()
     assert listing_text.strip()
+
+
+def test_cli_handles_v1441_script_key(tmp_path):
+    target = tmp_path / V1441_SOURCE.name
+    target.write_text(V1441_SOURCE.read_text())
+
+    _run_cli(target, tmp_path, "--script-key", "KeyForTests")
+
+    output = target.with_name(f"{target.stem}_deob.lua")
+    assert output.exists()
+    assert output.read_text().strip() == V1441_GOLDEN.read_text().strip()
+
+
+def test_cli_reports_missing_script_key(tmp_path):
+    target = tmp_path / V1441_SOURCE.name
+    target.write_text(V1441_SOURCE.read_text())
+
+    _run_cli(target, tmp_path, "--format", "json")
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text())
+    payload_meta = data.get("passes", {}).get("payload_decode", {})
+    error_text = payload_meta.get("handler_bytecode_error", "")
+    assert "script key" in error_text.lower()
