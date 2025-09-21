@@ -76,6 +76,7 @@ class LuaDeobfuscator:
         self._script_key = script_key.strip() if script_key else None
         self._bootstrapper_path = self._normalise_bootstrapper(bootstrapper)
         self._last_render_validation: Dict[str, Any] = {}
+        self._last_handler: VersionHandler | None = None
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -151,6 +152,8 @@ class LuaDeobfuscator:
                     else:
                         if isinstance(bootstrap_meta, dict) and bootstrap_meta:
                             metadata.setdefault("bootstrapper", bootstrap_meta)
+
+        self._last_handler = handler_instance
 
         payload_dict: Optional[Dict[str, Any]] = None
         embedded: Optional[str] = None
@@ -418,6 +421,12 @@ class LuaDeobfuscator:
     @property
     def last_render_validation(self) -> Dict[str, Any]:
         return dict(self._last_render_validation)
+
+    @property
+    def last_handler(self) -> VersionHandler | None:
+        """Return the most recently used version handler instance."""
+
+        return self._last_handler
 
     # --- Public convenience API -----------------------------------------
     def deobfuscate_content(

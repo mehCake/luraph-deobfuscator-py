@@ -174,6 +174,14 @@ __all__ = [
 ]
 
 
+try:  # pragma: no cover - optional helper module
+    from .initv4 import InitV4Bootstrap, InitV4Decoder  # noqa: F401
+except Exception:  # pragma: no cover - optional helper may fail to load
+    pass
+else:  # pragma: no cover - export helpers when available
+    __all__ += ["InitV4Bootstrap", "InitV4Decoder"]
+
+
 # Ensure built-in handlers register themselves on import.
 try:  # pragma: no cover - import side effect
     from . import luraph_v14_2_json  # noqa: F401

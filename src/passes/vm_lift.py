@@ -621,14 +621,15 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
         return {"available": False}
 
     version = ctx.detected_version
-    handler: VersionHandler | None = None
-    if version is not None and not version.is_unknown:
+    handler: VersionHandler | None = ctx.version_handler
+    if handler is None and version is not None and not version.is_unknown:
         try:
             candidate = get_handler(version.name)
         except KeyError:
             candidate = None
         if isinstance(candidate, VersionHandler):
             handler = candidate
+            ctx.version_handler = handler
 
     op_table = handler.opcode_table() if handler else {}
     endianness = ctx.vm.meta.get("endianness") if ctx.vm.meta else None

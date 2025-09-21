@@ -47,6 +47,11 @@ def run(ctx: "Context") -> Dict[str, Any]:
         script_key=script_key if isinstance(script_key, str) else None,
         bootstrapper=ctx.bootstrapper_path,
     )
+    handler_instance = getattr(deob, "last_handler", None)
+    if isinstance(handler_instance, VersionHandler):
+        ctx.version_handler = handler_instance
+    else:
+        ctx.version_handler = None
     output_text = result.text or ""
     ctx.stage_output = output_text
     if output_text:
@@ -56,6 +61,8 @@ def run(ctx: "Context") -> Dict[str, Any]:
     vm_ir = metadata.pop("vm_ir", None)
     if isinstance(vm_ir, VMIR):
         ctx.vm_ir = vm_ir
+        if vm_ir.constants and not ctx.vm.const_pool:
+            ctx.vm.const_pool = list(vm_ir.constants)
         metadata["vm_ir"] = {
             "constants": len(vm_ir.constants),
             "bytecode": len(vm_ir.bytecode),

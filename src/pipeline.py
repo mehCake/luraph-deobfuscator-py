@@ -23,6 +23,7 @@ from version_detector import VersionInfo
 
 from . import utils
 from .deobfuscator import LuaDeobfuscator, VMIR
+from .versions import VersionHandler
 from .passes.preprocess import run as preprocess_run
 from .passes.payload_decode import run as payload_decode_run
 from .passes.vm_devirtualize import run as vm_devirtualize_run
@@ -73,6 +74,7 @@ class Context:
     ir_module: "IRModule | None" = None
     from_json: bool = False
     reconstructed_lua: str = ""
+    version_handler: VersionHandler | None = None
 
     def __post_init__(self) -> None:
         if self.deobfuscator is None:
