@@ -4,11 +4,15 @@ local dispatch = {
   [0x10] = "MOVE",
   [0x13] = "CALL",
   [0x15] = "RETURN",
+  [0x22] = "CONCAT",
   [0x28] = "JMP"
 }
 
 dispatch[0x29] = "FORPREP"
 dispatch[0x2A] = "FORLOOP"
+dispatch[0x2B] = function(...)
+  return ... -- TFORLOOP
+end
 
 return {
   alphabet = alphabet,

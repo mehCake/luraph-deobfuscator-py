@@ -384,7 +384,29 @@ def _locate_base64_blob(text: str, *, start: int) -> Tuple[str, int, int] | None
     return best
 
 
-_BASE_OPCODE_TABLE: Dict[int, OpSpec] = LuraphV142JSON().opcode_table()
+_BASE_OPCODE_TABLE: Dict[int, OpSpec] = dict(LuraphV142JSON().opcode_table())
+
+_ADDITIONAL_SPECS: Tuple[OpSpec, ...] = (
+    OpSpec("NOT", ("a", "b")),
+    OpSpec("LEN", ("a", "b")),
+    OpSpec("CONCAT", ("a", "b", "c")),
+    OpSpec("TFORLOOP", ("a", "offset", "c")),
+)
+
+_CANONICAL_OPCODE_SPECS: Dict[str, OpSpec] = {}
+_existing = {spec.mnemonic.upper() for spec in _BASE_OPCODE_TABLE.values()}
+_next_opcode = max(_BASE_OPCODE_TABLE.keys(), default=0) + 1
+for extra in _ADDITIONAL_SPECS:
+    name = extra.mnemonic.upper()
+    if name in _existing:
+        continue
+    _BASE_OPCODE_TABLE[_next_opcode] = extra
+    _existing.add(name)
+    _next_opcode += 1
+
+_CANONICAL_OPCODE_SPECS.update(
+    {spec.mnemonic.upper(): spec for spec in _BASE_OPCODE_TABLE.values()}
+)
 
 
 class LuraphV1441(VersionHandler):
@@ -432,10 +454,9 @@ class LuraphV1441(VersionHandler):
         override_table: Dict[int, OpSpec] = dict(table)
         if decoder.has_custom_opcodes() and decoder.opcode_map:
             for opcode, name in decoder.opcode_map.items():
-                for base_opcode, base_spec in _BASE_OPCODE_TABLE.items():
-                    if base_spec.mnemonic.upper() == name.upper():
-                        override_table[opcode] = base_spec
-                        break
+                spec = _CANONICAL_OPCODE_SPECS.get(name.upper())
+                if spec is not None:
+                    override_table[opcode] = spec
         self._opcode_override = dict(sorted(override_table.items()))
 
         meta: Dict[str, object] = {"path": str(bootstrap.path)}

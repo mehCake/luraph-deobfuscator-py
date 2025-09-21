@@ -89,7 +89,7 @@ def test_lift_no_unknowns() -> None:
     module = VMLifter().lift(bytecode, handler.opcode_table(), decoded)
 
     assert module.instructions, "expected lifted instructions"
-    assert all(inst.opcode != "Unknown" for inst in module.instructions)
+    assert all(inst.opcode != "UNKNOWN_OP" for inst in module.instructions)
     assert not module.warnings
 
 

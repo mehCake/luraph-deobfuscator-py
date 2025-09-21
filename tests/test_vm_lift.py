@@ -41,5 +41,17 @@ def test_vmlifter_basic_blocks():
 def test_vmlifter_unknown_opcode():
     lifter = VMLifter()
     module = lifter.lift(bytes([0xFF, 0x00, 0x00, 0x00]), {}, consts=[])
-    assert module.instructions[0].opcode == "Unknown"
+    assert module.instructions[0].opcode == "UNKNOWN_OP"
     assert module.warnings
+
+
+def test_vmlifter_concat_sets_string_type():
+    table = {0x40: OpSpec("CONCAT", ("a", "b", "c"))}
+    bytecode = bytes([0x40, 0x00, 0x01, 0x02])
+    lifter = VMLifter()
+    module = lifter.lift(bytecode, table, consts=[])
+    instruction = module.instructions[0]
+    assert instruction.opcode == "BinOp"
+    assert instruction.args["op"] == "CONCAT"
+    assert module.register_types.get(0) == "string"
+    assert instruction.sources == [1, 2]

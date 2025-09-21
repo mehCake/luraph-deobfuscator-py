@@ -85,13 +85,14 @@ class VMLifter:
 
             if spec is None:
                 operands: Dict[str, int] = {}
+                message = f"unknown opcode 0x{opcode:02x} at pc {pc}"
                 ir = IRInstruction(
                     pc=pc,
-                    opcode="Unknown",
+                    opcode="UNKNOWN_OP",
                     args={"opcode": opcode, "raw": list(operand_bytes)},
                 )
-                warnings.append(f"unknown opcode 0x{opcode:02x} at pc {pc}")
-                LOG.debug("unknown opcode 0x%02x at pc=%d", opcode, pc)
+                warnings.append(message)
+                LOG.warning(message)
             else:
                 operands = self._decode_operands(spec, operand_bytes, endian_value)
                 ir = self._build_ir(
@@ -304,7 +305,7 @@ class VMLifter:
                 sources=sources,
             )
 
-        if op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "BAND", "BOR", "BXOR", "SHL", "SHR"}:
+        if op in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "BAND", "BOR", "BXOR", "SHL", "SHR", "CONCAT"}:
             dest = operands.get("a")
             lhs = operands.get("b")
             rhs = operands.get("c")
@@ -313,6 +314,8 @@ class VMLifter:
             result_type = "number"
             if op in {"BAND", "BOR", "BXOR", "SHL", "SHR"}:
                 result_type = "integer"
+            elif op == "CONCAT":
+                result_type = "string"
             self._set_register_type(dest, result_type, register_types, current_types)
             sources = [reg for reg in (lhs, rhs) if isinstance(reg, int)]
             return IRInstruction(
@@ -506,7 +509,7 @@ class VMLifter:
                     leaders.add(target)
                 if next_idx < len(instructions):
                     leaders.add(next_idx)
-            elif ir.opcode in {"Test", "ForPrep", "ForLoop"}:
+            elif ir.opcode in {"Test", "ForPrep", "ForLoop", "TForLoop"}:
                 target = ir.args.get("target")
                 if isinstance(target, int) and 0 <= target < len(instructions):
                     leaders.add(target)
@@ -670,7 +673,7 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
         metadata["step_limit"] = step_limit
     if time_limit is not None:
         metadata["time_limit"] = time_limit
-    unknown_count = sum(1 for inst in module.instructions if inst.opcode == "Unknown")
+    unknown_count = sum(1 for inst in module.instructions if inst.opcode == "UNKNOWN_OP")
     if unknown_count:
         metadata["unknown_opcodes"] = unknown_count
     if module.warnings:

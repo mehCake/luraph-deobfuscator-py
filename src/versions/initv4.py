@@ -15,6 +15,24 @@ _BASE_OPCODE_NAMES: Dict[int, str] = {
     opcode: spec.mnemonic for opcode, spec in _BASE_OPCODE_SPECS.items()
 }
 
+_ADDITIONAL_SPECS: Tuple[OpSpec, ...] = (
+    OpSpec("NOT", ("a", "b")),
+    OpSpec("LEN", ("a", "b")),
+    OpSpec("CONCAT", ("a", "b", "c")),
+    OpSpec("TFORLOOP", ("a", "offset", "c")),
+)
+
+_existing = {spec.mnemonic.upper() for spec in _BASE_OPCODE_SPECS.values()}
+_next_opcode = max(_BASE_OPCODE_SPECS.keys(), default=0) + 1
+for _spec in _ADDITIONAL_SPECS:
+    name = _spec.mnemonic.upper()
+    if name in _existing:
+        continue
+    _BASE_OPCODE_SPECS[_next_opcode] = _spec
+    _BASE_OPCODE_NAMES[_next_opcode] = _spec.mnemonic
+    _existing.add(name)
+    _next_opcode += 1
+
 _PRINTABLE85 = re.escape(
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     "!#$%&()*+,-./:;<=>?@[]^_`{|}~"

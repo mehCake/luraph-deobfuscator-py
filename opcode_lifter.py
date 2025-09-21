@@ -38,6 +38,10 @@ INSTRUCTION_SIGNATURES: Dict[str, InstructionSignature] = {
     "LOADK": InstructionSignature(["a", "b"], {"a": "register", "b": "const"}),
     "LOADN": InstructionSignature(["a", "b"], {"a": "register", "b": "immediate"}),
     "LOADB": InstructionSignature(["a", "b"], {"a": "register", "b": "immediate"}),
+    "LOADBOOL": InstructionSignature(
+        ["a", "b", "c"],
+        {"a": "register", "b": "immediate", "c": "immediate"},
+    ),
     "LOADNIL": InstructionSignature(["a"], {"a": "register"}),
     "MOVE": InstructionSignature(["a", "b"], {"a": "register", "b": "register"}),
     "GETGLOBAL": InstructionSignature(["a", "b"], {"a": "register", "b": "const"}),

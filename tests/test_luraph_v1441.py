@@ -149,6 +149,8 @@ def test_v1441_handler_uses_bootstrapper_metadata(tmp_path: Path) -> None:
     table = handler.opcode_table()
     assert table[0x10].mnemonic == "MOVE"
     assert table[0x2A].mnemonic == "FORLOOP"
+    assert table[0x2B].mnemonic == "TFORLOOP"
+    assert table[0x22].mnemonic == "CONCAT"
 
 
 def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
@@ -168,6 +170,8 @@ def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
     opcode_table = decoder.opcode_table()
     assert opcode_table.get(0x10) == "MOVE"
     assert opcode_table.get(0x2A) == "FORLOOP"
+    assert opcode_table.get(0x2B) == "TFORLOOP"
+    assert opcode_table.get(0x22) == "CONCAT"
 
 
 def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:
