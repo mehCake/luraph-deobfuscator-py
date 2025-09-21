@@ -11,6 +11,14 @@ Building on top of the VM, the `src/passes/devirtualizer.py` module illustrates
 how control‑flow graphs, taint tracking and symbolic execution can be combined
 to reconstruct readable Lua from simple bytecode traces.
 
+## Supported releases
+
+- **Luraph v14.4.1 (initv4)** – full bootstrap support with `--script-key`
+  decoding and optional `--bootstrapper` extraction for opcode maps/alphabet
+  tables supplied by `initv4.lua`.
+- **Earlier 14.x JSON loaders** – automatic payload recovery for the
+  `luraph_v14_2_json` family and compatible builds.
+
 Heuristics in `src/deobfuscator.py` attempt to detect the Luraph version used
 in a script.  Version specific tweaks live in `src/versions/` and are applied
 automatically when the virtual machine executes embedded bytecode (currently
