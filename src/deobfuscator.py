@@ -196,8 +196,8 @@ class LuaDeobfuscator:
                 except Exception as exc:  # pragma: no cover - best effort
                     message = str(exc)
                     metadata["handler_bytecode_error"] = message
-                    payload_meta = payload_info.metadata or {}
-                    literal_key = bool(payload_meta.get("script_key"))
+                    payload_info_meta = payload_info.metadata or {}
+                    literal_key = bool(payload_info_meta.get("script_key"))
                     env_key = os.environ.get("LURAPH_SCRIPT_KEY", "")
                     if (
                         version.name in {"luraph_v14_4_initv4", "v14.4.1"}
@@ -327,8 +327,8 @@ class LuaDeobfuscator:
                     errors = chunk_meta_updates.get("chunk_errors")
                     if isinstance(errors, list) and errors:
                         metadata.setdefault("handler_chunk_errors", list(errors))
-                    payload_meta = metadata.get("handler_payload_meta")
-                    if isinstance(payload_meta, dict):
+                    existing_payload_meta = metadata.get("handler_payload_meta")
+                    if isinstance(existing_payload_meta, dict):
                         for key in (
                             "chunk_count",
                             "chunk_decoded_bytes",
@@ -336,8 +336,8 @@ class LuaDeobfuscator:
                             "chunk_success_count",
                         ):
                             value = chunk_meta_updates.get(key)
-                            if value is not None and key not in payload_meta:
-                                payload_meta[key] = value
+                            if value is not None and key not in existing_payload_meta:
+                                existing_payload_meta[key] = value
                     elif any(
                         key in chunk_meta_updates
                         for key in (
@@ -816,12 +816,13 @@ class LuaDeobfuscator:
             renamed_chunk = ""
             chunk_source: str | None = None
 
+            chunk_bytes: bytes | None = None
             try:
                 chunk_bytes = decoder.extract_bytecode(blob)
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append({"chunk_index": index, "error": str(exc)})
-                chunk_bytes = None
             else:
+                assert chunk_bytes is not None
                 decoded_length = len(chunk_bytes)
                 decoded_parts.append(chunk_bytes)
 
@@ -859,10 +860,12 @@ class LuaDeobfuscator:
                                     ),
                                 )
                             except Exception as exc:  # pragma: no cover - defensive
-                                errors.append({
-                                    "chunk_index": index,
-                                    "error": str(exc),
-                                })
+                                errors.append(
+                                    {
+                                        "chunk_index": index,
+                                        "error": str(exc),
+                                    }
+                                )
                             else:
                                 devirt = IRDevirtualizer(module, consts)
                                 chunk_ast, _ = devirt.lower()

@@ -8,7 +8,7 @@ import os
 import re
 from types import SimpleNamespace
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, TypedDict, cast
 
 from ..utils_pkg import strings as string_utils
 from . import OpSpec, PayloadInfo, VersionHandler, register_handler
@@ -174,6 +174,14 @@ def _score_decoded_bytes(data: bytes) -> float:
     return max(0.0, min(score, 1.0))
 
 
+class _DecodeAttempt(TypedDict):
+    method: str
+    alphabet_source: str
+    data: bytes
+    size: int
+    score: float
+
+
 def _decode_attempts(
     blob: str,
     script_key: str,
@@ -187,7 +195,7 @@ def _decode_attempts(
         return b"", {"decode_method": "empty", "decode_attempts": []}
 
     key_bytes = script_key.encode("utf-8") if script_key else b""
-    attempts: List[Dict[str, object]] = []
+    attempts: List[_DecodeAttempt] = []
     errors: Dict[str, str] = {}
 
     def _record(
@@ -200,13 +208,16 @@ def _decode_attempts(
             return
         decoded = _apply_script_key_transform(raw, key_bytes)
         attempts.append(
-            {
-                "method": method,
-                "alphabet_source": alphabet_source,
-                "data": decoded,
-                "size": len(decoded),
-                "score": _score_decoded_bytes(decoded),
-            }
+            cast(
+                _DecodeAttempt,
+                {
+                    "method": method,
+                    "alphabet_source": alphabet_source,
+                    "data": decoded,
+                    "size": len(decoded),
+                    "score": _score_decoded_bytes(decoded),
+                },
+            )
         )
 
     prefer_base91 = any(ch not in _BASE64_CHARSET for ch in cleaned) if cleaned else False
@@ -281,13 +292,13 @@ def _decode_attempts(
                 "method": entry["method"],
                 "size": entry["size"],
                 "score": round(float(entry["score"]), 4),
-                "alphabet_source": entry.get("alphabet_source", "n/a"),
+                "alphabet_source": entry["alphabet_source"],
             }
             for entry in attempts
         ],
         "script_key_length": len(key_bytes),
         "index_xor": True,
-        "alphabet_source": best.get("alphabet_source", "n/a"),
+        "alphabet_source": best["alphabet_source"],
     }
     if best["score"] < 0.25:
         metadata["low_confidence"] = True

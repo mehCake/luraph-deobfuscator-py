@@ -6,7 +6,7 @@ import ast
 import math
 import operator
 import re
-from typing import Dict, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, Tuple, TYPE_CHECKING
 
 from string_decryptor import StringDecryptor
 
@@ -94,7 +94,9 @@ _ALLOWED_EXPR_CHARS = set("0123456789+-*/%.() \t\r\n")
 
 _CONST_EXPR_RE = re.compile(r"(?P<expr>(?:[-+*/%().0-9]+\s*){2,})")
 
-_ALLOWED_BINOPS = {
+Number = float | int
+
+_ALLOWED_BINOPS: Dict[type[ast.operator], Callable[[Number, Number], Number]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -102,7 +104,7 @@ _ALLOWED_BINOPS = {
     ast.Mod: operator.mod,
 }
 
-_ALLOWED_UNOPS = {
+_ALLOWED_UNOPS: Dict[type[ast.unaryop], Callable[[Number], Number]] = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
