@@ -66,6 +66,11 @@ class IRDevirtualizer:
         self._unreachable_pcs = {
             inst.pc for inst in self.instructions if inst.pc not in self._reachable_pcs
         }
+        self._pc_statement_map: Dict[int, List[int]] = {}
+        self._block_pc_map: Dict[str, List[int]] = {}
+        for label, block in self.blocks.items():
+            pcs = [inst.pc for inst in block.instructions]
+            self._block_pc_map[label] = pcs
 
         self._handlers = {
             "LoadK": self._handle_loadk,
@@ -141,7 +146,7 @@ class IRDevirtualizer:
         ctx = _LoweringContext()
         body, _ = self._lower_range(ctx, 0, len(self.instructions))
         chunk = lua_ast.Chunk(body=body)
-        metadata = {
+        metadata: Dict[str, Any] = {
             "statements": self._count_statements(body),
             "unknown_instructions": self._unknown,
             "loops": self._loop_count,
@@ -154,6 +159,40 @@ class IRDevirtualizer:
         eliminated = len(self._unreachable_pcs)
         if eliminated:
             metadata["eliminated_instructions"] = eliminated
+        if self._unreachable_pcs:
+            metadata["unreachable_pcs"] = sorted(self._unreachable_pcs)
+        if self._block_pc_map:
+            block_entries = []
+            for label, pcs in sorted(self._block_pc_map.items()):
+                block = self.blocks.get(label)
+                start_pc = block.start_pc if isinstance(block, IRBasicBlock) else pcs[0] if pcs else -1
+                block_entries.append(
+                    {
+                        "label": label,
+                        "start_pc": start_pc,
+                        "pcs": pcs,
+                    }
+                )
+            if block_entries:
+                metadata["block_map"] = block_entries
+        if self._pc_statement_map:
+            pc_map: List[Dict[str, Any]] = [
+                {"pc": pc, "statements": indices}
+                for pc, indices in sorted(self._pc_statement_map.items())
+            ]
+            metadata["pc_mapping"] = pc_map
+            stmt_entries: List[Dict[str, Any]] = []
+            for entry in pc_map:
+                pc_value = entry.get("pc")
+                stmt_indices = entry.get("statements")
+                if not isinstance(pc_value, int) or not isinstance(stmt_indices, list):
+                    continue
+                for stmt_index in stmt_indices:
+                    if isinstance(stmt_index, int):
+                        stmt_entries.append({"statement": stmt_index, "pc": pc_value})
+            if stmt_entries:
+                stmt_entries.sort(key=lambda item: item["statement"])
+                metadata["statement_map"] = stmt_entries
         if self._closure_count:
             metadata["closures"] = self._closure_count
         return chunk, metadata
@@ -177,7 +216,14 @@ class IRDevirtualizer:
                 self._unknown += 1
                 idx += 1
                 continue
+            before = len(statements)
             idx = handler(ctx, idx, end, statements)
+            after = len(statements)
+            if after > before:
+                indices = list(range(before, after))
+                self._pc_statement_map.setdefault(inst.pc, []).extend(indices)
+            else:
+                self._pc_statement_map.setdefault(inst.pc, [])
         return statements, idx
 
     # --- Helpers -----------------------------------------------------

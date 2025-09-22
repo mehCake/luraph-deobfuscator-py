@@ -167,6 +167,8 @@ def _format_pipeline_output(
         }
         if ctx.decoded_payloads:
             payload["decoded_payloads"] = ctx.decoded_payloads
+        if ctx.vm_metadata:
+            payload["vm_metadata"] = utils.serialise_metadata(ctx.vm_metadata)
         if getattr(ctx, "result", None):
             payload.update(ctx.result)
         return json.dumps(payload, indent=2, sort_keys=True)

@@ -89,6 +89,7 @@ class Context:
     bootstrapper_path: Path | None = None
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
+    vm_metadata: Dict[str, Any] = field(default_factory=dict)
     ir_module: "IRModule | None" = None
     from_json: bool = False
     reconstructed_lua: str = ""
@@ -287,6 +288,52 @@ def _pass_payload_decode(ctx: Context) -> None:
 
 def _pass_vm_lift(ctx: Context) -> None:
     metadata = vm_lift_run(ctx)
+    module = ctx.ir_module
+    if module is not None:
+        lifter_meta = ctx.vm_metadata.setdefault("lifter", {})
+        lifter_meta.update(
+            {
+                "instruction_count": module.instruction_count,
+                "block_count": module.block_count,
+                "bytecode_size": module.bytecode_size,
+            }
+        )
+        block_lookup: Dict[int, str] = {}
+        for label, block in module.blocks.items():
+            for inst in block.instructions:
+                block_lookup[inst.pc] = label
+        markers: List[Dict[str, Any]] = []
+        for inst in module.instructions:
+            entry: Dict[str, Any] = {"pc": inst.pc, "opcode": inst.opcode}
+            if inst.args:
+                entry["args"] = dict(inst.args)
+            if inst.dest is not None:
+                entry["dest"] = inst.dest
+            origin_offset = inst.origin.get("offset") if isinstance(inst.origin, dict) else None
+            if isinstance(origin_offset, int):
+                entry["offset"] = origin_offset
+            block_label = block_lookup.get(inst.pc)
+            if block_label:
+                entry["block"] = block_label
+            markers.append(entry)
+        if markers:
+            lifter_meta["instruction_total"] = len(markers)
+            sample_limit = 256
+            lifter_meta["instruction_markers"] = markers[:sample_limit]
+            if len(markers) > sample_limit:
+                lifter_meta["instruction_sample_size"] = sample_limit
+        block_meta: List[Dict[str, Any]] = []
+        for label, block in sorted(module.blocks.items()):
+            block_meta.append(
+                {
+                    "label": label,
+                    "start_pc": block.start_pc,
+                    "size": len(block.instructions),
+                    "successors": list(block.successors),
+                }
+            )
+        if block_meta:
+            lifter_meta["blocks"] = block_meta
     report = ctx.report
     if report is not None and ctx.ir_module is not None:
         stats: Dict[str, int] = {}
@@ -312,6 +359,28 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
         ctx.record_metadata("vm_devirtualize", {"skipped": True})
         return
     metadata = vm_devirtualize_run(ctx)
+    if metadata:
+        devirt_meta = ctx.vm_metadata.setdefault("devirtualizer", {})
+        for key in (
+            "pc_mapping",
+            "statement_map",
+            "block_map",
+            "reachable_blocks",
+            "unreachable_blocks",
+            "unreachable_pcs",
+            "eliminated_instructions",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                devirt_meta[key] = value
+        unreachable = metadata.get("unreachable_pcs")
+        if isinstance(unreachable, list) and unreachable:
+            traps_meta = ctx.vm_metadata.setdefault("traps", {})
+            traps_meta["unreachable_pcs"] = list(unreachable)
+        eliminated = metadata.get("eliminated_instructions")
+        if isinstance(eliminated, int) and eliminated > 0:
+            traps_meta = ctx.vm_metadata.setdefault("traps", {})
+            traps_meta["eliminated_instructions"] = eliminated
     ctx.record_metadata("vm_devirtualize", dict(metadata))
     if ctx.stage_output:
         ctx.write_artifact("vm_devirtualize", ctx.stage_output)
@@ -329,6 +398,12 @@ def _pass_cleanup(ctx: Context) -> None:
         if isinstance(dummy_loops, int):
             traps += max(dummy_loops, 0)
         report.traps_removed = traps
+        trap_meta = ctx.vm_metadata.setdefault("traps", {})
+        if isinstance(assert_traps, int):
+            trap_meta["assert_traps"] = max(assert_traps, 0)
+        if isinstance(dummy_loops, int):
+            trap_meta["dummy_loops"] = max(dummy_loops, 0)
+        trap_meta["total_removed"] = traps
 
         constants = 0
         if metadata.get("constant_folded"):

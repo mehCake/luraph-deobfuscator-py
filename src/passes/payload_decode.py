@@ -37,6 +37,53 @@ _TOP_LEVEL_LITERAL_RE = re.compile(
 _STUB_HINT_RE = re.compile(r"init_fn\s*\(")
 
 
+def _detect_jump_table(constants: Iterable[Any]) -> Optional[Dict[str, Any]]:
+    """Identify jump-table like structures in *constants*."""
+
+    best_index: Optional[int] = None
+    best_entries: List[int] = []
+    best_kind = ""
+
+    for index, value in enumerate(constants):
+        entries: List[int] | None = None
+        kind = ""
+
+        if isinstance(value, (list, tuple)) and len(value) >= 3:
+            ints = [int(item) for item in value if isinstance(item, (int, float))]
+            if len(ints) >= 3:
+                entries = ints
+                kind = "sequence"
+        elif isinstance(value, dict) and value:
+            numeric_items = [
+                (int(key), int(val))
+                for key, val in value.items()
+                if isinstance(key, (int, float)) and isinstance(val, (int, float))
+            ]
+            if len(numeric_items) >= 3:
+                numeric_items.sort(key=lambda item: item[0])
+                entries = [val for _, val in numeric_items]
+                kind = "mapping"
+
+        if entries and len(entries) > len(best_entries):
+            best_index = index
+            best_entries = entries
+            best_kind = kind or "sequence"
+
+    if best_index is None or not best_entries:
+        return None
+
+    preview = best_entries[:64]
+    result: Dict[str, Any] = {
+        "index": best_index,
+        "size": len(best_entries),
+        "entries": preview,
+        "type": best_kind,
+    }
+    if len(best_entries) > len(preview):
+        result["truncated"] = True
+    return result
+
+
 def _payload_iteration_limit(ctx: "Context") -> int:
     """Return the maximum number of iterative payload decodes to attempt."""
 
@@ -772,6 +819,13 @@ def run(ctx: "Context") -> Dict[str, Any]:
             ctx.working_text = final_output
             if not ctx.decoded_payloads or ctx.decoded_payloads[-1] != final_output:
                 ctx.decoded_payloads.append(final_output)
+
+    const_pool = ctx.vm.const_pool or []
+    if const_pool:
+        jump_meta = _detect_jump_table(const_pool)
+        if jump_meta:
+            metadata.setdefault("vm_jump_table", dict(jump_meta))
+            ctx.vm_metadata.setdefault("jump_table", dict(jump_meta))
 
     report = getattr(ctx, "report", None)
     if report is not None:

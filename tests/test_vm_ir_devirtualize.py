@@ -118,6 +118,9 @@ def test_ir_devirtualizer_skips_unreachable_blocks() -> None:
     assert "trap" not in source
     assert metadata.get("unreachable_blocks") == 1
     assert metadata.get("eliminated_instructions") == 2
+    assert metadata.get("unreachable_pcs") == [2, 3]
+    pc_map = metadata.get("pc_mapping")
+    assert isinstance(pc_map, list) and any(entry.get("pc") == 0 for entry in pc_map)
 
 
 def test_ir_devirtualizer_lowers_closures() -> None:
@@ -161,3 +164,4 @@ def test_vm_devirtualize_pass_renames_and_formats(tmp_path) -> None:
     assert metadata["renamed_identifiers"] is True
     assert metadata["renamed_count"] >= 2
     assert ctx.report.variables_renamed == metadata["renamed_count"]
+    assert "pc_mapping" in metadata

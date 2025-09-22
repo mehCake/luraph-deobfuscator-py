@@ -222,6 +222,16 @@ def test_cli_v1441_script_key_only(tmp_path):
     decoded = [entry.strip() for entry in data.get("decoded_payloads", [])]
     assert any("print(" in entry for entry in decoded)
 
+    vm_meta = data.get("vm_metadata")
+    assert isinstance(vm_meta, dict)
+    assert "traps" in vm_meta
+    lifter_meta = vm_meta.get("lifter")
+    if lifter_meta is not None:
+        assert isinstance(lifter_meta, dict)
+    devirt_meta = vm_meta.get("devirtualizer")
+    if devirt_meta is not None:
+        assert isinstance(devirt_meta, dict)
+
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("alphabet_source") == "default"

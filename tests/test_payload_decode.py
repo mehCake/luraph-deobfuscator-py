@@ -2,7 +2,7 @@ import base64
 import logging
 
 from src.pipeline import Context
-from src.passes.payload_decode import run as payload_decode_run
+from src.passes.payload_decode import _detect_jump_table, run as payload_decode_run
 
 
 def _sample_payload() -> str:
@@ -55,3 +55,18 @@ def test_payload_decode_loadstring_fallback(tmp_path):
     assert fallback is not None
     load_meta = fallback.get("loadstrings") if isinstance(fallback, dict) else None
     assert load_meta and load_meta.get("decoded") == 1
+
+
+def test_detect_jump_table_records_entries():
+    const_pool = [
+        [3, 5, 7, 9, 11],
+        {1: 2, 2: 4},
+        (10, 20, 30, 40, 50, 60),
+    ]
+
+    meta = _detect_jump_table(const_pool)
+    assert meta is not None
+    assert meta["index"] == 2
+    assert meta["size"] == 6
+    assert meta["type"] == "sequence"
+    assert meta["entries"][0] == 10
