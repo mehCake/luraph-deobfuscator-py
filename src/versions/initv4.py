@@ -325,7 +325,7 @@ class InitV4Decoder:
     def locate_payload(self, source: str) -> List[str]:
         blobs: List[str] = []
         for match in _PAYLOAD_RE.finditer(source):
-            blobs.append(match.group(2))
+            blobs.append(match.group(0))
         return blobs
 
     # ------------------------------------------------------------------

@@ -236,6 +236,13 @@ class LuaDeobfuscator:
 
                 cleaned_meta = dict(payload_info.metadata)
                 cleaned_meta.pop(override_token, None)
+                cleaned_meta.pop("_chunks", None)
+                chunk_count = cleaned_meta.get("chunk_count")
+                if isinstance(chunk_count, int) and chunk_count > 0:
+                    metadata["handler_payload_chunks"] = chunk_count
+                chunk_bytes = cleaned_meta.get("chunk_decoded_bytes")
+                if isinstance(chunk_bytes, list):
+                    metadata["handler_chunk_decoded_bytes"] = list(chunk_bytes)
                 if cleaned_meta:
                     metadata["handler_payload_meta"] = cleaned_meta
 

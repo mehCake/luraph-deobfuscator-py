@@ -103,9 +103,22 @@ def run(ctx: "Context") -> Dict[str, Any]:
         raw_bytes = metadata.get("handler_vm_bytecode")
         if not lengths and isinstance(raw_bytes, (bytes, bytearray)):
             lengths.append(len(raw_bytes))
-        if lengths:
+        chunk_count = metadata.get("handler_payload_chunks")
+        if isinstance(chunk_count, int) and chunk_count > 0:
+            report.blob_count += chunk_count
+        elif lengths:
             report.blob_count += len(lengths)
+
+        if lengths:
             report.decoded_bytes += sum(lengths)
+        elif isinstance(metadata.get("handler_chunk_decoded_bytes"), list):
+            chunk_bytes = [
+                value
+                for value in metadata.get("handler_chunk_decoded_bytes", [])
+                if isinstance(value, int) and value >= 0
+            ]
+            if chunk_bytes:
+                report.decoded_bytes += sum(chunk_bytes)
 
         warnings = metadata.get("warnings")
         if isinstance(warnings, list):
