@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List, Optional, Set, TYPE_CHECKING
 
 from .. import utils
 from ..deobfuscator import VMIR
@@ -18,6 +18,293 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 ConstPool = List[Any]
+
+
+def _payload_iteration_limit(ctx: "Context") -> int:
+    """Return the maximum number of iterative payload decodes to attempt."""
+
+    default_limit = 3
+    options = getattr(ctx, "options", None)
+    if isinstance(options, dict):
+        raw_limit = options.get("payload_decode_max_iterations")
+        if not isinstance(raw_limit, int):
+            raw_limit = options.get("max_iterations")
+        if isinstance(raw_limit, int) and raw_limit > 0:
+            return max(1, raw_limit)
+    return default_limit
+
+
+def _extend_list(
+    target: Dict[str, Any],
+    key: str,
+    values: Optional[Iterable[Any]],
+    *,
+    allow_false: bool = False,
+    predicate: Optional[Any] = None,
+    transform: Optional[Any] = None,
+) -> None:
+    if not values:
+        return
+    bucket = target.setdefault(key, [])
+    for value in values:
+        if not allow_false and not value:
+            continue
+        if predicate is not None and not predicate(value):
+            continue
+        if transform is not None:
+            value = transform(value)
+        bucket.append(value)
+
+
+def _merge_payload_meta(target: Dict[str, Any], meta: Any) -> None:
+    if not isinstance(meta, dict):
+        return
+
+    for key, value in meta.items():
+        if key in {"chunk_count", "chunk_success_count"} and isinstance(value, int):
+            target[key] = target.get(key, 0) + max(value, 0)
+            continue
+        if key in {"chunk_decoded_bytes", "chunk_encoded_lengths", "chunk_lengths"} and isinstance(value, list):
+            existing = target.setdefault(key, [])
+            for item in value:
+                if isinstance(item, int):
+                    existing.append(item)
+            continue
+        if key in {"chunk_meta", "decode_attempts", "decode_errors"} and isinstance(value, list):
+            existing = target.setdefault(key, [])
+            for item in value:
+                if isinstance(item, dict):
+                    existing.append(dict(item))
+            continue
+        if key in {"chunk_methods", "chunk_alphabet_sources"} and isinstance(value, list):
+            existing = target.setdefault(key, [])
+            existing.extend(value)
+            continue
+        if key not in target:
+            target[key] = value
+
+
+def _merge_iteration_metadata(
+    aggregate: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    version_name: str,
+    changed: bool,
+) -> None:
+    aggregate.setdefault("payload_iterations", 0)
+    aggregate["payload_iterations"] += 1
+
+    versions = aggregate.setdefault("payload_iteration_versions", [])
+    versions.append(version_name)
+
+    changes = aggregate.setdefault("payload_iteration_changes", [])
+    changes.append(bool(changed))
+
+    aggregate.setdefault("initial_version", version_name)
+    aggregate["final_version"] = version_name
+
+    for key in ("handler_payload_offset", "script_key_override", "bootstrapper_path", "bootstrapper"):
+        if key in meta and key not in aggregate:
+            aggregate[key] = meta[key]
+
+    for key in ("handler_payload_chunks", "handler_chunk_success_count", "handler_bytecode_bytes", "handler_payload_bytes", "decoded_bytes"):
+        value = meta.get(key)
+        if isinstance(value, int):
+            aggregate[key] = aggregate.get(key, 0) + max(value, 0)
+
+    if meta.get("script_payload"):
+        aggregate["script_payload"] = True
+    if meta.get("decoded_json"):
+        aggregate["decoded_json"] = True
+
+    _extend_list(
+        aggregate,
+        "handler_chunk_decoded_bytes",
+        meta.get("handler_chunk_decoded_bytes"),
+        allow_false=True,
+        predicate=lambda value: isinstance(value, int),
+    )
+    _extend_list(
+        aggregate,
+        "handler_chunk_encoded_lengths",
+        meta.get("handler_chunk_encoded_lengths"),
+        allow_false=True,
+        predicate=lambda value: isinstance(value, int),
+    )
+    _extend_list(
+        aggregate,
+        "handler_chunk_cleaned",
+        meta.get("handler_chunk_cleaned"),
+        allow_false=True,
+        predicate=lambda value: isinstance(value, bool),
+    )
+    _extend_list(
+        aggregate,
+        "handler_chunk_rename_counts",
+        meta.get("handler_chunk_rename_counts"),
+        allow_false=True,
+        predicate=lambda value: isinstance(value, int),
+    )
+    _extend_list(
+        aggregate,
+        "handler_chunk_sources",
+        meta.get("handler_chunk_sources"),
+        predicate=lambda value: isinstance(value, str) and value != "",
+    )
+    _extend_list(
+        aggregate,
+        "handler_chunk_errors",
+        meta.get("handler_chunk_errors"),
+        predicate=lambda value: isinstance(value, dict),
+    )
+    _extend_list(
+        aggregate,
+        "decode_attempts",
+        meta.get("decode_attempts"),
+        predicate=lambda value: isinstance(value, dict),
+    )
+    _extend_list(
+        aggregate,
+        "warnings",
+        meta.get("warnings"),
+        predicate=lambda value: bool(value),
+    )
+
+    combined = meta.get("handler_chunk_combined_source")
+    if isinstance(combined, str) and combined.strip():
+        aggregate["handler_chunk_combined_source"] = combined
+
+    payload_meta = aggregate.setdefault("handler_payload_meta", {})
+    _merge_payload_meta(payload_meta, meta.get("handler_payload_meta"))
+
+    summary = {
+        "version": version_name,
+        "chunks": meta.get("handler_payload_chunks", 0),
+        "decoded_bytes": meta.get("handler_bytecode_bytes") or meta.get("handler_payload_bytes") or meta.get("decoded_bytes") or 0,
+        "script_payload": bool(meta.get("script_payload")),
+        "changed": bool(changed),
+    }
+    aggregate.setdefault("payload_iteration_summary", []).append(summary)
+
+    skip_keys = {
+        "handler_chunk_decoded_bytes",
+        "handler_chunk_encoded_lengths",
+        "handler_chunk_cleaned",
+        "handler_chunk_sources",
+        "handler_chunk_rename_counts",
+        "handler_chunk_errors",
+        "handler_payload_meta",
+        "handler_vm_bytecode",
+        "decode_attempts",
+        "warnings",
+    }
+    for key, value in meta.items():
+        if key in skip_keys:
+            continue
+        if key not in aggregate:
+            aggregate[key] = value
+
+
+def _unique_ordered(values: Iterable[Any]) -> List[Any]:
+    seen: Set[Any] = set()
+    ordered: List[Any] = []
+    for value in values:
+        marker = value
+        if isinstance(value, dict):
+            marker = tuple(sorted(value.items()))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        ordered.append(value)
+    return ordered
+
+
+def _finalise_metadata(
+    aggregate: Dict[str, Any],
+    last_meta: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not aggregate:
+        return dict(last_meta or {})
+
+    final = dict(aggregate)
+
+    if last_meta:
+        if last_meta.get("script_payload"):
+            final["script_payload"] = True
+        for key in (
+            "handler_chunk_combined_source",
+            "handler_chunk_sources",
+            "handler_chunk_cleaned",
+            "handler_chunk_rename_counts",
+            "handler_chunk_errors",
+            "decode_attempts",
+            "warnings",
+            "vm_ir",
+        ):
+            if key not in final and key in last_meta:
+                final[key] = last_meta[key]
+
+        for key in ("handler_payload_offset", "bootstrapper_path", "bootstrapper", "script_key_override"):
+            if key not in final and key in last_meta:
+                final[key] = last_meta[key]
+
+    warnings = final.get("warnings")
+    if isinstance(warnings, list):
+        final["warnings"] = _unique_ordered(str(item) for item in warnings if item)
+
+    iterations = final.get("payload_iterations")
+    if not isinstance(iterations, int) or iterations <= 0:
+        final["payload_iterations"] = 1
+
+    versions = final.get("payload_iteration_versions")
+    if isinstance(versions, list):
+        final["payload_iteration_versions"] = [str(entry) for entry in versions if entry]
+    elif last_meta is not None:
+        final["payload_iteration_versions"] = [final.get("final_version")] if final.get("final_version") else []
+
+    changes = final.get("payload_iteration_changes")
+    if isinstance(changes, list):
+        final["payload_iteration_changes"] = [bool(entry) for entry in changes]
+
+    final.pop("handler_vm_bytecode", None)
+
+    return final
+
+
+def _has_remaining_payload(text: str, version: Any) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if version is None:
+        return False
+    is_unknown = getattr(version, "is_unknown", False)
+    if is_unknown:
+        return False
+    version_name = getattr(version, "name", "")
+    if not version_name:
+        return False
+    try:
+        handler = get_handler(version_name)
+    except KeyError:
+        return False
+    if not isinstance(handler, VersionHandler):
+        return False
+    try:
+        payload = handler.locate_payload(text)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.debug("failed to probe payload for %s: %s", version_name, exc)
+        return False
+    if payload is None:
+        return False
+    if isinstance(payload.data, (dict, list)):
+        return True
+    meta = payload.metadata or {}
+    if meta.get("_chunks") or meta.get("chunk_count"):
+        return True
+    payload_text = payload.text
+    if isinstance(payload_text, str):
+        cleaned = payload_text.strip()
+        return len(cleaned) >= 16
+    return False
 
 
 def run(ctx: "Context") -> Dict[str, Any]:
@@ -40,41 +327,85 @@ def run(ctx: "Context") -> Dict[str, Any]:
     if not isinstance(script_key, str) and isinstance(ctx.options, dict):
         script_key = ctx.options.get("script_key")
 
-    result = deob.decode_payload(
-        text,
-        version=version,
-        features=features,
-        script_key=script_key if isinstance(script_key, str) else None,
-        bootstrapper=ctx.bootstrapper_path,
-    )
-    handler_instance = getattr(deob, "last_handler", None)
-    if isinstance(handler_instance, VersionHandler):
-        ctx.version_handler = handler_instance
-    else:
-        ctx.version_handler = None
-    output_text = result.text or ""
-    ctx.stage_output = output_text
-    if output_text:
-        ctx.decoded_payloads.append(output_text)
+    iteration_limit = _payload_iteration_limit(ctx)
+    aggregated: Dict[str, Any] = {}
+    final_output = text
+    current_version = version
+    current_features = features
+    seen_outputs: Set[str] = {text}
+    last_metadata: Optional[Dict[str, Any]] = None
 
-    metadata: Dict[str, Any] = dict(result.metadata)
-    vm_ir = metadata.pop("vm_ir", None)
-    if isinstance(vm_ir, VMIR):
-        ctx.vm_ir = vm_ir
-        if vm_ir.constants and not ctx.vm.const_pool:
-            ctx.vm.const_pool = list(vm_ir.constants)
-        metadata["vm_ir"] = {
-            "constants": len(vm_ir.constants),
-            "bytecode": len(vm_ir.bytecode),
-            "prototypes": len(vm_ir.prototypes or []),
-        }
+    for iteration in range(iteration_limit):
+        current_source = final_output
+        override_key = script_key if iteration == 0 and isinstance(script_key, str) else None
+        result = deob.decode_payload(
+            current_source,
+            version=current_version,
+            features=current_features,
+            script_key=override_key,
+            bootstrapper=ctx.bootstrapper_path,
+        )
 
-    if version.name == "luraph_v14_2_json":
-        handler_meta = _populate_v142_json_payload(ctx, text)
-        if handler_meta:
-            metadata.update(handler_meta)
+        handler_instance = getattr(deob, "last_handler", None)
+        if isinstance(handler_instance, VersionHandler):
+            ctx.version_handler = handler_instance
+        else:
+            ctx.version_handler = None
 
-    _apply_vm_bytecode(ctx, metadata, version.name)
+        output_text = result.text or ""
+        changed = bool(output_text) and output_text != current_source
+        if output_text:
+            if not ctx.decoded_payloads or ctx.decoded_payloads[-1] != output_text:
+                ctx.decoded_payloads.append(output_text)
+        if changed:
+            final_output = output_text
+        ctx.stage_output = final_output
+
+        iteration_metadata: Dict[str, Any] = dict(result.metadata)
+        vm_ir = iteration_metadata.pop("vm_ir", None)
+        if isinstance(vm_ir, VMIR):
+            ctx.vm_ir = vm_ir
+            if vm_ir.constants and not ctx.vm.const_pool:
+                ctx.vm.const_pool = list(vm_ir.constants)
+            iteration_metadata["vm_ir"] = {
+                "constants": len(vm_ir.constants),
+                "bytecode": len(vm_ir.bytecode),
+                "prototypes": len(vm_ir.prototypes or []),
+            }
+
+        if current_version.name == "luraph_v14_2_json":
+            handler_meta = _populate_v142_json_payload(ctx, current_source)
+            if handler_meta:
+                iteration_metadata.update(handler_meta)
+
+        _merge_iteration_metadata(
+            aggregated,
+            iteration_metadata,
+            version_name=current_version.name,
+            changed=changed,
+        )
+
+        _apply_vm_bytecode(ctx, dict(iteration_metadata), current_version.name)
+        last_metadata = iteration_metadata
+
+        if not changed:
+            break
+
+        if final_output in seen_outputs:
+            break
+        seen_outputs.add(final_output)
+
+        next_version = deob.detect_version(final_output, from_json=ctx.from_json)
+        current_version = next_version
+        current_features = next_version.features if next_version.features else None
+
+        if not _has_remaining_payload(final_output, current_version):
+            break
+
+    ctx.stage_output = final_output
+    ctx.detected_version = current_version
+
+    metadata = _finalise_metadata(aggregated, last_metadata)
 
     report = getattr(ctx, "report", None)
     if report is not None:
@@ -100,9 +431,6 @@ def run(ctx: "Context") -> Dict[str, Any]:
         payload_len = metadata.get("handler_payload_bytes")
         if isinstance(payload_len, int) and payload_len >= 0:
             lengths.append(payload_len)
-        raw_bytes = metadata.get("handler_vm_bytecode")
-        if not lengths and isinstance(raw_bytes, (bytes, bytearray)):
-            lengths.append(len(raw_bytes))
 
         chunk_decoded_raw = metadata.get("handler_chunk_decoded_bytes")
         chunk_decoded: List[int] = []

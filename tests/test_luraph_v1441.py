@@ -453,6 +453,34 @@ def test_payload_decode_merges_multiple_initv4_payloads(tmp_path: Path) -> None:
     assert ctx.decoded_payloads and ctx.decoded_payloads[-1].strip() == merged.strip()
 
 
+def test_payload_decode_iterates_nested_payloads(tmp_path: Path) -> None:
+    final_script = "print('nested chunk payload')"
+    inner_mapping = {"constants": [], "bytecode": [], "script": final_script}
+    inner_raw = json.dumps(inner_mapping).encode("utf-8")
+    inner_stub, _, _, _ = _make_sample(raw=inner_raw, script_key=EXAMPLE_SCRIPT_KEY)
+    outer_stub, _, _, _ = _make_sample(raw=inner_stub.encode("utf-8"), script_key=EXAMPLE_SCRIPT_KEY)
+
+    path = tmp_path / "nested.lua"
+    path.write_text(outer_stub, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=outer_stub,
+        stage_output=outer_stub,
+        script_key=EXAMPLE_SCRIPT_KEY,
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    assert ctx.stage_output.strip() == final_script.strip()
+    assert metadata.get("payload_iterations", 0) >= 2
+    versions = metadata.get("payload_iteration_versions")
+    assert isinstance(versions, list) and len(versions) >= 2
+    assert ctx.decoded_payloads and ctx.decoded_payloads[-1].strip() == final_script.strip()
+    assert metadata.get("handler_payload_chunks", 0) >= 1
+    assert ctx.report.blob_count >= metadata.get("handler_payload_chunks", 0)
+
+
 def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:
     script = EXAMPLE_V1441.read_text(encoding="utf-8")
     path = tmp_path / "wrong_key.lua"

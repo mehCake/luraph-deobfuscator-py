@@ -379,21 +379,17 @@ def _locate_json_block(text: str, *, start: int) -> Tuple[str, int, int, Dict[st
 
 
 def _locate_payload_chunks(text: str, *, start: int) -> List[Tuple[str, int, int]]:
-    matches: List[Tuple[str, int, int]] = []
-    for match in _CHUNK_STRING_RE.finditer(text, pos=start):
+    primary: List[Tuple[str, int, int]] = []
+    secondary: List[Tuple[str, int, int]] = []
+    for match in _CHUNK_STRING_RE.finditer(text):
         chunk = match.group(2)
         begin, end = match.span(2)
-        matches.append((chunk, begin, end))
-    if matches:
-        return matches
-
-    if start:
-        for match in _CHUNK_STRING_RE.finditer(text):
-            chunk = match.group(2)
-            begin, end = match.span(2)
-            matches.append((chunk, begin, end))
-    if matches:
-        return matches
+        if begin >= start:
+            primary.append((chunk, begin, end))
+        else:
+            secondary.append((chunk, begin, end))
+    if primary or secondary:
+        return primary + secondary
 
     best: Tuple[str, int, int] | None = None
     for match in _HIGH_ENTROPY_RE.finditer(text, pos=start):

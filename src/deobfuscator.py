@@ -870,16 +870,30 @@ class LuaDeobfuscator:
                             chunk_ast, _ = devirt.lower()
                             chunk_source = lua_ast.to_source(chunk_ast)
 
-                if chunk_source:
-                    cleaned_source = self.cleanup(chunk_source)
-                    cleaned_flag = cleaned_source != chunk_source
-                    renamer = VariableRenamer()
-                    renamed_chunk = renamer.rename_variables(cleaned_source)
-                    stats = getattr(renamer, "last_stats", {})
-                    if isinstance(stats, dict):
-                        count_value = stats.get("replacements")
-                        if isinstance(count_value, int):
-                            rename_count = max(count_value, 0)
+            if chunk_source:
+                cleaned_source = self.cleanup(chunk_source)
+                cleaned_flag = cleaned_source != chunk_source
+                renamer = VariableRenamer()
+                renamed_chunk = renamer.rename_variables(cleaned_source)
+                stats = getattr(renamer, "last_stats", {})
+                if isinstance(stats, dict):
+                    count_value = stats.get("replacements")
+                    if isinstance(count_value, int):
+                        rename_count = max(count_value, 0)
+            else:
+                try:
+                    decoded_text = chunk_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded_text = ""
+                if decoded_text:
+                    stripped = utils.strip_non_printable(decoded_text)
+                    if stripped and any(
+                        token in stripped for token in ("function", "local ", "return", "init_fn")
+                    ):
+                        chunk_source = stripped
+                        cleaned_source = chunk_source
+                        cleaned_flag = False
+                        renamed_chunk = chunk_source
 
             decoded_lengths.append(decoded_length)
             cleaned_flags.append(cleaned_flag)
@@ -910,7 +924,7 @@ class LuaDeobfuscator:
         if chunk_sources:
             analysis["sources"] = chunk_sources
         if merged_source:
-            analysis["final_source"] = self._formatter.format_source(merged_source)
+            analysis["final_source"] = merged_source
         if rename_counts and any(rename_counts):
             analysis["rename_counts"] = rename_counts
         if cleaned_flags and any(cleaned_flags):
