@@ -167,6 +167,8 @@ def _format_pipeline_output(
         }
         if ctx.decoded_payloads:
             payload["decoded_payloads"] = ctx.decoded_payloads
+        if getattr(ctx, "result", None):
+            payload.update(ctx.result)
         return json.dumps(payload, indent=2, sort_keys=True)
     return ctx.output or ctx.stage_output or ctx.raw_input
 
@@ -410,6 +412,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if final_ctx is None:
             return WorkResult(item, False, error="pipeline did not produce output")
 
+        report = final_ctx.report if final_ctx else None
+        if (
+            not args.detect_only
+            and args.format == "json"
+            and report is not None
+        ):
+            final_ctx.result["report"] = dict(report.__dict__)
+
         if args.detect_only:
             output_text = _format_detection(final_ctx, args.format)
         else:
@@ -417,6 +427,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if not utils.safe_write_file(str(item.destination), output_text):
             return WorkResult(item, False, error="failed to write output")
+
+        if (
+            not args.detect_only
+            and report is not None
+            and final_ctx.options.get("report", True)
+        ):
+            print("\n=== Deobfuscation Report ===")
+            print(report.to_text())
 
         if dump_ir_target and final_ctx:
             if dump_ir_is_directory:

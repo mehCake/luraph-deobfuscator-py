@@ -93,6 +93,7 @@ class Context:
     reconstructed_lua: str = ""
     version_handler: VersionHandler | None = None
     report: DeobReport = field(default_factory=_default_report)
+    result: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.deobfuscator is None:
