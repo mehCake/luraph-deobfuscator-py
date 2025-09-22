@@ -1,0 +1,69 @@
+import textwrap
+
+from src.report import DeobReport
+
+
+def test_report_to_text_includes_expected_sections():
+    report = DeobReport(
+        version_detected="luraph_v14_4_initv4",
+        script_key_used="ncbmxnbs6wrpkpaitt6dwj",
+        bootstrapper_used="examples/initv4.lua",
+        blob_count=3,
+        decoded_bytes=4096,
+        opcode_stats={"CALL": 5, "LOADK": 8},
+        unknown_opcodes=[255],
+        traps_removed=2,
+        constants_decrypted=7,
+        variables_renamed=12,
+        output_length=2048,
+        warnings=["extra metadata missing"],
+        errors=["opcode 0x33 failed"],
+    )
+
+    rendered = report.to_text()
+
+    expected = textwrap.dedent(
+        """
+        Detected version: luraph_v14_4_initv4
+        Script key: ncbmxn... (len=22)
+        Bootstrapper: examples/initv4.lua
+        Decoded 3 blobs, total 4096 bytes
+        Opcode counts:
+          CALL: 5
+          LOADK: 8
+        Unknown opcodes: [255]
+        Traps removed: 2
+        Constants decrypted: 7
+        Variables renamed: 12
+        Final output length: 2048 chars
+        Warnings:
+          - extra metadata missing
+        Errors:
+          - opcode 0x33 failed
+        """
+    ).strip()
+
+    assert rendered == expected
+
+
+def test_report_to_text_handles_missing_optional_fields():
+    report = DeobReport(
+        version_detected="luraph_v14_4_initv4",
+        script_key_used=None,
+        bootstrapper_used=None,
+        blob_count=0,
+        decoded_bytes=0,
+        opcode_stats={},
+        unknown_opcodes=[],
+        traps_removed=0,
+        constants_decrypted=0,
+        variables_renamed=0,
+        output_length=0,
+    )
+
+    rendered = report.to_text().splitlines()
+
+    assert "Script key" not in "\n".join(rendered)
+    assert "Bootstrapper" not in "\n".join(rendered)
+    assert rendered[0] == "Detected version: luraph_v14_4_initv4"
+    assert rendered[-1] == "Final output length: 0 chars"
