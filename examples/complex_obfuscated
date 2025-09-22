@@ -1,0 +1,18 @@
+-- Example multi-chunk Luraph v14.4.1 bootstrap
+local script_key = script_key or "qjp0cnxufsolyf599g6zgs"
+local init_fn = function(blob)
+    return blob
+end
+
+local constants = {
+    [1] = "Aimbot enabled",
+    [2] = "ESP toggled",
+    [3] = "Eliminating all targets",
+}
+local sentinel = {constants[1], constants[2], constants[3]}
+
+local chunk_1 = "dPekpDf.A5yhZxRGR%+k,H@vNk#CEY[3Be25i#I)9B:/{,8D%pToJegel5={`wvHJ<zAQg#5tz}^Nd|N].Hp2yI2aG(4ux^NiNy~^4NVx<637H,kdI|3EX@dFn-@48yr[$P@eb/sh8zKvN9EE:dc:P14f3MS8g$,v:8`N"
+local chunk_2 = ",!L7iIJ198Zd{B)7}oX:zyawH6BRp>eRMjHTjPe^M$%q-,wfwSWX<_3NilItYwyBB9@-w*hJ4Jz.0G$P-[t.%FvT=2yZ-3}T]H~0$M/?,B>B.a81dm$k478CaMR-0d@~9GB23aCn:8fS5x:q^^W]GYPhrQ{ZuwSc1#VTH"
+local chunk_3 = "ngoQ)fXBBo4cF>7JBxV.:H<vuxVAnuFfD!~jf8y0]2X:@TBKA*~vyZNI<n+Y:>U#pu%D[F8smsgb>7~xAihQ]Gv,`Ne8)2{$^eK>L4yKv<#-!/szwMfyl1.;7;|$;`HMR%11Zax_N9#Kc8PHG:eRWa,[b)`S?OF,|4}VI"
+local payload = chunk_1 .. chunk_2 .. chunk_3
+return init_fn(payload)

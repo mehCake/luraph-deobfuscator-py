@@ -1,4 +1,5 @@
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,41 @@ def _make_sample(raw: bytes | None = None, *, script_key: str = "SuperSecretKey"
         "return init_fn(payload)\n"
     )
     return script, payload, script_key, blob
+
+
+def _make_chunked_sample(
+    raw: bytes | None = None,
+    *,
+    script_key: str = "SuperSecretKey",
+    chunk_count: int = 3,
+) -> tuple[str, bytes, str, list[str]]:
+    payload = raw if raw is not None else bytes(range(256)) * 2
+    key_bytes = script_key.encode("utf-8")
+    chunk_count = max(1, chunk_count)
+    chunk_size = max(1, (len(payload) + chunk_count - 1) // chunk_count)
+    chunks = [payload[index : index + chunk_size] for index in range(0, len(payload), chunk_size)]
+    encoded_chunks: list[str] = []
+    for chunk in chunks:
+        masked = _apply_script_key_transform(chunk, key_bytes)
+        encoded_chunks.append(_encode_base91(masked))
+
+    chunk_lines = [f"local chunk_{index} = \"{chunk}\"" for index, chunk in enumerate(encoded_chunks)]
+    concat_expr = " .. ".join(f"chunk_{index}" for index in range(len(encoded_chunks)))
+
+    script = "\n".join(
+        [
+            "-- Luraph v14.4.1 chunked bootstrap",
+            f"local script_key = script_key or \"{script_key}\"",
+            "local init_fn = function(blob)",
+            "    return blob",
+            "end",
+            *chunk_lines,
+            f"local payload = {concat_expr}",
+            "return init_fn(payload)",
+        ]
+    )
+
+    return script, payload, script_key, encoded_chunks
 
 
 def _write_bootstrap_stub(tmp_path: Path) -> Path:
@@ -162,7 +198,7 @@ def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
     assert decoder.alphabet is not None and len(decoder.alphabet) >= 85
 
     payloads = decoder.locate_payload(script)
-    assert blob in payloads
+    assert f'"{blob}"' in payloads
 
     decoded = decoder.extract_bytecode(payloads[0])
     assert decoded == raw
@@ -172,6 +208,34 @@ def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
     assert opcode_table.get(0x2A) == "FORLOOP"
     assert opcode_table.get(0x2B) == "TFORLOOP"
     assert opcode_table.get(0x22) == "CONCAT"
+
+
+def test_v1441_handler_decodes_chunked_payload() -> None:
+    script, raw, script_key, encoded_chunks = _make_chunked_sample(chunk_count=4)
+    handler = LuraphV1441()
+
+    payload = handler.locate_payload(script)
+    assert payload is not None
+
+    meta_before = dict(payload.metadata)
+    assert meta_before.get("chunk_count") == len(encoded_chunks)
+    assert isinstance(meta_before.get("chunks"), list)
+
+    decoded = handler.extract_bytecode(payload)
+    assert decoded == raw
+
+    meta_after = payload.metadata
+    assert meta_after.get("chunk_count") == len(encoded_chunks)
+    assert "_chunks" not in meta_after
+
+    chunk_size = max(1, (len(raw) + len(encoded_chunks) - 1) // len(encoded_chunks))
+    expected_decoded = [len(raw[index : index + chunk_size]) for index in range(0, len(raw), chunk_size)]
+    assert meta_after.get("chunk_decoded_bytes") == expected_decoded
+    assert meta_after.get("chunk_lengths") == [len(chunk) for chunk in encoded_chunks]
+
+    attempts = meta_after.get("decode_attempts", [])
+    assert attempts
+    assert {entry.get("chunk_index") for entry in attempts} == set(range(len(encoded_chunks)))
 
 
 def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:
@@ -219,6 +283,7 @@ def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
         stage_output=script,
         script_key=script_key,
     )
+    ctx.detected_version = VersionDetector().info_for_name("luraph_v14_4_initv4")
 
     metadata = payload_decode_run(ctx)
 
@@ -267,6 +332,91 @@ return 'ok'"""
     assert payload_meta.get("index_xor") is True
     assert payload_meta.get("alphabet_source") == "default"
     assert ctx.report.script_key_used == EXAMPLE_SCRIPT_KEY
+
+
+def test_payload_decode_handles_chunked_script(tmp_path: Path) -> None:
+    script_body = "\n".join(["print('chunked payload!')"] * 8)
+    raw_mapping = {"bytecode": [], "constants": [], "script": script_body}
+    raw_bytes = json.dumps(raw_mapping).encode("utf-8")
+    chunk_count = 4
+    script, _, script_key, encoded_chunks = _make_chunked_sample(
+        raw=raw_bytes,
+        script_key=EXAMPLE_SCRIPT_KEY,
+        chunk_count=chunk_count,
+    )
+
+    path = tmp_path / "chunked.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=script,
+        stage_output=script,
+        script_key=script_key,
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    assert ctx.stage_output.strip() == script_body.strip()
+    payload_meta = metadata.get("handler_payload_meta", {})
+    assert payload_meta.get("chunk_count") == chunk_count
+    assert payload_meta.get("chunk_lengths") == [len(chunk) for chunk in encoded_chunks]
+    assert payload_meta.get("chunk_success_count") == chunk_count
+
+    chunk_size = max(1, (len(raw_bytes) + chunk_count - 1) // chunk_count)
+    expected_decoded = [len(raw_bytes[index : index + chunk_size]) for index in range(0, len(raw_bytes), chunk_size)]
+    assert payload_meta.get("chunk_decoded_bytes") == expected_decoded
+    encoded_lengths = metadata.get("handler_chunk_encoded_lengths") or payload_meta.get("chunk_encoded_lengths")
+    assert encoded_lengths == [len(chunk) for chunk in encoded_chunks]
+
+    assert metadata.get("handler_payload_chunks") == chunk_count
+    assert ctx.report.blob_count == chunk_count
+    total_expected = sum(expected_decoded)
+    assert ctx.report.decoded_bytes == total_expected
+    warning_summary = next(
+        (entry for entry in ctx.report.warnings if str(entry).startswith("Decoded chunk sizes (bytes):")),
+        None,
+    )
+    assert warning_summary is not None
+    for length in expected_decoded:
+        assert str(length) in warning_summary
+    assert ctx.report.script_key_used == script_key
+    assert ctx.decoded_payloads and ctx.decoded_payloads[-1].strip() == script_body.strip()
+
+
+def test_payload_decode_merges_multiple_initv4_payloads(tmp_path: Path) -> None:
+    script_body_one = "print('first chunk payload')"
+    script_body_two = "print('second chunk payload')"
+
+    raw_one = json.dumps({"constants": [], "bytecode": [], "script": script_body_one}).encode("utf-8")
+    raw_two = json.dumps({"constants": [], "bytecode": [], "script": script_body_two}).encode("utf-8")
+
+    script_one, _, script_key, _ = _make_sample(raw=raw_one, script_key=EXAMPLE_SCRIPT_KEY)
+    script_two, _, _, _ = _make_sample(raw=raw_two, script_key=EXAMPLE_SCRIPT_KEY)
+
+    combined = "\n\n".join([script_one, script_two])
+    path = tmp_path / "multi_chunks.lua"
+    path.write_text(combined, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=combined,
+        stage_output=combined,
+        script_key=EXAMPLE_SCRIPT_KEY,
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    sources = metadata.get("handler_chunk_sources", [])
+    assert isinstance(sources, list) and len([src for src in sources if isinstance(src, str) and src.strip()]) >= 2
+
+    merged = metadata.get("handler_chunk_combined_source")
+    assert isinstance(merged, str)
+    assert "first chunk payload" in merged
+    assert "second chunk payload" in merged
+
+    assert ctx.stage_output.strip() == merged.strip()
+    assert ctx.decoded_payloads and ctx.decoded_payloads[-1].strip() == merged.strip()
 
 
 def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:

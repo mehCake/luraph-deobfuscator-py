@@ -103,9 +103,47 @@ def run(ctx: "Context") -> Dict[str, Any]:
         raw_bytes = metadata.get("handler_vm_bytecode")
         if not lengths and isinstance(raw_bytes, (bytes, bytearray)):
             lengths.append(len(raw_bytes))
-        if lengths:
-            report.blob_count += len(lengths)
-            report.decoded_bytes += sum(lengths)
+
+        chunk_decoded_raw = metadata.get("handler_chunk_decoded_bytes")
+        chunk_decoded: List[int] = []
+        if isinstance(chunk_decoded_raw, list):
+            chunk_decoded = [
+                value for value in chunk_decoded_raw if isinstance(value, int) and value >= 0
+            ]
+
+        chunk_encoded_raw = metadata.get("handler_chunk_encoded_lengths")
+        chunk_encoded: List[int] = []
+        if isinstance(chunk_encoded_raw, list):
+            chunk_encoded = [
+                value for value in chunk_encoded_raw if isinstance(value, int) and value >= 0
+            ]
+
+        chunk_count = metadata.get("handler_payload_chunks")
+        if isinstance(chunk_count, int) and chunk_count > 0:
+            report.blob_count = chunk_count
+            if chunk_decoded:
+                report.decoded_bytes = sum(chunk_decoded)
+                decoded_warning = "Decoded chunk sizes (bytes): " + ", ".join(
+                    str(value) for value in chunk_decoded
+                )
+                if decoded_warning not in report.warnings:
+                    report.warnings.append(decoded_warning)
+            elif lengths:
+                report.decoded_bytes = sum(lengths)
+            elif chunk_encoded:
+                report.decoded_bytes = sum(chunk_encoded)
+        else:
+            if chunk_decoded:
+                report.blob_count = len(chunk_decoded)
+                report.decoded_bytes = sum(chunk_decoded)
+                decoded_warning = "Decoded chunk sizes (bytes): " + ", ".join(
+                    str(value) for value in chunk_decoded
+                )
+                if decoded_warning not in report.warnings:
+                    report.warnings.append(decoded_warning)
+            elif lengths:
+                report.blob_count = len(lengths)
+                report.decoded_bytes = sum(lengths)
 
         warnings = metadata.get("warnings")
         if isinstance(warnings, list):

@@ -6,7 +6,7 @@ import ast
 import math
 import operator
 import re
-from typing import Dict, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, Tuple, TYPE_CHECKING
 
 from string_decryptor import StringDecryptor
 
@@ -94,7 +94,11 @@ _ALLOWED_EXPR_CHARS = set("0123456789+-*/%.() \t\r\n")
 
 _CONST_EXPR_RE = re.compile(r"(?P<expr>(?:[-+*/%().0-9]+\s*){2,})")
 
-_ALLOWED_BINOPS = {
+Number = float | int
+BinOpEvaluator = Callable[[Number, Number], Number]
+UnOpEvaluator = Callable[[Number], Number]
+
+_ALLOWED_BINOPS: Dict[type[ast.operator], BinOpEvaluator] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -102,7 +106,7 @@ _ALLOWED_BINOPS = {
     ast.Mod: operator.mod,
 }
 
-_ALLOWED_UNOPS = {
+_ALLOWED_UNOPS: Dict[type[ast.unaryop], UnOpEvaluator] = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
@@ -130,11 +134,15 @@ def _evaluate_constant_expression(expr: str) -> str | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
             return node.value
         if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNOPS:
-            return _ALLOWED_UNOPS[type(node.op)](_eval(node.operand))
+            unary_type = type(node.op)
+            unary_fn: UnOpEvaluator = _ALLOWED_UNOPS[unary_type]
+            return unary_fn(_eval(node.operand))
         if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
+            bin_type = type(node.op)
+            bin_fn: BinOpEvaluator = _ALLOWED_BINOPS[bin_type]
             left = _eval(node.left)
             right = _eval(node.right)
-            return _ALLOWED_BINOPS[type(node.op)](left, right)
+            return bin_fn(left, right)
         raise ValueError("Unsupported expression node")
 
     try:
