@@ -375,6 +375,41 @@ def test_payload_decode_handles_chunked_script(tmp_path: Path) -> None:
     assert ctx.decoded_payloads and ctx.decoded_payloads[-1].strip() == script_body.strip()
 
 
+def test_payload_decode_merges_multiple_initv4_payloads(tmp_path: Path) -> None:
+    script_body_one = "print('first chunk payload')"
+    script_body_two = "print('second chunk payload')"
+
+    raw_one = json.dumps({"constants": [], "bytecode": [], "script": script_body_one}).encode("utf-8")
+    raw_two = json.dumps({"constants": [], "bytecode": [], "script": script_body_two}).encode("utf-8")
+
+    script_one, _, script_key, _ = _make_sample(raw=raw_one, script_key=EXAMPLE_SCRIPT_KEY)
+    script_two, _, _, _ = _make_sample(raw=raw_two, script_key=EXAMPLE_SCRIPT_KEY)
+
+    combined = "\n\n".join([script_one, script_two])
+    path = tmp_path / "multi_chunks.lua"
+    path.write_text(combined, encoding="utf-8")
+
+    ctx = Context(
+        input_path=path,
+        raw_input=combined,
+        stage_output=combined,
+        script_key=EXAMPLE_SCRIPT_KEY,
+    )
+
+    metadata = payload_decode_run(ctx)
+
+    sources = metadata.get("handler_chunk_sources", [])
+    assert isinstance(sources, list) and len([src for src in sources if isinstance(src, str) and src.strip()]) >= 2
+
+    merged = metadata.get("handler_chunk_combined_source")
+    assert isinstance(merged, str)
+    assert "first chunk payload" in merged
+    assert "second chunk payload" in merged
+
+    assert ctx.stage_output.strip() == merged.strip()
+    assert ctx.decoded_payloads and ctx.decoded_payloads[-1].strip() == merged.strip()
+
+
 def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:
     script = EXAMPLE_V1441.read_text(encoding="utf-8")
     path = tmp_path / "wrong_key.lua"

@@ -17,8 +17,11 @@ from lua_vm_simulator import LuaVMSimulator
 from variable_renamer import VariableRenamer
 
 from . import utils, versions
-from .versions import VersionHandler, PayloadInfo
+from .versions import VersionHandler, PayloadInfo, decode_constant_pool
 from .passes import Devirtualizer
+from .passes.vm_lift import VMLifter
+from .passes.vm_devirtualize import IRDevirtualizer
+from .utils_pkg import ast as lua_ast
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
 
@@ -224,9 +227,15 @@ class LuaDeobfuscator:
                         if not chunk_key:
                             chunk_key = os.environ.get("LURAPH_SCRIPT_KEY", "") or None
                         if chunk_key:
-                            chunk_parts, chunk_meta_updates = self._decode_initv4_chunks(
+                            (
+                                chunk_parts,
+                                chunk_meta_updates,
+                                chunk_analysis,
+                            ) = self._decode_initv4_chunks(
                                 text,
                                 script_key=chunk_key,
+                                handler=handler_instance,
+                                version=version,
                             )
                             if chunk_parts:
                                 combined_bytes = b"".join(chunk_parts)
@@ -245,6 +254,33 @@ class LuaDeobfuscator:
                                         for key, value in mapping_meta.items():
                                             if key not in metadata or not metadata.get(key):
                                                 metadata[key] = value
+                                if chunk_analysis:
+                                    sources = chunk_analysis.get("sources")
+                                    if sources:
+                                        metadata.setdefault(
+                                            "handler_chunk_sources",
+                                            list(sources),
+                                        )
+                                    rename_counts = chunk_analysis.get("rename_counts")
+                                    if rename_counts and "handler_chunk_rename_counts" not in metadata:
+                                        metadata["handler_chunk_rename_counts"] = list(rename_counts)
+                                    cleaned_flags = chunk_analysis.get("cleaned_chunks")
+                                    if cleaned_flags and "handler_chunk_cleaned" not in metadata:
+                                        metadata["handler_chunk_cleaned"] = list(cleaned_flags)
+                                    combined_source = chunk_analysis.get("final_source")
+                                    if combined_source:
+                                        metadata.setdefault(
+                                            "handler_chunk_combined_source",
+                                            combined_source,
+                                        )
+                                        if payload_dict is None or (
+                                            isinstance(sources, list)
+                                            and len([src for src in sources if src.strip()]) > 1
+                                        ):
+                                            payload_dict = {"script": combined_source}
+                                            metadata["script_payload"] = True
+                                            if payload_info is not None:
+                                                payload_info.data = {"script": combined_source}
                 finally:
                     if override_key:
                         payload_info.metadata.pop(override_token, None)
@@ -692,16 +728,18 @@ class LuaDeobfuscator:
         source: str,
         *,
         script_key: str,
-    ) -> Tuple[list[bytes], Dict[str, Any]]:
+        handler: VersionHandler | None = None,
+        version: VersionInfo | None = None,
+    ) -> Tuple[list[bytes], Dict[str, Any], Dict[str, Any]]:
         """Decode every initv4 payload chunk discovered in ``source``."""
 
         if not script_key:
-            return [], {}
+            return [], {}, {}
 
         try:
             from .versions.initv4 import InitV4Decoder
         except Exception:  # pragma: no cover - optional dependency
-            return [], {}
+            return [], {}, {}
 
         ctx = SimpleNamespace(
             script_key=script_key,
@@ -711,18 +749,29 @@ class LuaDeobfuscator:
             decoder = InitV4Decoder(ctx)
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.debug("initv4 decoder setup failed: %s", exc)
-            return [], {}
+            return [], {}, {}
 
         try:
             payloads = decoder.locate_payload(source)
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.debug("initv4 chunk discovery failed: %s", exc)
-            return [], {}
+            return [], {}, {}
 
         decoded_parts: list[bytes] = []
         decoded_lengths: list[int] = []
         encoded_lengths: list[int] = []
         errors: list[Dict[str, Any]] = []
+        chunk_sources: list[str] = []
+        rename_counts: list[int] = []
+        cleaned_flags: list[bool] = []
+
+        opcode_table: Dict[int, Any] = {}
+        if handler is not None:
+            try:
+                opcode_table = handler.opcode_table()
+            except Exception:  # pragma: no cover - best effort
+                opcode_table = {}
+        const_decoder = handler.const_decoder() if handler is not None else None
 
         for index, blob in enumerate(payloads):
             if not isinstance(blob, str):
@@ -740,6 +789,64 @@ class LuaDeobfuscator:
             decoded_parts.append(chunk_bytes)
             decoded_lengths.append(len(chunk_bytes))
 
+            mapping, _, _ = self._decode_payload_mapping(chunk_bytes)
+            chunk_output: str | None = None
+            if isinstance(mapping, dict):
+                script_text = mapping.get("script")
+                if isinstance(script_text, str) and script_text.strip():
+                    chunk_output = utils.strip_non_printable(script_text)
+                else:
+                    byte_values = mapping.get("bytecode") or mapping.get("code")
+                    if (
+                        handler is not None
+                        and isinstance(byte_values, list)
+                        and byte_values
+                        and all(
+                            isinstance(value, int) and 0 <= value <= 255
+                            for value in byte_values
+                        )
+                    ):
+                        consts = list(mapping.get("constants", []))
+                        if const_decoder is not None:
+                            try:
+                                consts = decode_constant_pool(const_decoder, consts)
+                            except Exception:  # pragma: no cover - defensive
+                                consts = list(mapping.get("constants", []))
+                        lifter = VMLifter()
+                        try:
+                            module = lifter.lift(
+                                bytes(byte_values),
+                                opcode_table,
+                                consts,
+                                endianness=(mapping.get("endianness") or mapping.get("endian")),
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            errors.append({
+                                "chunk_index": index,
+                                "error": str(exc),
+                            })
+                        else:
+                            devirt = IRDevirtualizer(module, consts)
+                            chunk_ast, _ = devirt.lower()
+                            chunk_output = lua_ast.to_source(chunk_ast)
+            if chunk_output:
+                cleaned = self.cleanup(chunk_output)
+                cleaned_flags.append(cleaned != chunk_output)
+                renamer = VariableRenamer()
+                renamed = renamer.rename_variables(cleaned)
+                stats = getattr(renamer, "last_stats", {})
+                renamed_count = 0
+                if isinstance(stats, dict):
+                    count_value = stats.get("replacements")
+                    if isinstance(count_value, int):
+                        renamed_count = max(count_value, 0)
+                rename_counts.append(renamed_count)
+                chunk_sources.append(renamed)
+            else:
+                cleaned_flags.append(False)
+                rename_counts.append(0)
+                chunk_sources.append("")
+
         meta: Dict[str, Any] = {}
         if decoded_parts:
             meta["chunk_count"] = len(decoded_parts)
@@ -749,7 +856,25 @@ class LuaDeobfuscator:
         if errors:
             meta["chunk_errors"] = errors
 
-        return decoded_parts, meta
+        merged_source = ""
+        if any(text.strip() for text in chunk_sources):
+            merged_source = "\n\n".join(
+                text.strip()
+                for text in chunk_sources
+                if text.strip()
+            )
+
+        analysis: Dict[str, Any] = {}
+        if chunk_sources:
+            analysis["sources"] = chunk_sources
+        if merged_source:
+            analysis["final_source"] = self._formatter.format_source(merged_source)
+        if rename_counts and any(rename_counts):
+            analysis["rename_counts"] = rename_counts
+        if cleaned_flags and any(cleaned_flags):
+            analysis["cleaned_chunks"] = cleaned_flags
+
+        return decoded_parts, meta, analysis
 
     def _vm_ir_from_mapping(self, payload: Optional[Dict[str, Any]]) -> Optional[VMIR]:
         if not payload:
