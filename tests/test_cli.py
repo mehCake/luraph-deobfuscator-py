@@ -71,9 +71,13 @@ def test_cli_emits_output_for_single_file(tmp_path):
 
     _run_cli(target, tmp_path)
 
-    output = target.with_name(f"{target.stem}_deob.lua")
-    assert output.exists()
-    assert output.read_text().strip()
+    output_lua = target.with_name(f"{target.stem}_deob.lua")
+    output_json = target.with_name(f"{target.stem}_deob.json")
+    assert output_lua.exists()
+    assert output_lua.read_text().strip()
+    assert output_json.exists()
+    data = json.loads(output_json.read_text())
+    assert data["output"].strip()
 
 
 def test_cli_accepts_directory(tmp_path):
@@ -88,10 +92,15 @@ def test_cli_accepts_directory(tmp_path):
 
     _run_cli(sample_dir, tmp_path)
 
-    outputs = list(sample_dir.glob("*_deob.lua"))
-    assert outputs, "expected deobfuscated files in directory"
-    for produced in outputs:
+    lua_outputs = sorted(sample_dir.glob("*_deob.lua"))
+    json_outputs = sorted(sample_dir.glob("*_deob.json"))
+    assert lua_outputs, "expected deobfuscated files in directory"
+    assert len(lua_outputs) == len(json_outputs)
+    for produced in lua_outputs:
         assert produced.read_text().strip()
+    for sidecar in json_outputs:
+        data = json.loads(sidecar.read_text())
+        assert data["output"].strip()
 
 
 def test_cli_smoke_complex_sample(tmp_path):
@@ -101,9 +110,13 @@ def test_cli_smoke_complex_sample(tmp_path):
 
     _run_cli(local_copy, tmp_path)
 
-    output = local_copy.with_name("complex_obfuscated_deob.lua")
-    assert output.exists()
-    assert output.stat().st_size > 0
+    output_lua = local_copy.with_name("complex_obfuscated_deob.lua")
+    output_json = local_copy.with_name("complex_obfuscated_deob.json")
+    assert output_lua.exists()
+    assert output_lua.stat().st_size > 0
+    assert output_json.exists()
+    json_data = json.loads(output_json.read_text(encoding="utf-8"))
+    assert json_data["output"].strip()
 
 
 def test_cli_reports_multi_chunk_payload(tmp_path):
@@ -122,9 +135,10 @@ def test_cli_reports_multi_chunk_payload(tmp_path):
     assert f"Decoded {expected_chunks} blobs" in stdout
 
     output_path = local_copy.with_name("complex_obfuscated_deob.json")
+    lua_sidecar = local_copy.with_name("complex_obfuscated_deob.lua")
     assert output_path.exists()
     produced = sorted(local_copy.parent.glob("complex_obfuscated_deob.*"))
-    assert produced == [output_path], "expected single CLI output artefact"
+    assert produced == [output_path, lua_sidecar], "expected JSON and Lua outputs"
 
     data = json.loads(output_path.read_text(encoding="utf-8"))
     payload_meta = (
@@ -159,6 +173,21 @@ def test_cli_supports_json_format(tmp_path):
     assert data["output"]
     assert data["version"]
     assert data["timings"]
+    lua_sidecar = target.with_name(f"{target.stem}_deob.lua")
+    assert lua_sidecar.exists()
+
+
+def test_cli_format_lua_skips_json(tmp_path):
+    source = PROJECT_ROOT / "example_obfuscated.lua"
+    target = tmp_path / source.name
+    target.write_text(source.read_text())
+
+    _run_cli(target, tmp_path, "--format", "lua")
+
+    output_lua = target.with_name(f"{target.stem}_deob.lua")
+    assert output_lua.exists()
+    output_json = target.with_name(f"{target.stem}_deob.json")
+    assert not output_json.exists()
 
 
 def test_cli_detect_only_reports_version(tmp_path):
@@ -171,6 +200,8 @@ def test_cli_detect_only_reports_version(tmp_path):
     output = target.with_name(f"{target.stem}_deob.lua")
     text = output.read_text()
     assert text.startswith("-- detected Luraph version")
+    json_sidecar = target.with_name(f"{target.stem}_deob.json")
+    assert not json_sidecar.exists()
 
 
 def test_cli_writes_artifacts(tmp_path):
@@ -192,10 +223,14 @@ def test_cli_accepts_json_inputs(tmp_path):
 
     _run_cli(source, tmp_path)
 
-    output = source.with_name(f"{source.stem}_deob.lua")
-    assert output.exists()
-    text = output.read_text()
+    output_lua = source.with_name(f"{source.stem}_deob.lua")
+    output_json = source.with_name(f"{source.stem}_deob.json")
+    assert output_lua.exists()
+    text = output_lua.read_text()
     assert "json pipeline" in text
+    assert output_json.exists()
+    data = json.loads(output_json.read_text())
+    assert "json pipeline" in data.get("output", "")
 
 
 def test_cli_dump_ir_creates_listing(tmp_path):

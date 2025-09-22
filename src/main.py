@@ -6,9 +6,9 @@ import argparse
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from . import pipeline, utils
 from .deobfuscator import LuaDeobfuscator
@@ -38,6 +38,8 @@ class _ColourFormatter(logging.Formatter):
 class WorkItem:
     source: Path
     destination: Path
+    lua_destination: Optional[Path] = None
+    json_destination: Optional[Path] = None
 
 
 @dataclass
@@ -93,9 +95,17 @@ def _gather_inputs(target: Path) -> List[Path]:
     return sorted(files)
 
 
-def _default_output_path(source: Path, fmt: str) -> Path:
-    suffix = ".json" if fmt == "json" else ".lua"
-    return source.with_name(f"{source.stem}_deob{suffix}")
+def _default_output_paths(source: Path) -> Tuple[Path, Path]:
+    base = source.with_name(f"{source.stem}_deob")
+    return base.with_suffix(".lua"), base.with_suffix(".json")
+
+
+def _normalise_output_paths(base: Path) -> Tuple[Path, Path]:
+    if base.suffix:
+        root = base.with_suffix("")
+    else:
+        root = base
+    return root.with_suffix(".lua"), root.with_suffix(".json")
 
 
 def _prepare_work_items(
@@ -108,12 +118,25 @@ def _prepare_work_items(
         raise ValueError("--out/--output can only be used with a single input file")
     for src in inputs:
         if override is None:
-            dst = _default_output_path(src, fmt)
+            lua_dst, json_dst = _default_output_paths(src)
         elif treat_override_as_dir:
-            dst = override / _default_output_path(src, fmt).name
+            base = override / f"{src.stem}_deob"
+            lua_dst, json_dst = _normalise_output_paths(base)
         else:
-            dst = override
-        yield WorkItem(src, dst)
+            lua_dst, json_dst = _normalise_output_paths(override)
+
+        destination = json_dst if fmt == "json" else lua_dst
+        json_path: Optional[Path]
+        if fmt == "lua":
+            json_path = None
+        else:
+            json_path = json_dst
+        yield WorkItem(
+            src,
+            destination,
+            lua_destination=lua_dst,
+            json_destination=json_path,
+        )
 
 
 def _artifact_dir(base: Optional[Path], source: Path, iteration: int) -> Optional[Path]:
@@ -148,6 +171,36 @@ def _format_detection(ctx: pipeline.Context, fmt: str) -> str:
     )
 
 
+def _build_json_payload(
+    ctx: pipeline.Context, timings: Sequence[tuple[str, float]], source: Path
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "input": str(source),
+        "version": _serialise_version(ctx.detected_version),
+        "passes": ctx.pass_metadata,
+        "timings": [{"name": name, "duration": duration} for name, duration in timings],
+        "iterations": ctx.iteration + 1,
+        "output": ctx.output or ctx.stage_output,
+    }
+    if ctx.decoded_payloads:
+        payload["decoded_payloads"] = list(ctx.decoded_payloads)
+    if ctx.vm_metadata:
+        payload["vm_metadata"] = utils.serialise_metadata(ctx.vm_metadata)
+    if getattr(ctx, "result", None):
+        payload.update(ctx.result)
+    report = getattr(ctx, "report", None)
+    if report is not None and ctx.options.get("report", True):
+        payload["report"] = asdict(report)
+    return payload
+
+
+def _serialise_pipeline_state(
+    ctx: pipeline.Context, timings: Sequence[tuple[str, float]], source: Path
+) -> str:
+    payload = _build_json_payload(ctx, timings, source)
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def _format_pipeline_output(
     ctx: pipeline.Context,
     timings: Sequence[tuple[str, float]],
@@ -155,23 +208,7 @@ def _format_pipeline_output(
     source: Path,
 ) -> str:
     if fmt == "json":
-        payload = {
-            "input": str(source),
-            "version": _serialise_version(ctx.detected_version),
-            "passes": ctx.pass_metadata,
-            "timings": [
-                {"name": name, "duration": duration} for name, duration in timings
-            ],
-            "iterations": ctx.iteration + 1,
-            "output": ctx.output or ctx.stage_output,
-        }
-        if ctx.decoded_payloads:
-            payload["decoded_payloads"] = ctx.decoded_payloads
-        if ctx.vm_metadata:
-            payload["vm_metadata"] = utils.serialise_metadata(ctx.vm_metadata)
-        if getattr(ctx, "result", None):
-            payload.update(ctx.result)
-        return json.dumps(payload, indent=2, sort_keys=True)
+        return _serialise_pipeline_state(ctx, timings, source)
     return ctx.output or ctx.stage_output or ctx.raw_input
 
 
@@ -226,7 +263,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("path", nargs="?", help="input file or directory (fallback)")
     parser.add_argument("-o", "--out", "--output", dest="output", help="output file path")
-    parser.add_argument("--format", choices=("lua", "json"), default="lua", help="output format")
+    parser.add_argument(
+        "--format",
+        choices=("lua", "json", "both"),
+        default="both",
+        help="output format (lua/json/both)",
+    )
     parser.add_argument("--max-iterations", type=int, default=1, help="run the pipeline up to N times")
     parser.add_argument("--skip-passes", help="comma separated list of passes to skip")
     parser.add_argument("--only-passes", help="comma separated list of passes to run exclusively")
@@ -346,6 +388,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return WorkResult(item, False, error="unable to read input file")
 
         bootstrapper_path = args.bootstrapper_path
+        render_target = item.lua_destination or item.destination
+        if render_target is None:
+            render_target = item.destination
         deob = LuaDeobfuscator(
             vm_trace=args.vm_trace,
             script_key=args.script_key,
@@ -386,7 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {
                         "detect_only": args.detect_only,
                         "format": args.format,
-                        "render_output": str(item.destination),
+                        "render_output": str(render_target),
                         "report": args.report,
                     }
                 )
@@ -424,13 +469,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return WorkResult(item, False, error="pipeline did not produce output")
 
         report = final_ctx.report if final_ctx else None
+        wants_json_output = (
+            not args.detect_only and item.json_destination is not None
+        )
         if (
-            not args.detect_only
-            and args.format == "json"
+            wants_json_output
             and report is not None
             and final_ctx.options.get("report", True)
         ):
-            final_ctx.result["report"] = dict(report.__dict__)
+            final_ctx.result["report"] = asdict(report)
+        else:
+            final_ctx.result.pop("report", None)
 
         if args.detect_only:
             output_text = _format_detection(final_ctx, args.format)
@@ -439,6 +488,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if not utils.safe_write_file(str(item.destination), output_text):
             return WorkResult(item, False, error="failed to write output")
+
+        if wants_json_output and item.json_destination is not None:
+            json_path = item.json_destination
+            json_text = _serialise_pipeline_state(final_ctx, final_timings, item.source)
+            if json_path != item.destination:
+                if not utils.safe_write_file(str(json_path), json_text):
+                    return WorkResult(item, False, error="failed to write JSON report")
 
         if (
             not args.detect_only

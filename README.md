@@ -39,8 +39,10 @@ pip install -r requirements.txt  # installs networkx, sympy, and test tools
 
 The modern CLI drives the pass-based pipeline and emits a timing summary for
 every processed file.  Inputs can be provided either positionally or with the
-`--in` flag.  Outputs default to `<name>_deob.lua` (or `.json` when
-`--format json` is requested).
+`--in` flag.  Outputs default to `<name>_deob.lua` *and* `<name>_deob.json`,
+providing both the cleaned Lua script and a merged JSON report.  Use
+`--format lua` to suppress the JSON sidecar or `--format json` to route the
+report to the primary output path while still emitting the Lua file.
 
 ```bash
 # basic invocation with positional argument
@@ -58,7 +60,7 @@ Frequently used flags:
 | Flag | Description |
 | --- | --- |
 | `-o/--out/--output` | Explicit output path (only valid for a single input file) |
-| `--format {lua,json}` | Choose Lua source or a JSON metadata bundle |
+| `--format {lua,json,both}` | Select Lua-only output, JSON-focused output, or both (default) |
 | `--max-iterations N` | Re-run the pipeline until convergence or the limit is reached |
 | `--skip-passes` / `--only-passes` | Comma separated pass names to disable or exclusively enable |
 | `--profile` | Print a timing table for the executed passes |
@@ -86,7 +88,8 @@ render          0.005s
 ```
 
 JSON mode (`--format json`) writes the rendered Lua alongside pass metadata,
-detected version details, and the per-pass timing information shown above.
+detected version details, and the per-pass timing information shown above while
+keeping the formatted Lua script next to the report for inspection.
 Supplying `--write-artifacts DIR` produces files such as `preprocess.lua` or
 `vm_devirtualize.lua` for each processed input, which greatly simplifies
 debugging new samples.
