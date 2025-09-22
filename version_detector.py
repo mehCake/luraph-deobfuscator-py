@@ -18,6 +18,11 @@ _INITV4_SCRIPT_KEY_RE = re.compile(
     r"\bscript_key\s*=\s*(?:script_key\s*or\s*)?(?:getgenv\(\)\.script_key|['\"]([^'\"]*)['\"])",
     re.IGNORECASE,
 )
+_INITV4_ALPHABET_CHARS = re.escape(
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    "!#$%&()*+,-./:;<=>?@[]^_`{|}~"
+)
+
 _INITV4_BLOB_RE = re.compile(r"s8W-[!-~]{64,}")
 _INITV4_JSON_BLOB_RE = re.compile(r"\[\s*['\"](s8W-[!-~]{128,})['\"]", re.IGNORECASE)
 _INITV4_ALPHABET_RE = re.compile(
@@ -25,9 +30,28 @@ _INITV4_ALPHABET_RE = re.compile(
     re.IGNORECASE,
 )
 _INITV4_JSON_ARRAY_KEY_RE = re.compile(
-    r"\"(?:bytecode|payload|chunks)\"\s*:\s*\[[^\]]*\"s8W-",
+    rf"\"(?:bytecode|payload|chunks)\"\s*:\s*\[[^\]]*\"[{_INITV4_ALPHABET_CHARS}]{{80,}}\"",
     re.IGNORECASE,
 )
+_INITV4_QUOTED_CHUNK_RE = re.compile(rf'(["\'])([{_INITV4_ALPHABET_CHARS}]{{80,}})\1')
+_INITV4_LONG_BLOB_RE = re.compile(rf"[{_INITV4_ALPHABET_CHARS}]{{160,}}")
+_INITV4_CHUNK_ASSIGN_RE = re.compile(r"local\s+chunk_\d+\s*=")
+_INITV4_CHUNK_CONCAT_RE = re.compile(r"chunk_\d+\s*\.\.\s*chunk_\d+")
+_BASE64_CHARSET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
+
+_VERSION_BANNER_RE = re.compile(
+    r"(?:lura\.ph|Luraph)\s*(?:Obfuscator\s*)?(?:v(?:ersion)?\s*)?(\d+(?:\.\d+)*)",
+    re.IGNORECASE,
+)
+
+_BANNER_VERSION_MAP = {
+    "14.4.1": "luraph_v14_4_initv4",
+    "14.4": "luraph_v14_4_initv4",
+    "14.2": "luraph_v14_2_json",
+    "14.1": "v14.1",
+    "14.0.2": "v14.0.2",
+    "14.0": "v14.0.2",
+}
 
 @dataclass(frozen=True)
 class VersionInfo:
@@ -64,6 +88,10 @@ class VersionDetector:
         self._all_features: FrozenSet[str] = self._collect_all_features()
 
     def detect(self, content: str, *, from_json: bool = False) -> VersionInfo:
+        banner_version = _resolve_banner_version(content)
+        if banner_version:
+            return self.info_for_name(banner_version)
+
         if from_json and _JSON_INIT_RE.search(content) and _JSON_SCRIPT_KEY_RE.search(content):
             return self.info_for_name("luraph_v14_2_json")
 
@@ -183,29 +211,63 @@ def _looks_like_initv4(content: str) -> bool:
     if not _INITV4_SCRIPT_KEY_RE.search(content):
         return False
 
-    blob_matches = list(_INITV4_BLOB_RE.finditer(content))
-    if not blob_matches:
-        return False
-
-    longest_blob = max(len(match.group(0)) for match in blob_matches)
-    json_blob_length = max(
-        (len(match.group(1)) for match in _INITV4_JSON_BLOB_RE.finditer(content)),
-        default=0,
-    )
-
     if _INITV4_ALPHABET_RE.search(content):
+        return True
+
+    if _INITV4_BLOB_RE.search(content):
+        return True
+
+    if _INITV4_JSON_BLOB_RE.search(content):
         return True
 
     if _INITV4_JSON_ARRAY_KEY_RE.search(content):
         return True
 
-    if json_blob_length >= 512:
+    chunk_match = _INITV4_QUOTED_CHUNK_RE.search(content)
+    if chunk_match:
+        inner = chunk_match.group(2)
+        if any(char not in _BASE64_CHARSET for char in inner):
+            return True
+        if _INITV4_CHUNK_ASSIGN_RE.search(content) and _INITV4_CHUNK_CONCAT_RE.search(content):
+            return True
+
+    long_match = _INITV4_LONG_BLOB_RE.search(content)
+    if long_match and any(char not in _BASE64_CHARSET for char in long_match.group(0)):
         return True
 
-    if longest_blob >= 160:
+    if _INITV4_CHUNK_ASSIGN_RE.search(content) and _INITV4_CHUNK_CONCAT_RE.search(content):
         return True
 
     return False
+
+
+def _resolve_banner_version(content: str) -> str | None:
+    matches = list(_VERSION_BANNER_RE.findall(content))
+    if not matches:
+        return None
+    for raw in matches:
+        mapped = _map_banner_version(raw)
+        if mapped:
+            return mapped
+    return None
+
+
+def _map_banner_version(raw: str) -> str | None:
+    candidate = raw.strip()
+    if not candidate:
+        return None
+    parts = candidate.split('.')
+    while parts:
+        key = '.'.join(parts)
+        mapped = _BANNER_VERSION_MAP.get(key)
+        if mapped:
+            return mapped
+        # drop trailing zero segments to allow 14.4.0 -> 14.4
+        if parts[-1] == '0':
+            parts = parts[:-1]
+            continue
+        parts = parts[:-1]
+    return _BANNER_VERSION_MAP.get(candidate)
 
 
 __all__ = ["VersionDetector", "VersionInfo"]

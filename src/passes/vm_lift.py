@@ -103,6 +103,15 @@ class VMLifter:
                     register_types,
                     current_types,
                 )
+            ir.origin.update(
+                {
+                    "offset": start,
+                    "size": offset - start,
+                }
+            )
+            if operand_bytes:
+                ir.origin.setdefault("operands", list(operand_bytes))
+            ir.origin.setdefault("opcode_byte", opcode)
 
             instructions.append(
                 _DecodedInstruction(

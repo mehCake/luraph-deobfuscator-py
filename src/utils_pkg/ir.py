@@ -15,6 +15,7 @@ class IRInstruction:
     args: Dict[str, Any] = field(default_factory=dict)
     dest: int | None = None
     sources: List[int] = field(default_factory=list)
+    origin: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

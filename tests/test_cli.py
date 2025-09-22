@@ -16,7 +16,7 @@ V1441_SOURCE = PROJECT_ROOT / "examples" / "v1441_hello.lua"
 V1441_GOLDEN = GOLDEN_DIR / "v1441_hello.lua.out"
 INITV4_STUB = PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua"
 COMPLEX_SOURCE = PROJECT_ROOT / "examples" / "complex_obfuscated"
-SCRIPT_KEY = "qjp0cnxufsolyf599g6zgs"
+SCRIPT_KEY = "x5elqj5j4ibv9z3329g7b"
 
 
 def _prepare_v1441_source(
@@ -71,9 +71,13 @@ def test_cli_emits_output_for_single_file(tmp_path):
 
     _run_cli(target, tmp_path)
 
-    output = target.with_name(f"{target.stem}_deob.lua")
-    assert output.exists()
-    assert output.read_text().strip()
+    output_lua = target.with_name(f"{target.stem}_deob.lua")
+    output_json = target.with_name(f"{target.stem}_deob.json")
+    assert output_lua.exists()
+    assert output_lua.read_text().strip()
+    assert output_json.exists()
+    data = json.loads(output_json.read_text())
+    assert data["output"].strip()
 
 
 def test_cli_accepts_directory(tmp_path):
@@ -88,10 +92,15 @@ def test_cli_accepts_directory(tmp_path):
 
     _run_cli(sample_dir, tmp_path)
 
-    outputs = list(sample_dir.glob("*_deob.lua"))
-    assert outputs, "expected deobfuscated files in directory"
-    for produced in outputs:
+    lua_outputs = sorted(sample_dir.glob("*_deob.lua"))
+    json_outputs = sorted(sample_dir.glob("*_deob.json"))
+    assert lua_outputs, "expected deobfuscated files in directory"
+    assert len(lua_outputs) == len(json_outputs)
+    for produced in lua_outputs:
         assert produced.read_text().strip()
+    for sidecar in json_outputs:
+        data = json.loads(sidecar.read_text())
+        assert data["output"].strip()
 
 
 def test_cli_smoke_complex_sample(tmp_path):
@@ -101,9 +110,55 @@ def test_cli_smoke_complex_sample(tmp_path):
 
     _run_cli(local_copy, tmp_path)
 
-    output = local_copy.with_name("complex_obfuscated_deob.lua")
-    assert output.exists()
-    assert output.stat().st_size > 0
+    output_lua = local_copy.with_name("complex_obfuscated_deob.lua")
+    output_json = local_copy.with_name("complex_obfuscated_deob.json")
+    assert output_lua.exists()
+    assert output_lua.stat().st_size > 0
+    assert output_json.exists()
+    json_data = json.loads(output_json.read_text(encoding="utf-8"))
+    assert json_data["output"].strip()
+
+
+def test_cli_reports_multi_chunk_payload(tmp_path):
+    complex_source = PROJECT_ROOT / "examples" / "complex_obfuscated"
+    source_text = complex_source.read_text(encoding="utf-8")
+    expected_chunks = sum(
+        1 for line in source_text.splitlines() if line.strip().startswith("local chunk_")
+    )
+    assert expected_chunks >= 2, "fixture should contain multiple payload chunks"
+
+    local_copy = tmp_path / "complex_obfuscated"
+    local_copy.write_text(source_text, encoding="utf-8")
+
+    proc = _run_cli(local_copy, tmp_path, "--format", "json")
+    stdout = proc.stdout.decode("utf-8")
+    assert f"Decoded {expected_chunks} blobs" in stdout
+
+    output_path = local_copy.with_name("complex_obfuscated_deob.json")
+    lua_sidecar = local_copy.with_name("complex_obfuscated_deob.lua")
+    assert output_path.exists()
+    produced = sorted(local_copy.parent.glob("complex_obfuscated_deob.*"))
+    assert produced == [output_path, lua_sidecar], "expected JSON and Lua outputs"
+
+    data = json.loads(output_path.read_text(encoding="utf-8"))
+    payload_meta = (
+        data.get("passes", {})
+        .get("payload_decode", {})
+        .get("handler_payload_meta", {})
+    )
+
+    assert payload_meta.get("chunk_count") == expected_chunks
+    assert payload_meta.get("chunk_success_count") == expected_chunks
+
+    decoded_lengths = payload_meta.get("chunk_decoded_bytes") or []
+    report = data.get("report", {})
+    assert report.get("blob_count") == expected_chunks
+    if decoded_lengths:
+        assert report.get("decoded_bytes") == sum(decoded_lengths)
+
+    output_text = data.get("output", "")
+    for marker in ("Aimbot", "ESP", "KillAll"):
+        assert marker in output_text, f"expected {marker} in merged output"
 
 
 def test_cli_supports_json_format(tmp_path):
@@ -118,6 +173,21 @@ def test_cli_supports_json_format(tmp_path):
     assert data["output"]
     assert data["version"]
     assert data["timings"]
+    lua_sidecar = target.with_name(f"{target.stem}_deob.lua")
+    assert lua_sidecar.exists()
+
+
+def test_cli_format_lua_skips_json(tmp_path):
+    source = PROJECT_ROOT / "example_obfuscated.lua"
+    target = tmp_path / source.name
+    target.write_text(source.read_text())
+
+    _run_cli(target, tmp_path, "--format", "lua")
+
+    output_lua = target.with_name(f"{target.stem}_deob.lua")
+    assert output_lua.exists()
+    output_json = target.with_name(f"{target.stem}_deob.json")
+    assert not output_json.exists()
 
 
 def test_cli_detect_only_reports_version(tmp_path):
@@ -130,6 +200,8 @@ def test_cli_detect_only_reports_version(tmp_path):
     output = target.with_name(f"{target.stem}_deob.lua")
     text = output.read_text()
     assert text.startswith("-- detected Luraph version")
+    json_sidecar = target.with_name(f"{target.stem}_deob.json")
+    assert not json_sidecar.exists()
 
 
 def test_cli_writes_artifacts(tmp_path):
@@ -151,10 +223,14 @@ def test_cli_accepts_json_inputs(tmp_path):
 
     _run_cli(source, tmp_path)
 
-    output = source.with_name(f"{source.stem}_deob.lua")
-    assert output.exists()
-    text = output.read_text()
+    output_lua = source.with_name(f"{source.stem}_deob.lua")
+    output_json = source.with_name(f"{source.stem}_deob.json")
+    assert output_lua.exists()
+    text = output_lua.read_text()
     assert "json pipeline" in text
+    assert output_json.exists()
+    data = json.loads(output_json.read_text())
+    assert "json pipeline" in data.get("output", "")
 
 
 def test_cli_dump_ir_creates_listing(tmp_path):
@@ -181,10 +257,22 @@ def test_cli_v1441_script_key_only(tmp_path):
     decoded = [entry.strip() for entry in data.get("decoded_payloads", [])]
     assert any("print(" in entry for entry in decoded)
 
+    vm_meta = data.get("vm_metadata")
+    assert isinstance(vm_meta, dict)
+    assert "traps" in vm_meta
+    lifter_meta = vm_meta.get("lifter")
+    if lifter_meta is not None:
+        assert isinstance(lifter_meta, dict)
+    devirt_meta = vm_meta.get("devirtualizer")
+    if devirt_meta is not None:
+        assert isinstance(devirt_meta, dict)
+
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("alphabet_source") == "default"
-    assert "bootstrapper" not in payload_meta
+    bootstrap_meta = payload_meta.get("bootstrapper")
+    assert isinstance(bootstrap_meta, dict)
+    assert "path" in bootstrap_meta
 
 
 def test_cli_report_metrics_v1441(tmp_path):
