@@ -1,0 +1,17 @@
+-- Luraph v14.1 mock bootstrap
+local header = [[return function()
+    local static_content = 'Luarmor::static_content'
+    local superflow_bytecode_ext0 = [[superflow_bytecode_ext0 marker]]
+    local function loader()
+        debug.setupvalue(loader, 1, static_content)
+        debug.getupvalue(loader, 1)
+        return superflow_bytecode_ext0
+    end
+    return loader
+end]]
+
+local function fake_loader()
+    return header
+end
+
+return fake_loader()

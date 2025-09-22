@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+from dataclasses import dataclass
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -31,6 +32,9 @@ _SCRIPT_KEY_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 _HIGH_ENTROPY_RE = re.compile(rf"[{re.escape(_INITV4_ALPHABET)}]{{200,}}")
+_CHUNK_STRING_RE = re.compile(
+    rf'(["\'])([{re.escape(_INITV4_ALPHABET)}]{{40,}})\1'
+)
 _JSON_BLOCKS = (
     re.compile(r"\[\[(\s*\{.*?\})\]\]", re.DOTALL),
     re.compile(r'"(\{\s*\"constants\".*?\})"', re.DOTALL),
@@ -171,6 +175,23 @@ def _score_decoded_bytes(data: bytes) -> float:
     return max(0.0, min(score, 1.0))
 
 
+@dataclass
+class _DecodeAttempt:
+    method: str
+    alphabet_source: str
+    data: bytes
+    size: int
+    score: float
+
+    def as_metadata(self) -> Dict[str, object]:
+        return {
+            "method": self.method,
+            "size": self.size,
+            "score": round(float(self.score), 4),
+            "alphabet_source": self.alphabet_source,
+        }
+
+
 def _decode_attempts(
     blob: str,
     script_key: str,
@@ -184,7 +205,7 @@ def _decode_attempts(
         return b"", {"decode_method": "empty", "decode_attempts": []}
 
     key_bytes = script_key.encode("utf-8") if script_key else b""
-    attempts: List[Dict[str, object]] = []
+    attempts: List[_DecodeAttempt] = []
     errors: Dict[str, str] = {}
 
     def _record(
@@ -197,13 +218,13 @@ def _decode_attempts(
             return
         decoded = _apply_script_key_transform(raw, key_bytes)
         attempts.append(
-            {
-                "method": method,
-                "alphabet_source": alphabet_source,
-                "data": decoded,
-                "size": len(decoded),
-                "score": _score_decoded_bytes(decoded),
-            }
+            _DecodeAttempt(
+                method=method,
+                alphabet_source=alphabet_source,
+                data=decoded,
+                size=len(decoded),
+                score=_score_decoded_bytes(decoded),
+            )
         )
 
     prefer_base91 = any(ch not in _BASE64_CHARSET for ch in cleaned) if cleaned else False
@@ -263,39 +284,31 @@ def _decode_attempts(
 
     if forced_base91:
         for entry in attempts:
-            if entry["method"] == "base91":
-                entry["score"] = max(0.0, entry["score"] - 0.05)
+            if entry.method == "base91":
+                entry.score = max(0.0, entry.score - 0.05)
 
-    attempts.sort(key=lambda entry: (entry["score"], entry["size"]), reverse=True)
+    attempts.sort(key=lambda entry: (entry.score, entry.size), reverse=True)
     best = attempts[0]
-    base91_present = any(entry["method"] == "base91" for entry in attempts)
+    base91_present = any(entry.method == "base91" for entry in attempts)
 
     metadata: Dict[str, object] = {
-        "decode_method": best["method"],
-        "decode_score": round(float(best["score"]), 4),
-        "decode_attempts": [
-            {
-                "method": entry["method"],
-                "size": entry["size"],
-                "score": round(float(entry["score"]), 4),
-                "alphabet_source": entry.get("alphabet_source", "n/a"),
-            }
-            for entry in attempts
-        ],
+        "decode_method": best.method,
+        "decode_score": round(float(best.score), 4),
+        "decode_attempts": [entry.as_metadata() for entry in attempts],
         "script_key_length": len(key_bytes),
         "index_xor": True,
-        "alphabet_source": best.get("alphabet_source", "n/a"),
+        "alphabet_source": best.alphabet_source,
     }
-    if best["score"] < 0.25:
+    if best.score < 0.25:
         metadata["low_confidence"] = True
-    if base91_present and best["method"] != "base91":
+    if base91_present and best.method != "base91":
         metadata["fallback_used"] = True
     if forced_base91 and base91_present:
         metadata.setdefault("base91_forced", True)
     if errors:
         metadata["decode_errors"] = errors
 
-    return best["data"], metadata
+    return best.data, metadata
 
 
 def decode_blob(
@@ -365,7 +378,19 @@ def _locate_json_block(text: str, *, start: int) -> Tuple[str, int, int, Dict[st
     return None
 
 
-def _locate_base64_blob(text: str, *, start: int) -> Tuple[str, int, int] | None:
+def _locate_payload_chunks(text: str, *, start: int) -> List[Tuple[str, int, int]]:
+    primary: List[Tuple[str, int, int]] = []
+    secondary: List[Tuple[str, int, int]] = []
+    for match in _CHUNK_STRING_RE.finditer(text):
+        chunk = match.group(2)
+        begin, end = match.span(2)
+        if begin >= start:
+            primary.append((chunk, begin, end))
+        else:
+            secondary.append((chunk, begin, end))
+    if primary or secondary:
+        return primary + secondary
+
     best: Tuple[str, int, int] | None = None
     for match in _HIGH_ENTROPY_RE.finditer(text, pos=start):
         blob = match.group(0)
@@ -373,15 +398,15 @@ def _locate_base64_blob(text: str, *, start: int) -> Tuple[str, int, int] | None
         if best is None or len(blob) > len(best[0]):
             best = (blob, span[0], span[1])
     if best:
-        return best
-    # Fallback to earlier blobs if none appeared after ``start``
+        return [best]
+
     if start:
         for match in _HIGH_ENTROPY_RE.finditer(text):
             blob = match.group(0)
             span = match.span(0)
             if best is None or len(blob) > len(best[0]):
                 best = (blob, span[0], span[1])
-    return best
+    return [best] if best else []
 
 
 _BASE_OPCODE_TABLE: Dict[int, OpSpec] = dict(LuraphV142JSON().opcode_table())
@@ -490,14 +515,24 @@ class LuraphV1441(VersionHandler):
             meta["format"] = "json"
             return PayloadInfo(blob, begin, end, data=data, metadata=meta)
 
-        base64_blob = _locate_base64_blob(text, start=start)
-        if base64_blob is None:
+        chunk_entries = _locate_payload_chunks(text, start=start)
+        if not chunk_entries:
             return None
 
-        blob, begin, end = base64_blob
+        chunks = [entry[0] for entry in chunk_entries]
+        begin = chunk_entries[0][1]
+        end = chunk_entries[-1][2]
         meta = dict(base_meta)
         meta.setdefault("format", "base64")
-        return PayloadInfo(blob, begin, end, metadata=meta)
+        if chunks:
+            meta["_chunks"] = list(chunks)
+            meta["chunk_count"] = len(chunks)
+            meta["chunks"] = [
+                {"offset": entry[1], "end": entry[2], "length": len(chunks[index])}
+                for index, entry in enumerate(chunk_entries)
+            ]
+        payload_text = chunks[0] if chunks else ""
+        return PayloadInfo(payload_text, begin, end, metadata=meta)
 
     def extract_bytecode(self, payload: PayloadInfo) -> bytes:
         metadata = payload.metadata or {}
@@ -528,11 +563,111 @@ class LuraphV1441(VersionHandler):
         if alphabet:
             metadata.setdefault("alphabet_length", len(alphabet))
 
-        raw, decode_meta = decode_blob_with_metadata(
-            payload.text,
-            script_key,
-            alphabet=alphabet,
-        )
+        chunk_texts_raw = metadata.pop("_chunks", None)
+        chunk_texts: List[str] | None = None
+        if isinstance(chunk_texts_raw, (list, tuple)):
+            filtered: List[str] = []
+            for entry in chunk_texts_raw:
+                if isinstance(entry, str) and entry:
+                    filtered.append(entry)
+            if filtered:
+                chunk_texts = filtered
+
+        if chunk_texts:
+            decoded_parts: List[bytes] = []
+            chunk_methods: List[str] = []
+            chunk_alphabets: List[str] = []
+            chunk_attempts: List[Dict[str, object]] = []
+            chunk_meta_details: List[Dict[str, object]] = []
+            chunk_decoded_bytes: List[int] = []
+            chunk_encoded_lengths = [len(chunk) for chunk in chunk_texts]
+
+            for index, chunk in enumerate(chunk_texts):
+                part, part_meta = decode_blob_with_metadata(
+                    chunk,
+                    script_key,
+                    alphabet=alphabet,
+                )
+                decoded_parts.append(part)
+                chunk_decoded_bytes.append(len(part))
+                chunk_methods.append(str(part_meta.get("decode_method", "")))
+                chunk_alphabets.append(str(part_meta.get("alphabet_source", "")))
+
+                attempts = part_meta.get("decode_attempts", [])
+                if isinstance(attempts, list):
+                    for entry in attempts:
+                        attempt_entry = dict(entry)
+                        attempt_entry["chunk_index"] = index
+                        chunk_attempts.append(attempt_entry)
+
+                sanitised = {
+                    key: value
+                    for key, value in part_meta.items()
+                    if key not in {"decode_attempts"}
+                }
+                sanitised["chunk_index"] = index
+                chunk_meta_details.append(sanitised)
+
+            raw = b"".join(decoded_parts)
+
+            method_set = {method for method in chunk_methods if method}
+            if method_set:
+                if len(method_set) == 1:
+                    decode_method = next(iter(method_set))
+                else:
+                    decode_method = "mixed"
+            else:
+                decode_method = "unknown"
+
+            alphabet_set = {source for source in chunk_alphabets if source}
+            if alphabet_set:
+                if len(alphabet_set) == 1:
+                    alphabet_source = next(iter(alphabet_set))
+                else:
+                    alphabet_source = "mixed"
+            else:
+                alphabet_source = "n/a"
+
+            decode_meta: Dict[str, object] = {
+                "decode_method": decode_method,
+                "alphabet_source": alphabet_source,
+                "chunk_count": len(chunk_texts),
+                "chunk_lengths": chunk_encoded_lengths,
+                "chunk_decoded_bytes": chunk_decoded_bytes,
+                "chunk_methods": chunk_methods,
+                "chunk_alphabet_sources": chunk_alphabets,
+                "chunk_meta": chunk_meta_details,
+                "index_xor": any(
+                    bool(meta.get("index_xor")) for meta in chunk_meta_details
+                ),
+                "script_key_length": len(script_key),
+            }
+            if chunk_attempts:
+                decode_meta["decode_attempts"] = chunk_attempts
+
+            aggregated_errors: List[Dict[str, object]] = []
+            for meta in chunk_meta_details:
+                errors = meta.get("decode_errors")
+                if errors:
+                    aggregated_errors.append(
+                        {
+                            "chunk_index": meta.get("chunk_index"),
+                            "errors": errors,
+                        }
+                    )
+            if aggregated_errors:
+                decode_meta["decode_errors"] = aggregated_errors
+
+            for flag in ("low_confidence", "fallback_used", "base91_forced"):
+                if any(meta.get(flag) for meta in chunk_meta_details):
+                    decode_meta[flag] = True
+
+        else:
+            raw, decode_meta = decode_blob_with_metadata(
+                payload.text,
+                script_key,
+                alphabet=alphabet,
+            )
         metadata["decoded_bytes"] = len(raw)
         metadata.update({key: value for key, value in decode_meta.items() if key != "decode_attempts"})
         if decode_meta.get("decode_attempts"):

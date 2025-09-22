@@ -388,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "report": args.report,
                     }
                 )
+                ctx.options.setdefault("payload_decode_max_iterations", iterations)
                 if bootstrapper_path:
                     ctx.options.setdefault("bootstrapper", bootstrapper_path)
                 if args.step_limit is not None:

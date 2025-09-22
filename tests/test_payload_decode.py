@@ -35,3 +35,23 @@ def test_payload_decode_sets_vm_fields(tmp_path, caplog):
     assert metadata["handler_payload_bytes"] == 3
     assert metadata["handler_const_count"] == 1
     assert "luraph_v14_2_json payload extracted" in caplog.text
+
+
+def test_payload_decode_loadstring_fallback(tmp_path):
+    inner = "local function hi()\n    print(\"hello\")\nend\nreturn hi()\n"
+    payload = base64.b64encode(inner.encode("utf-8")).decode("ascii")
+    script = f"return loadstring(\"{payload}\")()"
+
+    path = tmp_path / "inline.lua"
+    path.write_text(script, encoding="utf-8")
+
+    ctx = Context(input_path=path, raw_input=script, stage_output=script)
+
+    metadata = payload_decode_run(ctx)
+
+    assert "loadstring" not in ctx.stage_output
+    assert "local function hi()" in ctx.stage_output
+    fallback = metadata.get("fallback_inline")
+    assert fallback is not None
+    load_meta = fallback.get("loadstrings") if isinstance(fallback, dict) else None
+    assert load_meta and load_meta.get("decoded") == 1
