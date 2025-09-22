@@ -6,7 +6,7 @@ from src.report import DeobReport
 def test_report_to_text_includes_expected_sections():
     report = DeobReport(
         version_detected="luraph_v14_4_initv4",
-        script_key_used="ncbmxnbs6wrpkpaitt6dwj",
+        script_key_used="qjp0cnxufsolyf599g6zgs",
         bootstrapper_used="examples/initv4.lua",
         blob_count=3,
         decoded_bytes=4096,
@@ -25,7 +25,7 @@ def test_report_to_text_includes_expected_sections():
     expected = textwrap.dedent(
         """
         Detected version: luraph_v14_4_initv4
-        Script key: ncbmxn... (len=22)
+        Script key: qjp0cn... (len=22)
         Bootstrapper: examples/initv4.lua
         Decoded 3 blobs, total 4096 bytes
         Opcode counts:
@@ -65,5 +65,6 @@ def test_report_to_text_handles_missing_optional_fields():
 
     assert "Script key" not in "\n".join(rendered)
     assert "Bootstrapper" not in "\n".join(rendered)
+    assert "Unknown opcodes: none" in rendered
     assert rendered[0] == "Detected version: luraph_v14_4_initv4"
     assert rendered[-1] == "Final output length: 0 chars"

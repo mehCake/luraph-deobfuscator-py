@@ -1,7 +1,14 @@
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+from src.versions.luraph_v14_4_1 import (
+    _apply_script_key_transform,
+    _encode_base91,
+    decode_blob,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN_DIR = PROJECT_ROOT / "tests" / "golden"
@@ -9,11 +16,29 @@ V1441_SOURCE = PROJECT_ROOT / "examples" / "v1441_hello.lua"
 V1441_GOLDEN = GOLDEN_DIR / "v1441_hello.lua.out"
 INITV4_STUB = PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua"
 COMPLEX_SOURCE = PROJECT_ROOT / "examples" / "complex_obfuscated"
-SCRIPT_KEY = "ncbmxnbs6wrpkpaitt6dwj"
+SCRIPT_KEY = "qjp0cnxufsolyf599g6zgs"
 
 
-def _prepare_v1441_source(tmp_path: Path, *, literal_key: bool = False) -> Path:
+def _prepare_v1441_source(
+    tmp_path: Path, *, literal_key: bool = False, strip_script: bool = False
+) -> Path:
     text = V1441_SOURCE.read_text(encoding="utf-8")
+    if strip_script:
+        marker = 'local payload = "'
+        if marker in text:
+            blob = text.split(marker, 1)[1].split('"', 1)[0]
+            raw = decode_blob(blob, SCRIPT_KEY)
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict) and data.pop("script", None) is not None:
+                serialised = json.dumps(data, separators=(",", ":"))
+                masked = _apply_script_key_transform(
+                    serialised.encode("utf-8"), SCRIPT_KEY.encode("utf-8")
+                )
+                new_blob = _encode_base91(masked)
+                text = text.replace(blob, new_blob)
     if literal_key:
         text = text.replace("getgenv().script_key", f'"{SCRIPT_KEY}"')
     target = tmp_path / V1441_SOURCE.name
@@ -162,6 +187,52 @@ def test_cli_v1441_script_key_only(tmp_path):
     assert "bootstrapper" not in payload_meta
 
 
+def test_cli_report_metrics_v1441(tmp_path):
+    target = _prepare_v1441_source(tmp_path)
+
+    proc = _run_cli(target, tmp_path, "--script-key", SCRIPT_KEY)
+
+    stdout = proc.stdout.decode("utf-8")
+    assert "=== Deobfuscation Report ===" in stdout
+    after_header = stdout.split("=== Deobfuscation Report ===", 1)[1]
+    report_section = after_header.split("\n==", 1)[0]
+    report_lines = [line.strip() for line in report_section.strip().splitlines() if line.strip()]
+
+    assert any(
+        line.startswith("Detected version: luraph_v14_4_initv4") for line in report_lines
+    )
+
+    report_text = "\n".join(report_lines)
+    decoded_match = re.search(r"Decoded (\d+) blobs, total (\d+) bytes", report_text)
+    assert decoded_match is not None
+    blob_count = int(decoded_match.group(1))
+    assert blob_count > 0
+
+    assert "Opcode counts:" in report_lines
+    assert "Unknown opcodes: none" in report_lines
+
+    traps_line = next(line for line in report_lines if line.startswith("Traps removed:"))
+    traps_removed = int(traps_line.split(":", 1)[1])
+    assert traps_removed > 0
+
+    consts_line = next(
+        line for line in report_lines if line.startswith("Constants decrypted:")
+    )
+    constants_decrypted = int(consts_line.split(":", 1)[1])
+    assert constants_decrypted > 0
+
+    length_line = next(
+        line for line in report_lines if line.startswith("Final output length:")
+    )
+    length_match = re.search(r"(\d+)", length_line)
+    assert length_match is not None
+    reported_length = int(length_match.group(1))
+
+    output_path = target.with_name(f"{target.stem}_deob.lua")
+    output_text = output_path.read_text(encoding="utf-8")
+    assert reported_length == len(output_text)
+
+
 def test_cli_v1441_bootstrapper_only(tmp_path):
     target = _prepare_v1441_source(tmp_path, literal_key=True)
     stub_dir = _prepare_bootstrapper(tmp_path)
@@ -245,3 +316,24 @@ def test_cli_complex_initv4_with_key_and_bootstrapper(tmp_path):
     assert payload_meta.get("script_key_override") is True
     handler_name = payload_meta.get("handler")
     assert handler_name in {"luraph_v14_4_initv4", "luraph_v14_2_json"}
+
+
+def test_cli_no_report_disables_output(tmp_path):
+    target = _prepare_v1441_source(tmp_path)
+
+    proc = _run_cli(
+        target,
+        tmp_path,
+        "--script-key",
+        SCRIPT_KEY,
+        "--no-report",
+        "--format",
+        "json",
+    )
+
+    stdout = proc.stdout.decode("utf-8")
+    assert "Deobfuscation Report" not in stdout
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert "report" not in data

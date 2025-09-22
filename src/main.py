@@ -214,6 +214,7 @@ def _format_ir_arg(value: object) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
+    parser.set_defaults(report=True)
     parser.add_argument(
         "-i",
         "--in",
@@ -248,6 +249,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--bootstrapper",
         dest="bootstrapper_path",
         help="Path to an init bootstrap stub (file or directory)",
+    )
+    parser.add_argument(
+        "--no-report",
+        dest="report",
+        action="store_false",
+        help="Disable deobfuscation summary report",
     )
     parser.add_argument(
         "--dump-ir",
@@ -378,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "detect_only": args.detect_only,
                         "format": args.format,
                         "render_output": str(item.destination),
+                        "report": args.report,
                     }
                 )
                 if bootstrapper_path:
@@ -417,6 +425,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             not args.detect_only
             and args.format == "json"
             and report is not None
+            and final_ctx.options.get("report", True)
         ):
             final_ctx.result["report"] = dict(report.__dict__)
 

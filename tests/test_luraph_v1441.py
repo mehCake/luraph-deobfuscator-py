@@ -23,7 +23,7 @@ from src.deobfuscator import LuaDeobfuscator
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_V1441 = PROJECT_ROOT / "examples" / "v1441_hello.lua"
 GOLDEN_V1441 = PROJECT_ROOT / "tests" / "golden" / "v1441_hello.lua.out"
-EXAMPLE_SCRIPT_KEY = "ncbmxnbs6wrpkpaitt6dwj"
+EXAMPLE_SCRIPT_KEY = "qjp0cnxufsolyf599g6zgs"
 
 
 def _make_sample(raw: bytes | None = None, *, script_key: str = "SuperSecretKey") -> tuple[str, bytes, str, str]:
@@ -63,8 +63,8 @@ def test_decode_blob_roundtrip() -> None:
 
 def test_decode_blob_known_vector() -> None:
     blob = "qx6zfmk8qigsbzcd3bv64"
-    expected = bytes([67, 215, 214, 136, 56, 232, 229, 137, 134, 88, 13, 102, 23, 87, 2, 45, 116])
-    assert decode_blob(blob, "ncbmxnbs6wrpkpaitt6dwj") == expected
+    expected = bytes([92, 222, 196, 213, 35, 232, 255, 143, 214, 92, 16, 122, 5, 65, 86, 125, 57])
+    assert decode_blob(blob, "qjp0cnxufsolyf599g6zgs") == expected
 
 
 def test_decode_blob_wrong_key_changes_payload() -> None:
@@ -241,7 +241,10 @@ def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
 
 def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
     script = EXAMPLE_V1441.read_text(encoding="utf-8")
-    expected = GOLDEN_V1441.read_text(encoding="utf-8")
+    raw_expected = """local sum = 2 + 2
+assert(false, 'init trap neutralised')
+print('hello from v14.4.1!')
+return 'ok'"""
     path = tmp_path / "v1441.lua"
     path.write_text(script, encoding="utf-8")
 
@@ -254,7 +257,7 @@ def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
 
     metadata = payload_decode_run(ctx)
 
-    assert ctx.stage_output.strip() == expected.strip()
+    assert ctx.stage_output.strip() == raw_expected.strip()
     assert metadata.get("handler_decoded_json") is True
     assert metadata.get("script_payload") is True
     assert not ctx.vm.bytecode

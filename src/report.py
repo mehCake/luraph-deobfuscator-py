@@ -43,6 +43,8 @@ class DeobReport:
             lines.append(f"  {op}: {count}")
         if self.unknown_opcodes:
             lines.append(f"Unknown opcodes: {self.unknown_opcodes}")
+        else:
+            lines.append("Unknown opcodes: none")
         lines.append(f"Traps removed: {self.traps_removed}")
         lines.append(f"Constants decrypted: {self.constants_decrypted}")
         lines.append(f"Variables renamed: {self.variables_renamed}")

@@ -111,7 +111,7 @@ Practical combinations look like:
 
 ```bash
 # Decode a standalone payload with the script key that Luraph provided
-python main.py --script-key ncbmxnbs6wrpkpaitt6dwj examples/v1441_hello.lua
+python main.py --script-key qjp0cnxufsolyf599g6zgs examples/v1441_hello.lua
 
 # Reuse the script key embedded in the file but supply a bootstrapper directory
 # so opcode mappings and the alphabet are recovered from initv4.lua automatically
@@ -119,7 +119,7 @@ python main.py --bootstrapper tests/fixtures/initv4_stub examples/v1441_hello.lu
 
 # Provide both arguments – the explicit key wins while the bootstrapper enriches
 # metadata and remaps opcodes for custom builds
-python main.py --script-key ncbmxnbs6wrpkpaitt6dwj --bootstrapper tests/fixtures/initv4_stub/initv4.lua \
+python main.py --script-key qjp0cnxufsolyf599g6zgs --bootstrapper tests/fixtures/initv4_stub/initv4.lua \
     examples/v1441_hello.lua
 ```
 
