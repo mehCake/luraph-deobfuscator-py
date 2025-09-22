@@ -106,6 +106,47 @@ def test_cli_smoke_complex_sample(tmp_path):
     assert output.stat().st_size > 0
 
 
+def test_cli_reports_multi_chunk_payload(tmp_path):
+    complex_source = PROJECT_ROOT / "examples" / "complex_obfuscated"
+    source_text = complex_source.read_text(encoding="utf-8")
+    expected_chunks = sum(
+        1 for line in source_text.splitlines() if line.strip().startswith("local chunk_")
+    )
+    assert expected_chunks >= 2, "fixture should contain multiple payload chunks"
+
+    local_copy = tmp_path / "complex_obfuscated"
+    local_copy.write_text(source_text, encoding="utf-8")
+
+    proc = _run_cli(local_copy, tmp_path, "--format", "json")
+    stdout = proc.stdout.decode("utf-8")
+    assert f"Decoded {expected_chunks} blobs" in stdout
+
+    output_path = local_copy.with_name("complex_obfuscated_deob.json")
+    assert output_path.exists()
+    produced = sorted(local_copy.parent.glob("complex_obfuscated_deob.*"))
+    assert produced == [output_path], "expected single CLI output artefact"
+
+    data = json.loads(output_path.read_text(encoding="utf-8"))
+    payload_meta = (
+        data.get("passes", {})
+        .get("payload_decode", {})
+        .get("handler_payload_meta", {})
+    )
+
+    assert payload_meta.get("chunk_count") == expected_chunks
+    assert payload_meta.get("chunk_success_count") == expected_chunks
+
+    decoded_lengths = payload_meta.get("chunk_decoded_bytes") or []
+    report = data.get("report", {})
+    assert report.get("blob_count") == expected_chunks
+    if decoded_lengths:
+        assert report.get("decoded_bytes") == sum(decoded_lengths)
+
+    output_text = data.get("output", "")
+    for marker in ("Aimbot", "ESP", "KillAll"):
+        assert marker in output_text, f"expected {marker} in merged output"
+
+
 def test_cli_supports_json_format(tmp_path):
     source = PROJECT_ROOT / "example_obfuscated.lua"
     target = tmp_path / source.name
