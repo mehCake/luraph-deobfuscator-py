@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Tuple
@@ -185,6 +186,8 @@ class LuaDeobfuscator:
                 if override_key:
                     payload_info.metadata[override_token] = override_key
                 raw_bytes: bytes | None = None
+                chunk_meta_updates: Dict[str, Any] = {}
+                chunk_parts: list[bytes] = []
                 try:
                     raw_bytes = handler_instance.extract_bytecode(payload_info)
                 except Exception as exc:  # pragma: no cover - best effort
@@ -208,28 +211,40 @@ class LuaDeobfuscator:
                     metadata["handler_bytecode_bytes"] = len(raw_bytes)
                     metadata["handler_vm_bytecode"] = raw_bytes
                     if payload_dict is None:
-                        decoded_text = raw_bytes.decode("utf-8", errors="ignore")
-                        cleaned_text = utils.strip_non_printable(decoded_text)
-                        mapping: Any = None
-                        if cleaned_text:
-                            stripped = cleaned_text.lstrip()
-                            if stripped.startswith("{") or stripped.startswith("["):
-                                try:
-                                    mapping = json.loads(cleaned_text)
-                                except json.JSONDecodeError:
-                                    mapping = None
-                            if mapping is None:
-                                mapping = extract_vm_ir(cleaned_text)
-                        if isinstance(mapping, dict):
+                        mapping, _, mapping_meta = self._decode_payload_mapping(raw_bytes)
+                        if mapping is not None:
                             payload_dict = mapping
                             payload_info.data = mapping
-                            metadata["handler_decoded_json"] = True
-                        elif isinstance(mapping, list):
-                            converted = extract_vm_ir(json.dumps(mapping))
-                            if isinstance(converted, dict):
-                                payload_dict = converted
-                                payload_info.data = converted
-                                metadata["handler_decoded_json"] = True
+                        for key, value in mapping_meta.items():
+                            if key not in metadata or not metadata.get(key):
+                                metadata[key] = value
+
+                    if version.name in {"luraph_v14_4_initv4", "v14.4.1"}:
+                        chunk_key: str | None = override_key or payload_info.metadata.get("script_key")
+                        if not chunk_key:
+                            chunk_key = os.environ.get("LURAPH_SCRIPT_KEY", "") or None
+                        if chunk_key:
+                            chunk_parts, chunk_meta_updates = self._decode_initv4_chunks(
+                                text,
+                                script_key=chunk_key,
+                            )
+                            if chunk_parts:
+                                combined_bytes = b"".join(chunk_parts)
+                                if combined_bytes:
+                                    existing_vm = metadata.get("handler_vm_bytecode")
+                                    if not existing_vm:
+                                        metadata["handler_vm_bytecode"] = combined_bytes
+                                        metadata["handler_bytecode_bytes"] = len(combined_bytes)
+                                    elif isinstance(existing_vm, (bytes, bytearray)) and len(combined_bytes) > len(existing_vm):
+                                        metadata.setdefault("handler_chunk_combined_bytes", len(combined_bytes))
+                                    if payload_dict is None:
+                                        mapping, _, mapping_meta = self._decode_payload_mapping(combined_bytes)
+                                        if mapping is not None:
+                                            payload_dict = mapping
+                                            payload_info.data = mapping
+                                        for key, value in mapping_meta.items():
+                                            if key not in metadata or not metadata.get(key):
+                                                metadata[key] = value
                 finally:
                     if override_key:
                         payload_info.metadata.pop(override_token, None)
@@ -245,6 +260,42 @@ class LuaDeobfuscator:
                     metadata["handler_chunk_decoded_bytes"] = list(chunk_bytes)
                 if cleaned_meta:
                     metadata["handler_payload_meta"] = cleaned_meta
+
+                if chunk_meta_updates:
+                    if (
+                        isinstance(chunk_meta_updates.get("chunk_count"), int)
+                        and chunk_meta_updates["chunk_count"] > 0
+                        and "handler_payload_chunks" not in metadata
+                    ):
+                        metadata["handler_payload_chunks"] = chunk_meta_updates["chunk_count"]
+                    if (
+                        isinstance(chunk_meta_updates.get("chunk_decoded_bytes"), list)
+                        and "handler_chunk_decoded_bytes" not in metadata
+                    ):
+                        metadata["handler_chunk_decoded_bytes"] = list(
+                            chunk_meta_updates["chunk_decoded_bytes"]
+                        )
+                    encoded_lengths = chunk_meta_updates.get("chunk_encoded_lengths")
+                    if isinstance(encoded_lengths, list) and encoded_lengths:
+                        metadata.setdefault("handler_chunk_encoded_lengths", list(encoded_lengths))
+                    errors = chunk_meta_updates.get("chunk_errors")
+                    if isinstance(errors, list) and errors:
+                        metadata.setdefault("handler_chunk_errors", list(errors))
+                    payload_meta = metadata.get("handler_payload_meta")
+                    if isinstance(payload_meta, dict):
+                        for key in ("chunk_count", "chunk_decoded_bytes", "chunk_encoded_lengths"):
+                            value = chunk_meta_updates.get(key)
+                            if value is not None and key not in payload_meta:
+                                payload_meta[key] = value
+                    elif any(
+                        key in chunk_meta_updates
+                        for key in ("chunk_count", "chunk_decoded_bytes", "chunk_encoded_lengths")
+                    ):
+                        metadata["handler_payload_meta"] = {
+                            key: chunk_meta_updates[key]
+                            for key in ("chunk_count", "chunk_decoded_bytes", "chunk_encoded_lengths")
+                            if key in chunk_meta_updates
+                        }
 
                 if data_candidate is not None:
                     payload_dict = data_candidate
@@ -595,6 +646,110 @@ class LuaDeobfuscator:
         if not snippet:
             return False
         return (snippet[0], snippet[-1]) in {("{", "}"), ("[", "]")}
+
+    def _decode_payload_mapping(
+        self, raw_bytes: bytes
+    ) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
+        """Return a mapping derived from ``raw_bytes`` when possible."""
+
+        metadata: Dict[str, Any] = {}
+        if not raw_bytes:
+            return None, "", metadata
+
+        try:
+            decoded_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "", metadata
+
+        cleaned_text = utils.strip_non_printable(decoded_text)
+        if not cleaned_text:
+            return None, "", metadata
+
+        mapping: Any = None
+        stripped = cleaned_text.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                mapping = json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                mapping = None
+            else:
+                metadata["handler_decoded_json"] = True
+
+        if isinstance(mapping, list):
+            converted = extract_vm_ir(json.dumps(mapping))
+            if isinstance(converted, dict):
+                mapping = converted
+
+        if isinstance(mapping, dict):
+            if isinstance(mapping.get("script"), str):
+                metadata.setdefault("script_payload", True)
+            return mapping, cleaned_text, metadata
+
+        return None, cleaned_text, metadata
+
+    def _decode_initv4_chunks(
+        self,
+        source: str,
+        *,
+        script_key: str,
+    ) -> Tuple[list[bytes], Dict[str, Any]]:
+        """Decode every initv4 payload chunk discovered in ``source``."""
+
+        if not script_key:
+            return [], {}
+
+        try:
+            from .versions.initv4 import InitV4Decoder
+        except Exception:  # pragma: no cover - optional dependency
+            return [], {}
+
+        ctx = SimpleNamespace(
+            script_key=script_key,
+            bootstrapper_path=self._bootstrapper_path,
+        )
+        try:
+            decoder = InitV4Decoder(ctx)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.debug("initv4 decoder setup failed: %s", exc)
+            return [], {}
+
+        try:
+            payloads = decoder.locate_payload(source)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.debug("initv4 chunk discovery failed: %s", exc)
+            return [], {}
+
+        decoded_parts: list[bytes] = []
+        decoded_lengths: list[int] = []
+        encoded_lengths: list[int] = []
+        errors: list[Dict[str, Any]] = []
+
+        for index, blob in enumerate(payloads):
+            if not isinstance(blob, str):
+                continue
+            cleaned = blob.strip()
+            if cleaned.startswith('"') and cleaned.endswith('"'):
+                encoded_lengths.append(max(len(cleaned) - 2, 0))
+            else:
+                encoded_lengths.append(len(cleaned))
+            try:
+                chunk_bytes = decoder.extract_bytecode(blob)
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append({"chunk_index": index, "error": str(exc)})
+                continue
+            decoded_parts.append(chunk_bytes)
+            decoded_lengths.append(len(chunk_bytes))
+
+        meta: Dict[str, Any] = {}
+        if decoded_parts:
+            meta["chunk_count"] = len(decoded_parts)
+            meta["chunk_decoded_bytes"] = decoded_lengths
+        if encoded_lengths:
+            meta["chunk_encoded_lengths"] = encoded_lengths
+        if errors:
+            meta["chunk_errors"] = errors
+
+        return decoded_parts, meta
 
     def _vm_ir_from_mapping(self, payload: Optional[Dict[str, Any]]) -> Optional[VMIR]:
         if not payload:

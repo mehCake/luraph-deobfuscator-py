@@ -365,6 +365,8 @@ def test_payload_decode_handles_chunked_script(tmp_path: Path) -> None:
     chunk_size = max(1, (len(raw_bytes) + chunk_count - 1) // chunk_count)
     expected_decoded = [len(raw_bytes[index : index + chunk_size]) for index in range(0, len(raw_bytes), chunk_size)]
     assert payload_meta.get("chunk_decoded_bytes") == expected_decoded
+    encoded_lengths = metadata.get("handler_chunk_encoded_lengths") or payload_meta.get("chunk_encoded_lengths")
+    assert encoded_lengths == [len(chunk) for chunk in encoded_chunks]
 
     assert metadata.get("handler_payload_chunks") == chunk_count
     assert ctx.report.blob_count == chunk_count
