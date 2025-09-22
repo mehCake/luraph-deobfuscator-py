@@ -294,6 +294,9 @@ class LuaDeobfuscator:
                 chunk_bytes = cleaned_meta.get("chunk_decoded_bytes")
                 if isinstance(chunk_bytes, list):
                     metadata["handler_chunk_decoded_bytes"] = list(chunk_bytes)
+                success_value = cleaned_meta.get("chunk_success_count")
+                if isinstance(success_value, int) and success_value >= 0:
+                    metadata["handler_chunk_success_count"] = success_value
                 if cleaned_meta:
                     metadata["handler_payload_meta"] = cleaned_meta
 
@@ -311,6 +314,13 @@ class LuaDeobfuscator:
                         metadata["handler_chunk_decoded_bytes"] = list(
                             chunk_meta_updates["chunk_decoded_bytes"]
                         )
+                    success_value = chunk_meta_updates.get("chunk_success_count")
+                    if (
+                        isinstance(success_value, int)
+                        and success_value >= 0
+                        and "handler_chunk_success_count" not in metadata
+                    ):
+                        metadata["handler_chunk_success_count"] = success_value
                     encoded_lengths = chunk_meta_updates.get("chunk_encoded_lengths")
                     if isinstance(encoded_lengths, list) and encoded_lengths:
                         metadata.setdefault("handler_chunk_encoded_lengths", list(encoded_lengths))
@@ -319,17 +329,32 @@ class LuaDeobfuscator:
                         metadata.setdefault("handler_chunk_errors", list(errors))
                     payload_meta = metadata.get("handler_payload_meta")
                     if isinstance(payload_meta, dict):
-                        for key in ("chunk_count", "chunk_decoded_bytes", "chunk_encoded_lengths"):
+                        for key in (
+                            "chunk_count",
+                            "chunk_decoded_bytes",
+                            "chunk_encoded_lengths",
+                            "chunk_success_count",
+                        ):
                             value = chunk_meta_updates.get(key)
                             if value is not None and key not in payload_meta:
                                 payload_meta[key] = value
                     elif any(
                         key in chunk_meta_updates
-                        for key in ("chunk_count", "chunk_decoded_bytes", "chunk_encoded_lengths")
+                        for key in (
+                            "chunk_count",
+                            "chunk_decoded_bytes",
+                            "chunk_encoded_lengths",
+                            "chunk_success_count",
+                        )
                     ):
                         metadata["handler_payload_meta"] = {
                             key: chunk_meta_updates[key]
-                            for key in ("chunk_count", "chunk_decoded_bytes", "chunk_encoded_lengths")
+                            for key in (
+                                "chunk_count",
+                                "chunk_decoded_bytes",
+                                "chunk_encoded_lengths",
+                                "chunk_success_count",
+                            )
                             if key in chunk_meta_updates
                         }
 
@@ -773,83 +798,98 @@ class LuaDeobfuscator:
                 opcode_table = {}
         const_decoder = handler.const_decoder() if handler is not None else None
 
+        discovered_chunks = 0
+
         for index, blob in enumerate(payloads):
             if not isinstance(blob, str):
                 continue
+            discovered_chunks += 1
             cleaned = blob.strip()
             if cleaned.startswith('"') and cleaned.endswith('"'):
                 encoded_lengths.append(max(len(cleaned) - 2, 0))
             else:
                 encoded_lengths.append(len(cleaned))
+
+            decoded_length = 0
+            cleaned_flag = False
+            rename_count = 0
+            renamed_chunk = ""
+            chunk_source: str | None = None
+
             try:
                 chunk_bytes = decoder.extract_bytecode(blob)
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append({"chunk_index": index, "error": str(exc)})
-                continue
-            decoded_parts.append(chunk_bytes)
-            decoded_lengths.append(len(chunk_bytes))
-
-            mapping, _, _ = self._decode_payload_mapping(chunk_bytes)
-            chunk_output: str | None = None
-            if isinstance(mapping, dict):
-                script_text = mapping.get("script")
-                if isinstance(script_text, str) and script_text.strip():
-                    chunk_output = utils.strip_non_printable(script_text)
-                else:
-                    byte_values = mapping.get("bytecode") or mapping.get("code")
-                    if (
-                        handler is not None
-                        and isinstance(byte_values, list)
-                        and byte_values
-                        and all(
-                            isinstance(value, int) and 0 <= value <= 255
-                            for value in byte_values
-                        )
-                    ):
-                        consts = list(mapping.get("constants", []))
-                        if const_decoder is not None:
-                            try:
-                                consts = decode_constant_pool(const_decoder, consts)
-                            except Exception:  # pragma: no cover - defensive
-                                consts = list(mapping.get("constants", []))
-                        lifter = VMLifter()
-                        try:
-                            module = lifter.lift(
-                                bytes(byte_values),
-                                opcode_table,
-                                consts,
-                                endianness=(mapping.get("endianness") or mapping.get("endian")),
-                            )
-                        except Exception as exc:  # pragma: no cover - defensive
-                            errors.append({
-                                "chunk_index": index,
-                                "error": str(exc),
-                            })
-                        else:
-                            devirt = IRDevirtualizer(module, consts)
-                            chunk_ast, _ = devirt.lower()
-                            chunk_output = lua_ast.to_source(chunk_ast)
-            if chunk_output:
-                cleaned = self.cleanup(chunk_output)
-                cleaned_flags.append(cleaned != chunk_output)
-                renamer = VariableRenamer()
-                renamed = renamer.rename_variables(cleaned)
-                stats = getattr(renamer, "last_stats", {})
-                renamed_count = 0
-                if isinstance(stats, dict):
-                    count_value = stats.get("replacements")
-                    if isinstance(count_value, int):
-                        renamed_count = max(count_value, 0)
-                rename_counts.append(renamed_count)
-                chunk_sources.append(renamed)
+                chunk_bytes = None
             else:
-                cleaned_flags.append(False)
-                rename_counts.append(0)
-                chunk_sources.append("")
+                decoded_length = len(chunk_bytes)
+                decoded_parts.append(chunk_bytes)
+
+                mapping, _, _ = self._decode_payload_mapping(chunk_bytes)
+                if isinstance(mapping, dict):
+                    script_text = mapping.get("script")
+                    if isinstance(script_text, str) and script_text.strip():
+                        chunk_source = utils.strip_non_printable(script_text)
+                    else:
+                        byte_values = mapping.get("bytecode") or mapping.get("code")
+                        if (
+                            handler is not None
+                            and isinstance(byte_values, list)
+                            and byte_values
+                            and all(
+                                isinstance(value, int) and 0 <= value <= 255
+                                for value in byte_values
+                            )
+                        ):
+                            consts = list(mapping.get("constants", []))
+                            if const_decoder is not None:
+                                try:
+                                    consts = decode_constant_pool(const_decoder, consts)
+                                except Exception:  # pragma: no cover - defensive
+                                    consts = list(mapping.get("constants", []))
+                            lifter = VMLifter()
+                            try:
+                                module = lifter.lift(
+                                    bytes(byte_values),
+                                    opcode_table,
+                                    consts,
+                                    endianness=(
+                                        mapping.get("endianness")
+                                        or mapping.get("endian")
+                                    ),
+                                )
+                            except Exception as exc:  # pragma: no cover - defensive
+                                errors.append({
+                                    "chunk_index": index,
+                                    "error": str(exc),
+                                })
+                            else:
+                                devirt = IRDevirtualizer(module, consts)
+                                chunk_ast, _ = devirt.lower()
+                                chunk_source = lua_ast.to_source(chunk_ast)
+
+                if chunk_source:
+                    cleaned_source = self.cleanup(chunk_source)
+                    cleaned_flag = cleaned_source != chunk_source
+                    renamer = VariableRenamer()
+                    renamed_chunk = renamer.rename_variables(cleaned_source)
+                    stats = getattr(renamer, "last_stats", {})
+                    if isinstance(stats, dict):
+                        count_value = stats.get("replacements")
+                        if isinstance(count_value, int):
+                            rename_count = max(count_value, 0)
+
+            decoded_lengths.append(decoded_length)
+            cleaned_flags.append(cleaned_flag)
+            rename_counts.append(rename_count)
+            chunk_sources.append(renamed_chunk)
 
         meta: Dict[str, Any] = {}
+        if discovered_chunks:
+            meta["chunk_count"] = discovered_chunks
         if decoded_parts:
-            meta["chunk_count"] = len(decoded_parts)
+            meta["chunk_success_count"] = len(decoded_parts)
+        if decoded_lengths:
             meta["chunk_decoded_bytes"] = decoded_lengths
         if encoded_lengths:
             meta["chunk_encoded_lengths"] = encoded_lengths
