@@ -1,5 +1,22 @@
-do local init_fn = function(...)
+local Aimbot = {}
 
-    script_key = script_key or getgenv().script_key
-end;
-init_fn(...); end;
+function Aimbot.enable()
+    print("Aimbot enabled")
+end
+
+local ESP = {}
+
+function ESP.toggle()
+    print("ESP toggled")
+end
+
+local function KillAll()
+    print("Eliminating all targets")
+end
+
+local Controls = {}
+Controls.Aimbot = Aimbot.enable
+Controls.ESP = ESP.toggle
+Controls.KillAll = KillAll
+
+return Controls
