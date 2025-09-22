@@ -159,3 +159,5 @@ def test_vm_devirtualize_pass_renames_and_formats(tmp_path) -> None:
     assert "local b = 2" in ctx.stage_output
     assert "R0" not in ctx.stage_output
     assert metadata["renamed_identifiers"] is True
+    assert metadata["renamed_count"] >= 2
+    assert ctx.report.variables_renamed == metadata["renamed_count"]

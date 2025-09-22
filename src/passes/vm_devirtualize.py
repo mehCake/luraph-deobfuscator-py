@@ -860,10 +860,20 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
 
     renamer = VariableRenamer()
     renamed = renamer.rename_variables(raw_source)
+    rename_stats = getattr(renamer, "last_stats", {})
+    renamed_count = 0
+    if isinstance(rename_stats, dict):
+        count_value = rename_stats.get("replacements")
+        if isinstance(count_value, int):
+            renamed_count = max(count_value, 0)
+    report = getattr(ctx, "report", None)
+    if report is not None:
+        report.variables_renamed = renamed_count
     formatter = utils.LuaFormatter()
     pretty = formatter.format_source(renamed)
 
     metadata["renamed_identifiers"] = renamed != raw_source
+    metadata["renamed_count"] = renamed_count
     metadata["formatted"] = pretty != renamed
 
     ctx.stage_output = pretty

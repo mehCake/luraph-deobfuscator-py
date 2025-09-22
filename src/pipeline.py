@@ -22,6 +22,7 @@ from typing import (
 from version_detector import VersionInfo
 
 from . import utils
+from .report import DeobReport
 from .deobfuscator import LuaDeobfuscator, VMIR
 from .versions import VersionHandler
 from .passes.preprocess import run as preprocess_run
@@ -37,6 +38,22 @@ PassFn = Callable[["Context"], None]
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .utils_pkg.ir import IRModule
+
+
+def _default_report() -> DeobReport:
+    return DeobReport(
+        version_detected="unknown",
+        script_key_used=None,
+        bootstrapper_used=None,
+        blob_count=0,
+        decoded_bytes=0,
+        opcode_stats={},
+        unknown_opcodes=[],
+        traps_removed=0,
+        constants_decrypted=0,
+        variables_renamed=0,
+        output_length=0,
+    )
 
 
 @dataclass
@@ -75,6 +92,7 @@ class Context:
     from_json: bool = False
     reconstructed_lua: str = ""
     version_handler: VersionHandler | None = None
+    report: DeobReport = field(default_factory=_default_report)
 
     def __post_init__(self) -> None:
         if self.deobfuscator is None:
@@ -82,6 +100,10 @@ class Context:
                 script_key=self.script_key,
                 bootstrapper=self.bootstrapper_path,
             )
+        if self.script_key and not self.report.script_key_used:
+            self.report.script_key_used = self.script_key
+        if self.bootstrapper_path and not self.report.bootstrapper_used:
+            self.report.bootstrapper_used = str(self.bootstrapper_path)
         try:
             suffix = self.input_path.suffix.lower()
         except AttributeError:
@@ -230,6 +252,9 @@ def _pass_detect(ctx: Context) -> None:
         version = deob.detect_version(ctx.raw_input, from_json=ctx.from_json)
     ctx.detected_version = version
 
+    if ctx.report:
+        ctx.report.version_detected = version.name
+
     metadata: Dict[str, Any] = {
         "name": version.name,
         "major": version.major,
@@ -260,6 +285,23 @@ def _pass_payload_decode(ctx: Context) -> None:
 
 def _pass_vm_lift(ctx: Context) -> None:
     metadata = vm_lift_run(ctx)
+    report = ctx.report
+    if report is not None and ctx.ir_module is not None:
+        stats: Dict[str, int] = {}
+        unknowns: set[int] = set()
+        for inst in ctx.ir_module.instructions:
+            opcode = inst.opcode or "UNKNOWN_OP"
+            stats[opcode] = stats.get(opcode, 0) + 1
+            if opcode == "UNKNOWN_OP":
+                raw_value = inst.args.get("opcode") if isinstance(inst.args, dict) else None
+                if isinstance(raw_value, int):
+                    unknowns.add(raw_value)
+        report.opcode_stats.clear()
+        report.opcode_stats.update(stats)
+        report.unknown_opcodes = sorted(unknowns)
+        warnings = metadata.get("warnings")
+        if isinstance(warnings, list):
+            report.warnings.extend(str(item) for item in warnings if item)
     ctx.record_metadata("vm_lift", metadata)
 
 
@@ -275,6 +317,28 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
 
 def _pass_cleanup(ctx: Context) -> None:
     metadata = cleanup_run(ctx)
+    report = ctx.report
+    if report is not None:
+        traps = 0
+        assert_traps = metadata.get("assert_traps")
+        if isinstance(assert_traps, int):
+            traps += max(assert_traps, 0)
+        dummy_loops = metadata.get("dummy_loops")
+        if isinstance(dummy_loops, int):
+            traps += max(dummy_loops, 0)
+        report.traps_removed = traps
+
+        constants = 0
+        if metadata.get("constant_folded"):
+            constants += 1
+        const_expr = metadata.get("constant_expressions")
+        if isinstance(const_expr, int):
+            constants += max(const_expr, 0)
+        report.constants_decrypted = constants
+
+        warnings = metadata.get("warnings")
+        if isinstance(warnings, list):
+            report.warnings.extend(str(item) for item in warnings if item)
     ctx.record_metadata("cleanup", metadata)
     if ctx.stage_output:
         ctx.write_artifact("cleanup", ctx.stage_output)
@@ -282,6 +346,14 @@ def _pass_cleanup(ctx: Context) -> None:
 
 def _pass_render(ctx: Context) -> None:
     metadata = render_run(ctx)
+    report = ctx.report
+    if report is not None:
+        length = metadata.get("length")
+        if isinstance(length, int) and length >= 0:
+            report.output_length = length
+        warnings = metadata.get("warnings")
+        if isinstance(warnings, list):
+            report.warnings.extend(str(item) for item in warnings if item)
     ctx.record_metadata("render", metadata)
     if ctx.stage_output:
         ctx.write_artifact("render", ctx.stage_output)

@@ -173,13 +173,18 @@ class VariableRenamer:
         self.logger = logging.getLogger(__name__)
         self._reserved_words = set(LUA_KEYWORDS)
         self._reserved_words.update(LUA_GLOBALS)
+        self._replacement_count = 0
+        self.last_stats: Dict[str, int] = {}
 
     # -- Public API -----------------------------------------------------
     def rename_variables(self, lua_src: str) -> str:
         """Return ``lua_src`` with registers renamed to human friendly names."""
 
+        self._replacement_count = 0
         state = ScopeState.root()
-        return self._rename_scope(lua_src, state, header=None)
+        result = self._rename_scope(lua_src, state, header=None)
+        self.last_stats = {"replacements": self._replacement_count}
+        return result
 
     # -- Recursive scope processing ------------------------------------
     def _rename_scope(
@@ -449,7 +454,11 @@ class VariableRenamer:
             if match:
                 identifier = match.group(0)
                 replacement = mapping.get(identifier)
-                result.append(replacement or identifier)
+                if replacement and replacement != identifier:
+                    self._replacement_count += 1
+                    result.append(replacement)
+                else:
+                    result.append(identifier)
                 i = match.end()
             else:
                 result.append(text[i])

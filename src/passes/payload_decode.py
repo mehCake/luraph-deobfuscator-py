@@ -76,6 +76,41 @@ def run(ctx: "Context") -> Dict[str, Any]:
 
     _apply_vm_bytecode(ctx, metadata, version.name)
 
+    report = getattr(ctx, "report", None)
+    if report is not None:
+        if ctx.script_key:
+            report.script_key_used = ctx.script_key
+        payload_meta = metadata.get("handler_payload_meta")
+        if isinstance(payload_meta, dict):
+            key_value = payload_meta.get("script_key")
+            if isinstance(key_value, str) and key_value:
+                report.script_key_used = key_value
+            bootstrap_meta = payload_meta.get("bootstrapper")
+            if isinstance(bootstrap_meta, dict):
+                path_value = bootstrap_meta.get("path") or bootstrap_meta.get("source")
+                if isinstance(path_value, str) and path_value:
+                    report.bootstrapper_used = path_value
+        if ctx.bootstrapper_path:
+            report.bootstrapper_used = str(ctx.bootstrapper_path)
+
+        lengths: List[int] = []
+        byte_len = metadata.get("handler_bytecode_bytes")
+        if isinstance(byte_len, int) and byte_len >= 0:
+            lengths.append(byte_len)
+        payload_len = metadata.get("handler_payload_bytes")
+        if isinstance(payload_len, int) and payload_len >= 0:
+            lengths.append(payload_len)
+        raw_bytes = metadata.get("handler_vm_bytecode")
+        if not lengths and isinstance(raw_bytes, (bytes, bytearray)):
+            lengths.append(len(raw_bytes))
+        if lengths:
+            report.blob_count += len(lengths)
+            report.decoded_bytes += sum(lengths)
+
+        warnings = metadata.get("warnings")
+        if isinstance(warnings, list):
+            report.warnings.extend(str(item) for item in warnings if item)
+
     return metadata
 
 

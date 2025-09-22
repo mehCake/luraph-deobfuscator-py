@@ -234,6 +234,9 @@ def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
     assert payload_meta.get("index_xor") is True
     assert payload_meta.get("alphabet_source") == "default"
     assert ctx.vm.meta.get("handler") in {"luraph_v14_4_initv4", "v14.4.1"}
+    assert ctx.report.script_key_used == script_key
+    assert ctx.report.blob_count >= 1
+    assert ctx.report.decoded_bytes >= len(raw)
 
 
 def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
@@ -260,6 +263,7 @@ def test_payload_decode_parses_script_payload(tmp_path: Path) -> None:
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
     assert payload_meta.get("alphabet_source") == "default"
+    assert ctx.report.script_key_used == EXAMPLE_SCRIPT_KEY
 
 
 def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None:
@@ -382,3 +386,19 @@ def test_pipeline_processes_initv4_bytecode(tmp_path: Path) -> None:
     output_path = Path(render_meta.get("output_path", ""))
     assert output_path.exists()
     assert ctx.output
+
+    report = ctx.report
+    assert report.version_detected in {"luraph_v14_4_initv4", "v14.4.1"}
+    assert report.script_key_used == script_key
+    payload_meta = ctx.pass_metadata.get("payload_decode", {})
+    byte_count = payload_meta.get("handler_bytecode_bytes")
+    assert isinstance(byte_count, int) and byte_count > 0
+    assert report.blob_count >= 1
+    assert report.decoded_bytes >= byte_count
+    assert "Return" in report.opcode_stats
+    assert report.opcode_stats["Return"] == ctx.ir_module.instruction_count
+    assert report.unknown_opcodes == []
+    assert report.variables_renamed == ctx.pass_metadata.get("vm_devirtualize", {}).get(
+        "renamed_count", 0
+    )
+    assert report.output_length == len(ctx.output)
