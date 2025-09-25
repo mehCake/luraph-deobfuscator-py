@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from .. import utils
@@ -170,6 +171,178 @@ def _decode_literal_value(
                     return text, "base91"
 
     return value, None
+
+
+def _strip_json_quotes_and_escapes(blob: str) -> str:
+    """Return ``blob`` without wrapping quotes and with escapes resolved."""
+
+    stripped = blob.strip()
+    if not stripped:
+        return stripped
+    if stripped.startswith("\"") and stripped.endswith("\""):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            stripped = stripped[1:-1]
+    return stripped
+
+
+def _attempt_simple_fallback_bytes(candidate: str) -> bytes:
+    """Decode ``candidate`` using lightweight heuristics.
+
+    The helper mirrors the best-effort logic in the reference pseudocode: first
+    try hexadecimal, then base64.  When both strategies fail an empty byte
+    string is returned so callers can distinguish fallback failures from valid
+    payloads.
+    """
+
+    text = candidate.strip()
+    if not text:
+        return b""
+
+    if len(text) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", text):
+        try:
+            return bytes.fromhex(text)
+        except ValueError:
+            pass
+
+    if len(text) >= 12 and re.fullmatch(r"[A-Za-z0-9+/=_-]+", text):
+        padded = text + "=" * (-len(text) % 4)
+        try:
+            return base64.b64decode(padded, validate=False)
+        except (binascii.Error, ValueError):
+            pass
+
+    return b""
+
+
+def _mask_script_key(script_key: Optional[str]) -> Optional[str]:
+    if not script_key:
+        return None
+    cleaned = script_key.strip()
+    if not cleaned:
+        return None
+    prefix = cleaned[:6]
+    masked_len = max(len(cleaned) - len(prefix), 0)
+    return prefix + ("*" * masked_len)
+
+
+def _iterative_initv4_decode(
+    ctx: "Context",
+    source: str,
+    *,
+    script_key: Optional[str],
+    max_iterations: int,
+    force: bool,
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    """Decode every initv4 payload chunk discovered in ``source``.
+
+    The implementation mirrors the user-provided pseudocode: it enumerates every
+    payload blob, decodes it with the supplied script key, records per-chunk
+    metadata, and replaces the literal with a placeholder so subsequent
+    iterations do not reprocess the same content.  The helper returns a list of
+    chunk dictionaries, the transformed source text, and aggregate metadata that
+    can feed the reporting layer.
+    """
+
+    if not script_key:
+        return [], source, {}
+
+    try:
+        from ..versions.luraph_v14_4_initv4 import InitV4Decoder
+    except Exception:  # pragma: no cover - optional helper may fail to load
+        return [], source, {}
+
+    ctx_proxy = SimpleNamespace(
+        script_key=script_key,
+        bootstrapper_path=getattr(ctx, "bootstrapper_path", None),
+    )
+
+    try:
+        decoder = InitV4Decoder(ctx_proxy)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.debug("initv4 decoder bootstrap failed: %s", exc)
+        return [], source, {"warnings": [str(exc)]}
+
+    masked_key = _mask_script_key(script_key)
+    aggregate_meta: Dict[str, Any] = {
+        "chunk_count": 0,
+        "chunk_decoded_bytes": [],
+        "chunk_encoded_lengths": [],
+        "chunk_details": [],
+        "chunk_success_count": 0,
+    }
+    warnings: List[str] = []
+    decoded_chunks: List[Dict[str, Any]] = []
+    current_text = source
+
+    for _iteration in range(max(1, max_iterations)):
+        try:
+            payloads = decoder.locate_payload(current_text)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.debug("initv4 payload scan failed: %s", exc)
+            warnings.append(str(exc))
+            break
+
+        if not payloads:
+            break
+
+        progress = False
+        for blob in payloads:
+            if not isinstance(blob, str):
+                continue
+
+            stripped = _strip_json_quotes_and_escapes(blob)
+            encoded_length = len(stripped)
+            decoded_bytes = b""
+
+            try:
+                decoded_bytes = decoder.extract_bytecode(blob)
+            except Exception as exc:
+                if not force:
+                    warnings.append(str(exc))
+                    continue
+                warnings.append(f"{exc} (ignored due to --force)")
+
+            if not decoded_bytes:
+                fallback = _attempt_simple_fallback_bytes(stripped)
+                if fallback:
+                    decoded_bytes = fallback
+                elif not force:
+                    warnings.append(
+                        "Failed to decode initv4 chunk; rerun with --force for best-effort."
+                    )
+                    continue
+
+            aggregate_meta["chunk_count"] += 1
+            aggregate_meta["chunk_decoded_bytes"].append(len(decoded_bytes))
+            aggregate_meta["chunk_encoded_lengths"].append(encoded_length)
+            aggregate_meta["chunk_success_count"] += 1 if decoded_bytes else 0
+
+            chunk_index = len(decoded_chunks)
+            chunk_record = {
+                "index": chunk_index,
+                "encoded_size": encoded_length,
+                "decoded_byte_count": len(decoded_bytes),
+                "used_key_masked": masked_key,
+            }
+            decoded_chunks.append(chunk_record)
+            aggregate_meta["chunk_details"].append(dict(chunk_record))
+
+            placeholder = f"<decoded_chunk_{chunk_index + 1}>"
+            replacement = (
+                f'"{placeholder}"' if blob.strip().startswith('"') else placeholder
+            )
+            current_text = current_text.replace(blob, replacement, 1)
+            progress = True
+
+        if not progress:
+            break
+
+    if warnings:
+        aggregate_meta["warnings"] = warnings
+
+    return decoded_chunks, current_text, aggregate_meta
 
 
 def _evaluate_payload_expression(
@@ -750,6 +923,22 @@ def run(ctx: "Context") -> Dict[str, Any]:
     current_features = features
     seen_outputs: Set[str] = {text}
     last_metadata: Optional[Dict[str, Any]] = None
+
+    if isinstance(version.name, str) and version.name.startswith("luraph_v14_4"):
+        decoded_chunks, _, chunk_meta = _iterative_initv4_decode(
+            ctx,
+            text,
+            script_key=script_key if isinstance(script_key, str) else None,
+            max_iterations=iteration_limit,
+            force=force_mode,
+        )
+        if decoded_chunks:
+            aggregated.setdefault("decoded_chunks", []).extend(decoded_chunks)
+        if chunk_meta:
+            _merge_payload_meta(aggregated, chunk_meta)
+            warnings = chunk_meta.get("warnings")
+            if warnings:
+                aggregated.setdefault("warnings", []).extend(str(msg) for msg in warnings)
 
     for iteration in range(iteration_limit):
         current_source = final_output
