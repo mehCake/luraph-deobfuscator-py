@@ -386,6 +386,7 @@ def _iterative_initv4_decode(
                 opcode_map=opcode_map,
             )
             blob_paths: List[str] = []
+            chunk_record: Dict[str, Any]
             if suspicious:
                 needs_emulation, blob_paths = _bootstrap_decoder_needs_emulation(
                     getattr(ctx, "bootstrapper_metadata", None)
@@ -401,7 +402,7 @@ def _iterative_initv4_decode(
                         + ", ".join(blob_paths)
                         + ". Use --force to proceed with fallback decoding."
                     )
-                chunk_record = {  # predeclare for metadata capture
+                chunk_record = {
                     "vm_lift_skipped": True,
                 }
                 if not force:
@@ -474,9 +475,9 @@ def _iterative_initv4_decode(
                         vm_summary["instructions"] = len(getattr(module, "instructions", []))
                         table_meta = getattr(module, "metadata", {}).get("opcode_table")
                         if isinstance(table_meta, Mapping):
-                            source = table_meta.get("source")
-                            if source:
-                                vm_summary["opcode_table_source"] = source
+                            opcode_source = table_meta.get("source")
+                            if opcode_source:
+                                vm_summary["opcode_table_source"] = opcode_source
                         aggregate_meta.setdefault("vm_lift_summaries", []).append(dict(vm_summary))
                 else:
                     chunk_record["vm_lift_skipped"] = True

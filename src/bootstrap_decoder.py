@@ -35,7 +35,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Sized, Tuple
 
 try:  # Optional dependency used for Lua sandbox fallback
     from lupa import LuaError, LuaRuntime
@@ -321,9 +321,14 @@ class BootstrapDecoder:
                 metadata["extraction_notes"].append("decode iteration limit reached")
                 break
 
-        metadata["raw_matches_count"] = sum(
-            len(v) for v in raw_matches.values() if isinstance(v, Iterable)
-        )
+        raw_count = 0
+        for value in raw_matches.values():
+            if isinstance(value, Sized):
+                try:
+                    raw_count += len(value)  # type: ignore[arg-type]
+                except TypeError:
+                    continue
+        metadata["raw_matches_count"] = raw_count
         metadata["needs_emulation"] = needs_emulation
         if metadata["alphabet"] and not metadata.get("alphabet_preview"):
             metadata["alphabet_preview"] = self._preview(metadata["alphabet"])
@@ -540,9 +545,11 @@ class BootstrapDecoder:
     def python_reimpl_decode(self, blob_bytes: bytes) -> DecodingResult:
         """Attempt to decode ``blob_bytes`` using a Python reimplementation."""
 
-        alphabets = list(self._candidate_alphabets) or [None]
-        if self.script_key_bytes and None not in alphabets:
-            alphabets.append(None)  # allow raw handling with only key xor
+        alphabets: List[Optional[str]] = list(self._candidate_alphabets)
+        if not alphabets:
+            alphabets = [None]
+        elif self.script_key_bytes:
+            alphabets = list(alphabets) + [None]
 
         pipelines: List[List[str]] = [
             ["index_map", "key_xor", "index_mix"],
@@ -857,8 +864,10 @@ class BootstrapDecoder:
     def _apply_pipeline(
         self, blob_bytes: bytes, steps: Sequence[str], alphabet: Optional[str]
     ) -> Optional[bytes]:
-        data = blob_bytes
+        data: Optional[bytes] = blob_bytes
         for step in steps:
+            if data is None:
+                return None
             if step == "index_map":
                 data = self._alphabet_map(data, alphabet)
             elif step == "key_xor":
@@ -868,8 +877,6 @@ class BootstrapDecoder:
             elif step == "rle":
                 data = self._simple_rle_decode(data)
             else:
-                return None
-            if data is None:
                 return None
         return data
 

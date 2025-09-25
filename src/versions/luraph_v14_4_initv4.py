@@ -457,9 +457,11 @@ class InitV4Decoder:
         if self._bootstrap_decoder_blobs:
             metadata["blobs"] = [dict(entry) for entry in self._bootstrap_decoder_blobs]
         if self._bootstrap_decoder_metadata and self._debug_bootstrap:
-            metadata.setdefault("decoder", {}).setdefault(
-                "metadata", dict(self._bootstrap_decoder_metadata)
-            )
+            decoder_info = metadata.setdefault("decoder", {})
+            if isinstance(decoder_info, dict):
+                decoder_info.setdefault(
+                    "metadata", dict(self._bootstrap_decoder_metadata)
+                )
         merged_raw_matches: Optional[Dict[str, Any]] = None
         existing_raw = metadata.get("raw_matches")
         if isinstance(existing_raw, Mapping):
@@ -471,14 +473,14 @@ class InitV4Decoder:
         if merged_raw_matches:
             metadata["raw_matches"] = merged_raw_matches
 
-        preview = [
+        opcode_preview = [
             {"opcode": f"0x{opcode:02X}", "mnemonic": name}
             for opcode, name in list(sorted(opcode_map.items()))[:10]
         ]
         dump_payload = {
             "path": str(self._bootstrap_path) if self._bootstrap_path else None,
             "warnings": warnings,
-            "opcode_preview": preview,
+            "opcode_preview": opcode_preview,
             "alphabet": {
                 "length": len(alphabet) if alphabet else 0,
                 "sample": alphabet[:64] if alphabet else "",
