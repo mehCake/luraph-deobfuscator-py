@@ -31,3 +31,13 @@ def test_initv4_bootstrap_detects_alphabet_and_mapping(tmp_path: Path) -> None:
 
     meta = dict(bootstrap.iter_metadata())
     assert meta.get("alphabet_length") == len(alphabet)
+
+    extracted_alphabet, extracted_mapping, opcode_table, summary = bootstrap.extract_metadata(
+        base_table,
+        debug=False,
+    )
+    assert extracted_alphabet == alphabet
+    assert extracted_mapping.get("MOVE") == 0x10
+    assert opcode_table[0x2A].mnemonic == "FORLOOP"
+    extraction_meta = summary.get("extraction") or {}
+    assert extraction_meta.get("opcode_dispatch", {}).get("count", 0) >= len(opcode_table)

@@ -69,6 +69,7 @@ Frequently used flags:
 | `--profile` | Print a timing table for the executed passes |
 | `--script-key KEY` | Provide the decryption key required by Luraph v14.4.x payloads |
 | `--bootstrapper PATH` | Load an initv4 stub to recover its alphabet/opcode table automatically |
+| `--debug-bootstrap` | Dump detailed bootstrapper extraction logs and raw regex matches |
 | `--yes` | Auto-confirm detected versions and bootstrapper prompts |
 | `--force` | Continue even if required data (such as `--script-key`) is missing |
 | `--verbose` | Enable colourised console logging alongside `deobfuscator.log` |

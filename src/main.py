@@ -282,6 +282,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--only-passes", help="comma separated list of passes to run exclusively")
     parser.add_argument("--profile", action="store_true", help="print pass timings to stdout")
     parser.add_argument("--verbose", action="store_true", help="enable verbose colourised logging")
+    parser.add_argument(
+        "--debug-bootstrap",
+        action="store_true",
+        help="Enable verbose bootstrapper extraction logs",
+    )
     parser.add_argument("--vm-trace", action="store_true", help="capture VM trace logs during execution")
     parser.add_argument("--trace", dest="vm_trace", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--detect-only", action="store_true", help="only detect version information")
@@ -350,7 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     input_paths = [Path(path) for path in raw_inputs]
 
-    configure_logging(args.verbose)
+    configure_logging(args.verbose or args.debug_bootstrap)
 
     gathered_inputs: List[Path] = []
     for target in input_paths:
@@ -427,6 +432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             vm_trace=args.vm_trace,
             script_key=args.script_key,
             bootstrapper=bootstrapper_path,
+            debug_bootstrap=args.debug_bootstrap,
         )
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
@@ -460,6 +466,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     bootstrapper_path=bootstrapper_path,
                     yes=args.yes,
                     force=args.force,
+                    debug_bootstrap=args.debug_bootstrap,
                 )
                 ctx.options.update(
                     {
@@ -470,6 +477,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "auto_confirm": args.yes,
                         "force": args.force,
                         "script_key": args.script_key,
+                        "debug_bootstrap": args.debug_bootstrap,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()

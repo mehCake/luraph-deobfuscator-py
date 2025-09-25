@@ -1035,6 +1035,12 @@ def run(ctx: "Context") -> Dict[str, Any]:
 
     metadata = _finalise_metadata(aggregated, last_metadata)
 
+    payload_meta = metadata.get("handler_payload_meta")
+    if isinstance(payload_meta, dict):
+        extraction_meta = payload_meta.get("bootstrapper_metadata")
+        if isinstance(extraction_meta, dict) and extraction_meta:
+            ctx.result.setdefault("bootstrapper_metadata", dict(extraction_meta))
+
     placeholder_source = metadata.get("handler_placeholder_source")
     if (
         isinstance(placeholder_source, str)

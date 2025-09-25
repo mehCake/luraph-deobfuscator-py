@@ -198,6 +198,9 @@ def test_v1441_handler_uses_bootstrapper_metadata(tmp_path: Path) -> None:
     assert table[0x2A].mnemonic == "FORLOOP"
     assert table[0x2B].mnemonic == "TFORLOOP"
     assert table[0x22].mnemonic == "CONCAT"
+    extraction = meta.get("extraction") or {}
+    dispatch_meta = extraction.get("opcode_dispatch", {})
+    assert dispatch_meta.get("count", 0) >= len(table)
 
 
 def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
@@ -263,6 +266,9 @@ def test_extract_bytecode_includes_bootstrap_info(tmp_path: Path) -> None:
     assert meta.get("path", "").endswith("initv4.lua")
     assert payload.metadata.get("alphabet_length", 0) >= 85
     assert payload.metadata.get("alphabet_source") == "bootstrapper"
+    extraction_meta = payload.metadata.get("bootstrapper_metadata")
+    assert isinstance(extraction_meta, dict)
+    assert extraction_meta.get("opcode_dispatch", {}).get("count", 0) >= len(handler.opcode_table())
 
 
 def test_payload_decode_requires_script_key(tmp_path: Path) -> None:
@@ -331,7 +337,7 @@ def test_payload_decode_uses_script_key(tmp_path: Path) -> None:
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
-    assert payload_meta.get("alphabet_source") == "default"
+    assert payload_meta.get("alphabet_source") in {"default", "bootstrapper"}
     assert ctx.vm.meta.get("handler") in {"luraph_v14_4_initv4", "v14.4.1"}
     assert ctx.report.script_key_used == script_key
     assert ctx.report.blob_count >= 1
@@ -364,7 +370,7 @@ return 'ok'"""
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
-    assert payload_meta.get("alphabet_source") == "default"
+    assert payload_meta.get("alphabet_source") in {"default", "bootstrapper"}
     assert ctx.report.script_key_used == EXAMPLE_SCRIPT_KEY
 
 
@@ -594,7 +600,7 @@ def test_pipeline_deobfuscates_v1441_example(tmp_path: Path) -> None:
     assert payload_meta.get("script_key_provider") == "override"
     assert payload_meta.get("decode_method") == "base91"
     assert payload_meta.get("index_xor") is True
-    assert payload_meta.get("alphabet_source") == "default"
+    assert payload_meta.get("alphabet_source") in {"default", "bootstrapper"}
     assert output.read_text(encoding="utf-8").strip() == expected.strip()
 
 

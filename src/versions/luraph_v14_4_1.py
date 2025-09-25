@@ -476,6 +476,8 @@ class LuraphV1441(VersionHandler):
         self._bootstrap_meta: Dict[str, object] = {}
         self._alphabet_override: Optional[str] = None
         self._opcode_override: Dict[int, OpSpec] | None = None
+        self._debug_bootstrap: bool = False
+        self._bootstrap_debug_log: Optional[Path] = None
 
     def matches(self, text: str) -> bool:
         return (
@@ -485,12 +487,18 @@ class LuraphV1441(VersionHandler):
         )
 
     # ------------------------------------------------------------------
+    def set_bootstrap_debug_options(self, *, enabled: bool, log_path: Path | None = None) -> None:
+        self._debug_bootstrap = bool(enabled)
+        self._bootstrap_debug_log = Path(log_path) if log_path else None
+
     def set_bootstrapper(self, path: Path | str) -> Dict[str, object]:
         bootstrap = InitV4Bootstrap.load(path)
         self._bootstrapper = bootstrap
-        alphabet = bootstrap.alphabet()
-        mapping = bootstrap.opcode_mapping(_BASE_OPCODE_TABLE)
-        table = bootstrap.build_opcode_table(_BASE_OPCODE_TABLE)
+        alphabet, mapping, table, summary = bootstrap.extract_metadata(
+            _BASE_OPCODE_TABLE,
+            debug=self._debug_bootstrap,
+            debug_log=self._bootstrap_debug_log,
+        )
 
         ctx = SimpleNamespace(script_key=None, bootstrapper_path=bootstrap.path)
         decoder = InitV4Decoder(ctx, bootstrap=bootstrap)
@@ -507,16 +515,17 @@ class LuraphV1441(VersionHandler):
                     override_table[opcode] = spec
         self._opcode_override = dict(sorted(override_table.items()))
 
-        meta: Dict[str, object] = {"path": str(bootstrap.path)}
+        meta: Dict[str, object] = dict(summary)
+        meta.setdefault("path", str(bootstrap.path))
         if alphabet:
-            meta["alphabet_length"] = len(alphabet)
+            meta.setdefault("alphabet_length", len(alphabet))
 
         if decoder.has_custom_opcodes():
             extracted_map = decoder.opcode_map or {}
-            meta["opcode_map_entries"] = len(extracted_map)
-            meta["opcode_map"] = dict(sorted(extracted_map.items()))
+            meta.setdefault("opcode_map_entries", len(extracted_map))
+            meta.setdefault("opcode_map", dict(sorted(extracted_map.items())))
         elif mapping:
-            meta["opcode_map_entries"] = len(mapping)
+            meta.setdefault("opcode_map_entries", len(mapping))
 
         for key, value in bootstrap.iter_metadata():
             meta.setdefault(key, value)
@@ -699,7 +708,14 @@ class LuraphV1441(VersionHandler):
             metadata["script_key_provider"] = provider
         metadata.setdefault("format", metadata.get("format", "base64"))
         if self._bootstrap_meta:
-            metadata.setdefault("bootstrapper", dict(self._bootstrap_meta))
+            summary = {
+                key: value for key, value in self._bootstrap_meta.items() if key != "extraction"
+            }
+            if summary:
+                metadata.setdefault("bootstrapper", dict(summary))
+            extraction_meta = self._bootstrap_meta.get("extraction")
+            if isinstance(extraction_meta, dict) and extraction_meta:
+                metadata.setdefault("bootstrapper_metadata", dict(extraction_meta))
 
         try:
             decoded_text = raw.decode("utf-8")

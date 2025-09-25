@@ -69,6 +69,7 @@ class LuaDeobfuscator:
         vm_trace: bool = False,
         script_key: str | None = None,
         bootstrapper: str | os.PathLike[str] | Path | None = None,
+        debug_bootstrap: bool = False,
     ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
@@ -83,6 +84,8 @@ class LuaDeobfuscator:
         self._bootstrapper_path = self._normalise_bootstrapper(bootstrapper)
         self._last_render_validation: Dict[str, Any] = {}
         self._last_handler: VersionHandler | None = None
+        self._debug_bootstrap = bool(debug_bootstrap)
+        self._bootstrap_debug_log = Path("logs") / "bootstrap_extract.log"
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -151,6 +154,25 @@ class LuaDeobfuscator:
                 handler = None
         if isinstance(handler, VersionHandler):
             handler_instance = handler
+            debug_enabled = self._debug_bootstrap
+            if hasattr(handler_instance, "set_bootstrap_debug_options"):
+                try:
+                    handler_instance.set_bootstrap_debug_options(
+                        enabled=debug_enabled,
+                        log_path=self._bootstrap_debug_log,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            else:
+                try:
+                    setattr(handler_instance, "debug_bootstrap", debug_enabled)
+                    setattr(
+                        handler_instance,
+                        "bootstrap_debug_log",
+                        self._bootstrap_debug_log if debug_enabled else None,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
             if self._bootstrapper_path is not None:
                 setter = getattr(handler_instance, "set_bootstrapper", None)
                 if callable(setter):
@@ -160,7 +182,16 @@ class LuaDeobfuscator:
                         metadata["bootstrapper_error"] = str(exc)
                     else:
                         if isinstance(bootstrap_meta, dict) and bootstrap_meta:
-                            metadata.setdefault("bootstrapper", bootstrap_meta)
+                            extraction = bootstrap_meta.get("extraction")
+                            summary = {
+                                key: value
+                                for key, value in bootstrap_meta.items()
+                                if key != "extraction"
+                            }
+                            if summary:
+                                metadata.setdefault("bootstrapper", summary)
+                            if isinstance(extraction, dict) and extraction:
+                                metadata.setdefault("bootstrapper_metadata", extraction)
 
         self._last_handler = handler_instance
 

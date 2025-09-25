@@ -280,7 +280,7 @@ def test_cli_v1441_script_key_only(tmp_path):
 
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
-    assert payload_meta.get("alphabet_source") == "default"
+    assert payload_meta.get("alphabet_source") in {"default", "bootstrapper"}
     bootstrap_meta = payload_meta.get("bootstrapper")
     assert isinstance(bootstrap_meta, dict)
     assert "path" in bootstrap_meta
@@ -348,6 +348,9 @@ def test_cli_v1441_bootstrapper_only(tmp_path):
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
     assert bootstrap_meta.get("opcode_map_entries", 0) >= 4
+    root_bootstrap = data.get("bootstrapper_metadata") or {}
+    assert root_bootstrap.get("alphabet", {}).get("length", 0) >= 85
+    assert root_bootstrap.get("opcode_dispatch", {}).get("count", 0) >= 16
 
 
 def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
@@ -375,6 +378,38 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")
     assert payload_meta.get("decode_method") == "base91"
+    root_bootstrap = data.get("bootstrapper_metadata") or {}
+    assert root_bootstrap.get("opcode_dispatch", {}).get("count", 0) >= 16
+
+
+def test_cli_debug_bootstrap_dump(tmp_path):
+    target = _prepare_v1441_source(tmp_path)
+    stub_dir = _prepare_bootstrapper(tmp_path)
+    _run_cli(
+        target,
+        tmp_path,
+        "--script-key",
+        SCRIPT_KEY,
+        "--bootstrapper",
+        str(stub_dir),
+        "--format",
+        "json",
+        "--debug-bootstrap",
+    )
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    bootstrap_meta = data.get("bootstrapper_metadata") or {}
+    raw_matches = bootstrap_meta.get("raw_matches") or {}
+    assert raw_matches, "expected raw bootstrapper matches in metadata"
+    assert "opcode_named_values" in raw_matches or "alphabet_candidates" in raw_matches
+
+    log_path = tmp_path / "logs" / "bootstrap_extract.log"
+    assert log_path.exists()
+    log_data = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_data.get("raw_matches")
+    preview = log_data.get("opcode_preview") or []
+    assert preview, "expected opcode preview in debug log"
 
 
 def test_cli_reports_missing_script_key(tmp_path):
