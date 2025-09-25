@@ -136,10 +136,11 @@ The sandbox replaces the global environment, blocks file system and network
 primitives, enforces an instruction budget, and intercepts `load`/`loadstring`
 to capture the decoded chunk without executing arbitrary payloads.  **Because
 any third-party Lua code might still be hostile, only enable `--allow-lua-run`
-on machines you trust and that can be discarded if compromised.**  Installing
-`lupa>=1.8.0` (LuaJIT must be available on the system) enables this fallback
-path; without it the extractor logs that emulation is required and keeps the
-partially decoded blob under `out/logs/` for manual analysis.
+on machines you trust and that can be discarded if compromised. Never run the
+fallback on production hosts or with secrets accessible to the process.**
+Installing `lupa>=1.8.0` (LuaJIT must be available on the system) enables this
+fallback path; without it the extractor logs that emulation is required and
+keeps the partially decoded blob under `out/logs/` for manual analysis.
 
 Debugging bootstrapper extraction works best with `--debug-bootstrap`, which
 prints the recovered alphabet length, opcode previews, and extraction notes to

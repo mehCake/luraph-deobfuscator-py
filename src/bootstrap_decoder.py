@@ -234,11 +234,29 @@ class BootstrapDecoder:
             blob_bytes = self.unescape_lua_string(blob.literal)
             label = blob.name or f"blob_{index}"
             self._trace(f"Decoded literal {label!r} to {len(blob_bytes)} bytes")
-
-            decode_result = self.python_reimpl_decode(blob_bytes)
+            if self._printable_ratio(blob_bytes) > 0.9 and (
+                label.lower().startswith("alphabet")
+                or self._looks_like_lua(blob_bytes)
+            ):
+                decode_result = DecodingResult(
+                    success=True,
+                    decoded=blob_bytes,
+                    steps=["raw"],
+                    notes=["blob already printable"],
+                )
+            else:
+                decode_result = self.python_reimpl_decode(blob_bytes)
             method_used: Optional[str] = None
             if decode_result.success:
-                method_used = "python_reimpl"
+                verification = self.sandboxed_lua_decode(blob_bytes)
+                if verification.success:
+                    decode_result = verification
+                    method_used = "lua_fallback"
+                    metadata["fallback_attempted"] = True
+                    metadata["fallback_executed"] = True
+                    metadata["extraction_notes"].extend(verification.notes or [])
+                else:
+                    method_used = "python_reimpl"
             else:
                 metadata["fallback_attempted"] = True
                 self._trace("Python reimplementation failed; attempting Lua fallback")
@@ -258,6 +276,8 @@ class BootstrapDecoder:
                 if fallback_result.success:
                     decode_result = fallback_result
                     method_used = "lua_fallback"
+                    if fallback_result.notes:
+                        metadata["extraction_notes"].extend(fallback_result.notes)
                 else:
                     needs_emulation = needs_emulation or fallback_result.needs_emulation
                     errors.extend(filter(None, [fallback_result.error]))
@@ -466,13 +486,35 @@ class BootstrapDecoder:
 
         candidates: List[DecoderCandidate] = []
         func_pattern = re.compile(
-            r"function\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<params>[^)]*)\)(?P<body>.*?)end",
-            re.DOTALL,
+            r"function\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<params>[^)]*)\)",
+        )
+        token_pattern = re.compile(
+            r"\b(function|if|for|while|do|repeat|end|until)\b"
         )
         for match in func_pattern.finditer(bootstrap_src):
             name = match.group("name")
             params = [p.strip() for p in match.group("params").split(",") if p.strip()]
-            body = match.group("body")
+            start = match.start()
+            search_pos = match.end()
+            depth = 1
+            body_end = len(bootstrap_src)
+            while depth and search_pos < len(bootstrap_src):
+                token_match = token_pattern.search(bootstrap_src, search_pos)
+                if not token_match:
+                    break
+                token = token_match.group(0)
+                search_pos = token_match.end()
+                if token in {"function", "if", "for", "while", "do", "repeat"}:
+                    depth += 1
+                elif token == "end":
+                    depth -= 1
+                    if depth == 0:
+                        body_end = token_match.start()
+                        break
+                elif token == "until" and depth > 0:
+                    depth -= 1
+            body = bootstrap_src[match.end():body_end]
+            source = bootstrap_src[start:search_pos]
             hints = []
             if "string.byte" in body or "string.char" in body:
                 hints.append("string-byte-char")
@@ -482,14 +524,13 @@ class BootstrapDecoder:
                 hints.append("alphabet")
             if "script_key" in body or "key" in body:
                 hints.append("key")
-            start, end = match.span()
             candidate = DecoderCandidate(
                 name=name,
                 params=params,
                 body=body,
-                source=match.group(0),
+                source=source,
                 start=start,
-                end=end,
+                end=search_pos,
                 hints=hints,
             )
             candidates.append(candidate)
@@ -587,10 +628,10 @@ class BootstrapDecoder:
             )
             self._warned_about_lua = True
 
-        runtime = LuaRuntime(unpack_returned_tuples=True, register_eval=False)
+        runtime = LuaRuntime(unpack_returned_tuples=True, register_eval=True)
         base_env = self._build_sandbox_env(runtime)
-        loader = runtime.eval(
-            "return function(src, env)\n"
+        runtime.execute(
+            "function __bootstrap_loader(src, env)\n"
             "  local chunk, err = load(src, 'bootstrap', 't', env)\n"
             "  if not chunk then return nil, err end\n"
             "  local ok, res = pcall(chunk)\n"
@@ -598,18 +639,29 @@ class BootstrapDecoder:
             "  return env\n"
             "end"
         )
+        loader = runtime.globals()["__bootstrap_loader"]
 
         notes: List[str] = []
         for candidate in self._decoder_candidates:
             try:
                 env = runtime.table_from(base_env)
                 env["_G"] = env
-                compiled_env, err = loader(candidate.source, env)
+                loader_result = loader(candidate.source, env)
+                if isinstance(loader_result, tuple):
+                    compiled_env, err = loader_result
+                else:
+                    compiled_env, err = loader_result, None
                 if not compiled_env:
                     reason = f"lua-fallback-load-error {candidate.name}: {err}"
                     notes.append(reason)
                     continue
-                decode_func = compiled_env.get(candidate.name) if candidate.name else None
+                if candidate.name:
+                    try:
+                        decode_func = compiled_env[candidate.name]
+                    except (KeyError, TypeError):
+                        decode_func = None
+                else:
+                    decode_func = None
                 if decode_func is None:
                     notes.append(f"lua-fallback-missing-func {candidate.name}")
                     continue
@@ -673,7 +725,7 @@ class BootstrapDecoder:
                 return None
 
         string_mod = _eval(
-            "return {byte=string.byte, char=string.char, find=string.find, format=string.format,"
+            "{byte=string.byte, char=string.char, find=string.find, format=string.format,"
             " gsub=string.gsub, len=string.len, lower=string.lower, upper=string.upper,"
             " sub=string.sub, rep=string.rep}"
         )
@@ -681,27 +733,27 @@ class BootstrapDecoder:
             safe_env["string"] = string_mod
 
         table_mod = _eval(
-            "return {insert=table.insert, remove=table.remove, unpack=table.unpack, pack=table.pack}"
+            "{insert=table.insert, remove=table.remove, unpack=table.unpack, pack=table.pack, concat=table.concat}"
         )
         if table_mod is not None:
             safe_env["table"] = table_mod
 
         math_mod = _eval(
-            "return {abs=math.abs, ceil=math.ceil, floor=math.floor, max=math.max, min=math.min,"
+            "{abs=math.abs, ceil=math.ceil, floor=math.floor, max=math.max, min=math.min,"
             " sqrt=math.sqrt, modf=math.modf}"
         )
         if math_mod is not None:
             safe_env["math"] = math_mod
 
         bit32_mod = _eval(
-            "return bit32 and {band=bit32.band, bor=bit32.bor, bxor=bit32.bxor,"
+            "bit32 and {band=bit32.band, bor=bit32.bor, bxor=bit32.bxor,"
             " bnot=bit32.bnot, lshift=bit32.lshift, rshift=bit32.rshift, arshift=bit32.arshift}"
         )
         if bit32_mod is not None:
             safe_env["bit32"] = bit32_mod
 
         bit_mod = _eval(
-            "return bit and {band=bit.band, bor=bit.bor, bxor=bit.bxor, bnot=bit.bnot,"
+            "bit and {band=bit.band, bor=bit.bor, bxor=bit.bxor, bnot=bit.bnot,"
             " lshift=bit.lshift, rshift=bit.rshift}"
         )
         if bit_mod is not None:
@@ -741,7 +793,11 @@ class BootstrapDecoder:
         raw_opcodes: List[str] = []
         raw_constants: List[str] = []
 
-        alphabet_pattern = re.compile(r"[! -~]{80,120}")
+        literal_match = re.search(r"alphabet\s*=\s*\"([^\"]{80,120})\"", text)
+        if literal_match:
+            candidate = literal_match.group(1)
+            raw_alphabets.append(candidate)
+        alphabet_pattern = re.compile(r"[!\x23-~]{80,120}")
         for match in alphabet_pattern.finditer(text):
             candidate = match.group(0)
             if self._looks_like_alphabet(candidate):
@@ -754,6 +810,9 @@ class BootstrapDecoder:
             re.compile(r"case\s+(0x[0-9A-Fa-f]+)\s*:\s*--\s*([A-Za-z0-9_]+)"),
             re.compile(r"opcodes\[\"([A-Za-z0-9_]+)\"\]\s*=\s*(0x[0-9A-Fa-f]+|\d+)")
         ]
+        string_opcode_pattern = re.compile(
+            r"\[\s*(0x[0-9A-Fa-f]+)\s*\]\s*=\s*\"([A-Za-z0-9_]+)\""
+        )
         for pattern in opcode_patterns:
             for match in pattern.finditer(text):
                 raw_opcodes.append(match.group(0))
@@ -764,6 +823,10 @@ class BootstrapDecoder:
                     value = int(match.group(1), 0)
                     name = match.group(2)
                 opcode_map[value] = name.upper()
+        for match in string_opcode_pattern.finditer(text):
+            raw_opcodes.append(match.group(0))
+            value = int(match.group(1), 0)
+            opcode_map[value] = match.group(2).upper()
 
         const_pattern = re.compile(r"([A-Z][A-Z0-9_]+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)")
         for match in const_pattern.finditer(text):
@@ -908,7 +971,10 @@ class BootstrapDecoder:
                 fh.write(data)
             self._primary_blob_written = True
             self._primary_blob_path = base_path
-        filename = f"bootstrap_decoded_{self._input_name}_{label}.bin"
+        safe_label = re.sub(r"[^A-Za-z0-9._-]", "_", label) if label else "blob"
+        if len(safe_label) > 48:
+            safe_label = safe_label[:48]
+        filename = f"bootstrap_decoded_{self._input_name}_{safe_label}.bin"
         path = os.path.join(self.logs_dir, filename)
         with open(path, "wb") as fh:
             fh.write(data)
