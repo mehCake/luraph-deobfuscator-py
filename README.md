@@ -120,6 +120,16 @@ provide `--script-key` (or run with `--force` to request a best-effort decode)
 before devirtualisation proceeds.  `--bootstrapper` can then focus purely on
 opcode/alphabet extraction.
 
+When initv4 hides metadata inside high-entropy blobs, the extractor first tries
+to reproduce the Lua decode routine in pure Python.  If those heuristics fall
+short, the pipeline automatically retries inside a sandboxed LuaJIT runtime
+powered by [`lupa`](https://pypi.org/project/lupa/).  The sandbox blocks file
+system and network primitives, enforces an instruction budget, and intercepts
+`load`/`loadstring` to capture the decoded chunk without executing arbitrary
+payloads.  Installing `lupa>=1.8.0` (LuaJIT must be available) enables this
+fallback path; without it the extractor logs that emulation is required and
+keeps the partially decoded blob under `out/logs/` for manual analysis.
+
 Practical combinations look like:
 
 ```bash

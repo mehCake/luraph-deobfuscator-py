@@ -23,6 +23,12 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+try:  # Optional dependency used for sandboxed Lua fallback execution
+    from lupa import LuaError, LuaRuntime
+except ImportError:  # pragma: no cover - optional dependency may be absent
+    LuaRuntime = None  # type: ignore[assignment]
+    LuaError = Exception  # type: ignore[assignment]
+
 
 LOG = logging.getLogger(__name__)
 
@@ -54,6 +60,7 @@ class DecoderFunctionInfo:
     name: Optional[str]
     params: List[str]
     body: str
+    source: str
     start: int
     end: int
     hints: List[str] = field(default_factory=list)
@@ -87,6 +94,20 @@ class BootstrapperExtractionResult:
     success: bool
     errors: List[str] = field(default_factory=list)
     needs_emulation: bool = False
+
+
+@dataclass
+class LuaFallbackResult:
+    """Describes the outcome of attempting a sandboxed Lua execution."""
+
+    success: bool
+    decoded_chunk: Optional[bytes] = None
+    error: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+
+
+class LuaTimeout(RuntimeError):
+    """Raised when the sandboxed Lua runtime exceeds the instruction budget."""
 
 
 class BootstrapDecoder:
@@ -245,7 +266,7 @@ class BootstrapDecoder:
         """Heuristically identify Lua functions that perform blob decoding."""
 
         func_regex = re.compile(
-            r"function\s+(?P<name>[A-Za-z0-9_.:]*)\s*\((?P<params>[^)]*)\)(?P<body>.*?)(?<=\n)end",
+            r"(?P<full>function\s+(?P<name>[A-Za-z0-9_.:]*)\s*\((?P<params>[^)]*)\)(?P<body>.*?)(?<=\n)end)",
             re.DOTALL,
         )
 
@@ -275,6 +296,7 @@ class BootstrapDecoder:
                     name=match.group("name") or None,
                     params=params,
                     body=body,
+                    source=match.group("full"),
                     start=match.start(),
                     end=match.end(),
                     hints=hints,
@@ -393,12 +415,13 @@ class BootstrapDecoder:
             metadata["alphabet"] = alphabet_match.group(1)
 
         opcode_regex = re.compile(
-            r"\[\s*(0x[0-9A-Fa-f]+|\d+)\s*\]\s*=\s*(?:function[^-]*--\s*)?([A-Za-z0-9_]+)",
+            r"\[\s*(0x[0-9A-Fa-f]+|\d+)\s*\]\s*=\s*(?:function[^-]*--\s*([A-Za-z0-9_]+)|\"([^\"]+)\")",
             re.DOTALL,
         )
-        for code, name in opcode_regex.findall(text):
+        for code, fn_name, str_name in opcode_regex.findall(text):
             opcode = int(code, 0)
-            metadata["opcode_map"][opcode] = name.upper()
+            name = fn_name or str_name
+            metadata["opcode_map"][opcode] = (name or "").upper()
 
         constant_regex = re.compile(
             r"([A-Z][A-Z0-9_]+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)", re.MULTILINE
@@ -455,6 +478,7 @@ class BootstrapDecoder:
             "blobs": [blob.as_dict() for blob in blobs],
             "decoder_functions": [fn.describe() for fn in decoder_functions],
         }
+        raw_matches_wrapped = {"bootstrap_decoder": raw_matches}
 
         decoded_blobs: Dict[str, bytes] = {}
         aggregate_metadata: Dict[str, Any] = {
@@ -462,7 +486,7 @@ class BootstrapDecoder:
             "opcode_map": {},
             "constants": {},
             "blobs": [],
-            "raw_matches": raw_matches,
+            "raw_matches": raw_matches_wrapped,
             "raw_matches_count": 0,
             "needs_emulation": False,
             "extraction_notes": [],
@@ -529,6 +553,50 @@ class BootstrapDecoder:
         success = bool(decoded_blobs)
         aggregate_metadata["needs_emulation"] = needs_emulation or not success
 
+        fallback_result: Optional[LuaFallbackResult] = None
+        fallback_required = (
+            aggregate_metadata.get("needs_emulation", False)
+            or not aggregate_metadata.get("alphabet")
+            or (len(aggregate_metadata.get("opcode_map") or {}) < 16)
+        )
+
+        if fallback_required:
+            LOG.info("[BOOTSTRAP] Attempting sandboxed Lua fallback execution.")
+            fallback_result = self._attempt_lua_fallback(src, script_key_bytes)
+            if fallback_result and fallback_result.success and fallback_result.decoded_chunk:
+                decoded_bytes = fallback_result.decoded_chunk
+                decoded_records.append(("lua_fallback", decoded_bytes))
+                decoded_blobs["lua_fallback"] = decoded_bytes
+                meta = self.extract_metadata_from_decoded(decoded_bytes)
+                if meta.get("alphabet"):
+                    aggregate_metadata["alphabet"] = meta["alphabet"]
+                aggregate_metadata["opcode_map"].update(meta.get("opcode_map", {}))
+                aggregate_metadata["constants"].update(meta.get("constants", {}))
+                aggregate_metadata.setdefault("extraction_notes", []).append("lua-fallback")
+                aggregate_metadata["needs_emulation"] = False
+                aggregate_metadata.setdefault("fallback", {}).update(
+                    {
+                        "strategy": "lua-sandbox",
+                        "notes": list(fallback_result.notes),
+                    }
+                )
+                aggregate_metadata["blobs"].append(
+                    {
+                        "index": len(aggregate_metadata["blobs"]),
+                        "name": "lua_fallback",
+                        "kind": "lua-fallback",
+                        "size": len(decoded_bytes),
+                        "decoded_size": len(decoded_bytes),
+                    }
+                )
+                success = True
+                needs_emulation = False
+            elif fallback_result and fallback_result.error:
+                aggregate_metadata.setdefault("extraction_notes", []).append(
+                    f"lua-fallback-error:{fallback_result.error}"
+                )
+                needs_emulation = True
+
         if not aggregate_metadata.get("alphabet"):
             aggregate_metadata["extraction_notes"].append("alphabet-missing")
         if not aggregate_metadata.get("opcode_map"):
@@ -582,7 +650,7 @@ class BootstrapDecoder:
             input_name,
             decoded_records,
             aggregate_metadata,
-            raw_matches,
+            raw_matches_wrapped,
             debug_enabled=bool(getattr(self.ctx, "debug_bootstrap", False)),
         )
         if artifact_paths:
@@ -602,7 +670,7 @@ class BootstrapDecoder:
             raw_matches=raw_matches,
             success=success,
             errors=errors,
-            needs_emulation=needs_emulation,
+            needs_emulation=aggregate_metadata.get("needs_emulation", needs_emulation),
         )
 
         LOG.info(
@@ -613,6 +681,139 @@ class BootstrapDecoder:
         )
 
         return result
+
+    # ------------------------------------------------------------------
+    def _attempt_lua_fallback(
+        self, bootstrap_src: str, script_key_bytes: bytes
+    ) -> Optional[LuaFallbackResult]:
+        """Execute the bootstrapper inside a sandboxed Lua runtime if available."""
+
+        if LuaRuntime is None:
+            LOG.warning(
+                "[BOOTSTRAP] Lua fallback unavailable because 'lupa' is not installed."
+            )
+            return LuaFallbackResult(
+                success=False, error="missing-lupa", notes=["missing-lupa"]
+            )
+
+        lua = LuaRuntime(unpack_returned_tuples=True, register_eval=False, encoding="latin-1")
+        globals_table = lua.globals()
+
+        key_text = script_key_bytes.decode("utf-8", errors="ignore")
+        escaped_key = key_text.replace("\\", "\\\\").replace("'", "\\'")
+        script_prefix = ""
+        if escaped_key:
+            script_prefix = (
+                f"_G.script_key = '{escaped_key}'\n"
+                "_G.SCRIPT_KEY = _G.script_key\n"
+                "_G.scriptKey = _G.script_key\n"
+                "script_key = _G.script_key\n"
+                "SCRIPT_KEY = _G.SCRIPT_KEY\n"
+                "scriptKey = _G.script_key\n"
+            )
+
+        blocked_message = "blocked bootstrapper API"
+
+        def _blocked(name: str) -> Callable[..., Any]:
+            def _inner(*_: Any, **__: Any) -> None:
+                raise RuntimeError(f"{name} is {blocked_message}")
+
+            return _inner
+
+        # Replace dangerous globals with safe stubs or empty tables.
+        for name in ("dofile", "loadfile", "require", "collectgarbage", "setfenv", "getfenv"):
+            globals_table[name] = _blocked(name)
+        for name in ("os", "io", "package", "debug"):
+            globals_table[name] = lua.table()
+
+        def _http_stub(*_: Any, **__: Any) -> None:
+            raise RuntimeError("network access disabled in bootstrap sandbox")
+
+        globals_table["syn"] = lua.table()
+        globals_table["syn"]["request"] = _http_stub
+        globals_table["game"] = lua.table()
+        globals_table["game"]["HttpGet"] = _http_stub
+        globals_table["http"] = lua.table()
+        globals_table["http"]["request"] = _http_stub
+        globals_table["request"] = _http_stub
+
+        max_chunk_size = 8 * 1024 * 1024  # 8 MiB safety cap
+
+        instruction_budget = 250_000
+        executed = {"count": 0}
+
+        def _hook(*_: Any) -> None:
+            executed["count"] += 1
+            if executed["count"] > instruction_budget:
+                raise LuaTimeout("Lua bootstrapper exceeded instruction budget")
+
+        set_debug_hook = getattr(lua, "set_debug_hook", None)
+        if callable(set_debug_hook):
+            set_debug_hook(_hook, instruction_count=1_000)
+        else:  # pragma: no cover - older Lua runtimes may not expose debug hooks
+            LOG.debug("[BOOTSTRAP] Lua runtime does not expose set_debug_hook; proceeding without instruction guard.")
+            executed["no_debug_hook"] = True
+
+        try:
+            capture_prefix = (
+                "_bootstrap_capture = nil\n"
+                "local function _bootstrap_loader(chunk, ...) \n"
+                "  _bootstrap_capture = chunk\n"
+                "  return function() return nil end\n"
+                "end\n"
+                "load = _bootstrap_loader\n"
+                "loadstring = _bootstrap_loader\n"
+            )
+            lua.execute(capture_prefix + script_prefix + bootstrap_src)
+        except LuaTimeout as exc:
+            LOG.error("[BOOTSTRAP] Lua fallback timed out: %s", exc)
+            return LuaFallbackResult(success=False, error="timeout", notes=["timeout"])
+        except LuaError as exc:  # type: ignore[misc]
+            LOG.error("[BOOTSTRAP] Lua runtime error during fallback: %s", exc)
+            return LuaFallbackResult(
+                success=False, error="lua-error", notes=[str(exc)[:200]]
+            )
+        except RuntimeError as exc:
+            LOG.error("[BOOTSTRAP] Lua fallback blocked an operation: %s", exc)
+            return LuaFallbackResult(
+                success=False, error="blocked-operation", notes=[str(exc)[:200]]
+            )
+        finally:
+            if callable(set_debug_hook):
+                set_debug_hook(None)
+
+        captured_value: Any = None
+        try:
+            captured_value = globals_table["_bootstrap_capture"]
+        except Exception:
+            captured_value = None
+
+        chunk_bytes: Optional[bytes] = None
+        if captured_value is not None:
+            if isinstance(captured_value, (bytes, bytearray)):
+                chunk_bytes = bytes(captured_value)
+            elif isinstance(captured_value, str):
+                chunk_bytes = captured_value.encode("latin-1", errors="ignore")
+            else:
+                try:
+                    chunk_bytes = bytes(captured_value)
+                except Exception:  # pragma: no cover - fallback
+                    chunk_bytes = str(captured_value).encode("latin-1", errors="ignore")
+
+        if chunk_bytes and len(chunk_bytes) > max_chunk_size:
+            raise RuntimeError("decoded chunk exceeds sandbox limit")
+
+        if not chunk_bytes:
+            LOG.warning("[BOOTSTRAP] Lua fallback did not capture a decoded chunk.")
+            return LuaFallbackResult(success=False, error="no-chunk", notes=["no-chunk"])
+
+        LOG.info(
+            "[BOOTSTRAP] Lua fallback captured %d decoded bytes.", len(chunk_bytes)
+        )
+        notes = ["lua-capture"]
+        if executed.get("no_debug_hook"):
+            notes.append("no-debug-hook")
+        return LuaFallbackResult(success=True, decoded_chunk=chunk_bytes, notes=notes)
 
     # ------------------------------------------------------------------
     def _persist_artifacts(
@@ -629,7 +830,7 @@ class BootstrapDecoder:
         sanitized_input = re.sub(r"[^A-Za-z0-9_.-]", "_", input_name) or "bootstrap"
         sanitized_input = sanitized_input[:60]
 
-        out_logs_dir = os.path.join("out", "logs")
+        out_logs_dir = os.path.abspath(os.path.join("out", "logs"))
         os.makedirs(out_logs_dir, exist_ok=True)
 
         debug_timestamp: Optional[str] = None
@@ -643,7 +844,7 @@ class BootstrapDecoder:
                     debug_timestamp = stem.replace("bootstrap_extract_debug_", "", 1)
             if debug_path is None:
                 debug_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                logs_dir = os.path.join("logs")
+                logs_dir = os.path.abspath("logs")
                 os.makedirs(logs_dir, exist_ok=True)
                 debug_path = os.path.join(
                     logs_dir, f"bootstrap_extract_debug_{debug_timestamp}.log"
