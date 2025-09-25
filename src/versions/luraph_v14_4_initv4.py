@@ -19,6 +19,10 @@ from ..bootstrap_extractor import BootstrapExtractor
 
 LOG = logging.getLogger(__name__)
 
+
+def _bootstrap_log(level: int, message: str, *args: object) -> None:
+    LOG.log(level, "[BOOTSTRAP] " + message, *args)
+
 DEFAULT_ALPHABET = (
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     "!#$%&()*+,-./:;<=>?@[]^_`{|}~"
@@ -221,30 +225,65 @@ class InitV4Decoder:
         if not opcode_map and has_bootstrap:
             warnings.append("opcode_mapping_not_found")
 
+        preview_len = 32
         if alphabet:
-            LOG.info("Bootstrapper alphabet length: %d", len(alphabet))
-            preview = alphabet[:32]
-            suffix = "..." if len(alphabet) > 32 else ""
-            LOG.info("Bootstrapper alphabet sample: %s%s", preview, suffix)
+            preview = alphabet[:preview_len]
+            suffix = "..." if len(alphabet) > preview_len else ""
+            _bootstrap_log(
+                logging.INFO,
+                "Extracted alphabet (len=%d): %s%s",
+                len(alphabet),
+                preview,
+                suffix,
+            )
         elif has_bootstrap:
-            LOG.warning("Bootstrapper alphabet missing; default alphabet will be used")
+            _bootstrap_log(
+                logging.WARNING,
+                "Alphabet missing; default alphabet will be used.",
+            )
 
         if opcode_map:
-            LOG.info("Bootstrapper opcode dispatch entries: %d", len(opcode_map))
-            for opcode, name in list(sorted(opcode_map.items()))[:10]:
-                LOG.info("  opcode 0x%02X -> %s", opcode, name)
+            total = len(opcode_map)
+            preview_count = min(10, total)
+            _bootstrap_log(
+                logging.INFO,
+                "Extracted %d opcode mappings. First %d:",
+                total,
+                preview_count,
+            )
+            for opcode, name in list(sorted(opcode_map.items()))[:preview_count]:
+                LOG.info("  0x%02X -> %s", opcode, name)
+            if total < 16:
+                _bootstrap_log(
+                    logging.WARNING,
+                    "Only %d opcode mappings extracted; results may be incomplete.",
+                    total,
+                )
         elif has_bootstrap:
-            LOG.warning("Bootstrapper opcode dispatch table not discovered")
+            _bootstrap_log(logging.WARNING, "Opcode dispatch table not discovered.")
+
+        if constants:
+            items = list(sorted(constants.items()))
+            preview_items = items[:5]
+            summary = ", ".join(f"{name}={value}" for name, value in preview_items)
+            if len(items) > len(preview_items):
+                summary += ", ..."
+            _bootstrap_log(
+                logging.INFO,
+                "Extracted %d constants: %s",
+                len(constants),
+                summary,
+            )
+        elif has_bootstrap:
+            _bootstrap_log(logging.INFO, "No bootstrapper constants discovered.")
 
         raw_matches = self._raw_matches if self._debug_bootstrap else None
         if raw_matches:
             try:
-                LOG.debug(
-                    "Bootstrapper raw matches:\n%s",
-                    json.dumps(raw_matches, indent=2, sort_keys=True),
-                )
+                pretty = json.dumps(raw_matches, indent=2, sort_keys=True)
             except TypeError:  # pragma: no cover - safety
-                LOG.debug("Bootstrapper raw matches: %r", raw_matches)
+                pretty = repr(raw_matches)
+            LOG.debug("[BOOTSTRAP] Raw matches:%s%s", "\n", pretty)
 
         dispatch_map = {f"0x{opcode:02X}": name for opcode, name in sorted(opcode_map.items())}
         metadata: Dict[str, object] = {
@@ -290,11 +329,19 @@ class InitV4Decoder:
                     json.dumps(dump_payload, indent=2, sort_keys=True),
                     encoding="utf-8",
                 )
-            except Exception:  # pragma: no cover - best effort
-                LOG.debug(
-                    "Failed to write bootstrap debug log to %s",
+                _bootstrap_log(
+                    logging.INFO,
+                    "Raw matches dumped to %s",
                     self._bootstrap_debug_log,
-                    exc_info=True,
+                )
+            except Exception:  # pragma: no cover - best effort
+                _bootstrap_log(
+                    logging.WARNING,
+                    "Failed to write raw matches to %s",
+                    self._bootstrap_debug_log,
+                )
+                LOG.debug(
+                    "Failed to write bootstrap debug log", exc_info=True
                 )
 
         if has_bootstrap or alphabet or opcode_map or constants or raw_matches:

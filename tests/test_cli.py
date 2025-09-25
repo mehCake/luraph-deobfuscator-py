@@ -382,7 +382,7 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
     assert root_bootstrap.get("opcode_dispatch", {}).get("count", 0) >= 16
 
 
-def test_cli_debug_bootstrap_dump(tmp_path):
+def test_debug_bootstrap_logging(tmp_path):
     target = _prepare_v1441_source(tmp_path)
     stub_dir = _prepare_bootstrapper(tmp_path)
     _run_cli(
@@ -402,7 +402,8 @@ def test_cli_debug_bootstrap_dump(tmp_path):
     bootstrap_meta = data.get("bootstrapper_metadata") or {}
     raw_matches = bootstrap_meta.get("raw_matches") or {}
     assert raw_matches, "expected raw bootstrapper matches in metadata"
-    assert "opcode_named_values" in raw_matches or "alphabet_candidates" in raw_matches
+    bootstrap_raw = raw_matches.get("bootstrap_extractor") or {}
+    assert bootstrap_raw.get("opcodes") or bootstrap_raw.get("alphabets")
 
     log_path = tmp_path / "logs" / "bootstrap_extract.log"
     assert log_path.exists()

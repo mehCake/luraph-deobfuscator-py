@@ -9,8 +9,6 @@ from typing import Any, Dict, Optional
 
 LOG = logging.getLogger(__name__)
 
-_PRINTABLE = r"!\x22#$%&'()*+,\-./0-9:;<=>?@A-Z\\[\\]^_`a-z{|}~"
-
 
 def _parse_int(value: str) -> int:
     try:
@@ -50,36 +48,60 @@ class BootstrapExtractor:
             for opcode, name in preview:
                 LOG.info("  opcode 0x%02X -> %s", opcode, name)
 
+        raw_matches = None
+        if debug_enabled:
+            raw_matches = {key: list(values) for key, values in self.raw_matches.items()}
+
         return {
             "alphabet": self.alphabet,
             "opcode_map": dict(sorted(self.opcode_map.items())),
             "constants": dict(sorted(self.constants.items())),
-            "raw_matches": dict(self.raw_matches) if debug_enabled else None,
+            "raw_matches": raw_matches,
         }
 
     # ------------------------------------------------------------------
     def _extract_alphabet(self, text: str) -> None:
-        pattern = re.compile(r'alphabet\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+        pattern = re.compile(r'alphabet\s*=\s*[\'"]([^\'"\\]*(?:\\.[^\'"\\]*)*)[\'"]')
         for match in pattern.finditer(text):
             candidate = match.group(1)
             self.raw_matches["alphabets"].append(candidate)
-        long_string_pattern = re.compile(rf"\"([{_PRINTABLE}]{{80,120}})\"")
+        long_string_pattern = re.compile(r'[\'"]([! -~]{80,120})[\'"]')
         for match in long_string_pattern.finditer(text):
             self.raw_matches["alphabets"].append(match.group(1))
         if self.raw_matches["alphabets"]:
             self.alphabet = max(self.raw_matches["alphabets"], key=len)
         else:
-            LOG.warning("No alphabet found in bootstrapper, using default.")
+            LOG.warning("[BOOTSTRAP] No alphabet found in bootstrapper, using default.")
             self.alphabet = None
 
     # ------------------------------------------------------------------
     def _extract_opcodes(self, text: str) -> None:
+        for match in re.finditer(
+            r"\[(0x[0-9A-Fa-f]+|\d+)\]\s*=\s*['\"]([A-Za-z0-9_]+)['\"]",
+            text,
+        ):
+            opcode = _parse_int(match.group(1))
+            name = match.group(2).upper()
+            self.opcode_map.setdefault(opcode, name)
+            self.raw_matches["opcodes"].append(match.group(0))
         for match in re.finditer(
             r"\[\s*(0x[0-9A-Fa-f]+)\s*\]\s*=\s*function\s*\([^)]*\)\s*--\s*([A-Za-z0-9_]+)",
             text,
         ):
             opcode = int(match.group(1), 16)
             name = match.group(2).upper()
+            self.opcode_map.setdefault(opcode, name)
+            self.raw_matches["opcodes"].append(match.group(0))
+        for match in re.finditer(
+            r"([A-Za-z_][A-Za-z0-9_]*)\[(0x[0-9A-Fa-f]+|\d+)\]\s*=\s*function(.*?)(?:--\s*([A-Za-z0-9_]+))",
+            text,
+            flags=re.DOTALL,
+        ):
+            comment = match.group(4)
+            if not comment:
+                continue
+            opcode = _parse_int(match.group(2))
+            name = comment.upper()
             self.opcode_map.setdefault(opcode, name)
             self.raw_matches["opcodes"].append(match.group(0))
         for match in re.finditer(
@@ -100,7 +122,9 @@ class BootstrapExtractor:
             self.raw_matches["opcodes"].append(match.group(0))
 
         if len(self.opcode_map) < 16:
-            LOG.warning("Opcode map extraction found fewer than 16 entries. Incomplete mapping?")
+            LOG.warning(
+                "[BOOTSTRAP] Opcode map extraction found fewer than 16 entries. Incomplete mapping?"
+            )
 
     # ------------------------------------------------------------------
     def _extract_constants(self, text: str) -> None:
@@ -109,8 +133,8 @@ class BootstrapExtractor:
             value = _parse_int(match.group(2))
             self.constants.setdefault(name, value)
             self.raw_matches["constants"].append(match.group(0))
-        if self.constants and bool(getattr(self.ctx, "debug_bootstrap", False)):
-            LOG.info("Discovered %d bootstrapper constants", len(self.constants))
+        if not self.constants:
+            LOG.debug("[BOOTSTRAP] No constants discovered in bootstrapper text")
 
 
 __all__ = ["BootstrapExtractor"]
