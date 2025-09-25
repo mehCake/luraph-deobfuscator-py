@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,7 +86,8 @@ class LuaDeobfuscator:
         self._last_render_validation: Dict[str, Any] = {}
         self._last_handler: VersionHandler | None = None
         self._debug_bootstrap = bool(debug_bootstrap)
-        self._bootstrap_debug_log = Path("logs") / "bootstrap_extract.log"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._bootstrap_debug_log = Path("logs") / f"bootstrap_extract_debug_{timestamp}.log"
         self._bootstrap_meta: Dict[str, Any] = {}
 
     # --- Pipeline stages -------------------------------------------------

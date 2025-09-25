@@ -349,8 +349,14 @@ def test_cli_v1441_bootstrapper_only(tmp_path):
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
     assert bootstrap_meta.get("opcode_map_entries", 0) >= 4
     root_bootstrap = data.get("bootstrapper_metadata") or {}
-    assert root_bootstrap.get("alphabet", {}).get("length", 0) >= 85
-    assert root_bootstrap.get("opcode_dispatch", {}).get("count", 0) >= 16
+    assert root_bootstrap.get("alphabet_len", 0) >= 85
+    assert root_bootstrap.get("opcode_map_count", 0) >= 16
+    assert root_bootstrap.get("opcode_map_sample")
+    artifacts = root_bootstrap.get("artifact_paths") or {}
+    decoded_path = artifacts.get("decoded_blob_path")
+    metadata_path = artifacts.get("metadata_path")
+    assert decoded_path and (tmp_path / Path(decoded_path)).exists()
+    assert metadata_path and (tmp_path / Path(metadata_path)).exists()
 
 
 def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
@@ -379,7 +385,10 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")
     assert payload_meta.get("decode_method") == "base91"
     root_bootstrap = data.get("bootstrapper_metadata") or {}
-    assert root_bootstrap.get("opcode_dispatch", {}).get("count", 0) >= 16
+    assert root_bootstrap.get("opcode_map_count", 0) >= 16
+    assert root_bootstrap.get("opcode_map_sample")
+    artifacts = root_bootstrap.get("artifact_paths") or {}
+    assert artifacts.get("decoded_blob_path")
 
 
 def test_debug_bootstrap_logging(tmp_path):
@@ -405,12 +414,14 @@ def test_debug_bootstrap_logging(tmp_path):
     bootstrap_raw = raw_matches.get("bootstrap_decoder") or {}
     assert bootstrap_raw.get("blobs") or bootstrap_raw.get("decoder_functions")
 
-    log_path = tmp_path / "logs" / "bootstrap_extract.log"
-    assert log_path.exists()
-    log_data = json.loads(log_path.read_text(encoding="utf-8"))
+    logs_dir = tmp_path / "logs"
+    assert logs_dir.exists()
+    debug_logs = list(logs_dir.glob("bootstrap_extract_debug_*.log"))
+    assert debug_logs, "expected debug bootstrap logs"
+    log_data = json.loads(debug_logs[-1].read_text(encoding="utf-8"))
     assert log_data.get("raw_matches")
-    preview = log_data.get("opcode_preview") or []
-    assert preview, "expected opcode preview in debug log"
+    preview = log_data.get("metadata_preview") or {}
+    assert preview.get("opcode_map_count", 0) >= 1
 
 
 def test_cli_reports_missing_script_key(tmp_path):

@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -460,14 +462,26 @@ class BootstrapDecoder:
             "opcode_map": {},
             "constants": {},
             "blobs": [],
+            "raw_matches": raw_matches,
+            "raw_matches_count": 0,
+            "needs_emulation": False,
+            "extraction_notes": [],
+            "decoder": {},
         }
         errors: List[str] = []
         needs_emulation = False
+        decoded_records: List[Tuple[str, bytes]] = []
 
         decoder_impl: Optional[DecoderImplementation] = None
         if decoder_functions:
             decoder_impl = self.reimplement_decoder(decoder_functions[0].body)
             needs_emulation = needs_emulation or decoder_impl.needs_emulation
+            aggregate_metadata["decoder"] = {
+                "needs_emulation": decoder_impl.needs_emulation,
+                "notes": list(decoder_impl.notes),
+            }
+        else:
+            aggregate_metadata["decoder"] = {"needs_emulation": True, "notes": ["no-decoder-functions"]}
 
         for idx, blob in enumerate(blobs):
             literal = blob.literal
@@ -494,33 +508,94 @@ class BootstrapDecoder:
             if error:
                 errors.append(error)
 
+            decoded_records.append((blob.name or f"blob_{idx}", decoded))
+
             meta = self.extract_metadata_from_decoded(decoded)
             if meta.get("alphabet") and not aggregate_metadata.get("alphabet"):
                 aggregate_metadata["alphabet"] = meta["alphabet"]
             aggregate_metadata["opcode_map"].update(meta.get("opcode_map", {}))
             aggregate_metadata["constants"].update(meta.get("constants", {}))
 
-            self._persist_artifacts(blob, decoded, meta)
-
-            sanitized_name = re.sub(
-                r"[^A-Za-z0-9_.-]", "_", (blob.name or f"offset_{blob.start}")
-            )[:60]
             blob_entry = {
+                "index": idx,
                 "name": blob.name,
                 "kind": blob.kind,
                 "size": len(blob_bytes),
                 "decoded_size": len(decoded),
-                "decoded_path": os.path.join(
-                    "logs", f"bootstrap_decoded_{sanitized_name}.bin"
-                ),
-                "metadata_path": os.path.join(
-                    "logs", f"bootstrapper_metadata_{sanitized_name}.json"
-                ),
             }
             aggregate_metadata["blobs"].append(blob_entry)
             decoded_blobs[f"blob_{idx}"] = decoded
 
         success = bool(decoded_blobs)
+        aggregate_metadata["needs_emulation"] = needs_emulation or not success
+
+        if not aggregate_metadata.get("alphabet"):
+            aggregate_metadata["extraction_notes"].append("alphabet-missing")
+        if not aggregate_metadata.get("opcode_map"):
+            aggregate_metadata["extraction_notes"].append("opcode-map-incomplete")
+
+        aggregate_metadata["raw_matches_count"] = sum(
+            len(entries)
+            for entries in raw_matches.values()
+            if isinstance(entries, list)
+        )
+
+        alphabet = aggregate_metadata.get("alphabet")
+        if isinstance(alphabet, str):
+            aggregate_metadata["alphabet_len"] = len(alphabet)
+            aggregate_metadata.setdefault("alphabet_preview", alphabet[:120])
+        else:
+            aggregate_metadata["alphabet_len"] = 0
+
+        opcode_map = aggregate_metadata.get("opcode_map") or {}
+        try:
+            sorted_opcodes = sorted(
+                opcode_map.items(), key=lambda item: int(item[0]) if not isinstance(item[0], int) else item[0]
+            )
+        except Exception:
+            sorted_opcodes = list(opcode_map.items())
+        sample: Dict[str, str] = {}
+        for key, name in sorted_opcodes[:10]:
+            try:
+                opcode_int = int(key)
+            except Exception:
+                formatted = str(key)
+            else:
+                formatted = f"0x{opcode_int:02X}"
+            sample[formatted] = str(name)
+        aggregate_metadata["opcode_map_count"] = len(opcode_map)
+        aggregate_metadata["opcode_map_sample"] = sample
+
+        constants = aggregate_metadata.get("constants")
+        if isinstance(constants, dict):
+            aggregate_metadata["constants"] = {
+                str(key): value for key, value in constants.items()
+            }
+
+        if errors:
+            aggregate_metadata.setdefault("extraction_notes", []).extend(
+                str(error) for error in errors if error
+            )
+
+        input_name = Path(bootstrap_path).stem or Path(bootstrap_path).name
+        artifact_paths = self._persist_artifacts(
+            input_name,
+            decoded_records,
+            aggregate_metadata,
+            raw_matches,
+            debug_enabled=bool(getattr(self.ctx, "debug_bootstrap", False)),
+        )
+        if artifact_paths:
+            aggregate_metadata.setdefault("artifact_paths", {}).update(artifact_paths)
+            decoded_blob_path = artifact_paths.get("decoded_blob_path")
+            if decoded_blob_path:
+                for blob_entry in aggregate_metadata.get("blobs", []):
+                    if isinstance(blob_entry, dict):
+                        blob_entry.setdefault("decoded_path", decoded_blob_path)
+                        metadata_path = artifact_paths.get("metadata_path")
+                        if metadata_path:
+                            blob_entry.setdefault("metadata_path", metadata_path)
+
         result = BootstrapperExtractionResult(
             decoded_blobs=decoded_blobs,
             bootstrapper_metadata=aggregate_metadata,
@@ -540,30 +615,106 @@ class BootstrapDecoder:
         return result
 
     # ------------------------------------------------------------------
-    def _persist_artifacts(self, blob: BlobInfo, decoded: bytes, meta: Dict[str, Any]) -> None:
-        """Write decoded payload bytes and metadata summaries to disk."""
+    def _persist_artifacts(
+        self,
+        input_name: str,
+        decoded_records: List[Tuple[str, bytes]],
+        aggregate_metadata: Dict[str, Any],
+        raw_matches: Dict[str, Any],
+        *,
+        debug_enabled: bool,
+    ) -> Dict[str, str]:
+        """Write bootstrapper artefacts to disk and return their locations."""
 
-        logs_dir = os.path.join("logs")
-        os.makedirs(logs_dir, exist_ok=True)
+        sanitized_input = re.sub(r"[^A-Za-z0-9_.-]", "_", input_name) or "bootstrap"
+        sanitized_input = sanitized_input[:60]
 
-        base_name = blob.name or f"offset_{blob.start}"
-        sanitized = re.sub(r"[^A-Za-z0-9_.-]", "_", base_name)[:60]
-        bin_path = os.path.join(logs_dir, f"bootstrap_decoded_{sanitized}.bin")
-        json_path = os.path.join(logs_dir, f"bootstrapper_metadata_{sanitized}.json")
+        out_logs_dir = os.path.join("out", "logs")
+        os.makedirs(out_logs_dir, exist_ok=True)
 
+        debug_timestamp: Optional[str] = None
+        debug_path: Optional[str] = None
+        if debug_enabled:
+            context_log = getattr(self.ctx, "bootstrap_debug_log", None)
+            if context_log:
+                debug_path = str(Path(context_log))
+                stem = Path(debug_path).stem
+                if stem.startswith("bootstrap_extract_debug_"):
+                    debug_timestamp = stem.replace("bootstrap_extract_debug_", "", 1)
+            if debug_path is None:
+                debug_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                logs_dir = os.path.join("logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                debug_path = os.path.join(
+                    logs_dir, f"bootstrap_extract_debug_{debug_timestamp}.log"
+                )
+            else:
+                Path(debug_path).parent.mkdir(parents=True, exist_ok=True)
+
+        artifacts: Dict[str, str] = {}
+
+        primary_name = None
+        primary_bytes = b""
+        if decoded_records:
+            primary_name, primary_bytes = max(decoded_records, key=lambda item: len(item[1]))
+            if not primary_bytes and decoded_records:
+                primary_name, primary_bytes = decoded_records[0]
+
+        bin_path = os.path.join(out_logs_dir, f"bootstrap_decoded_{sanitized_input}.bin")
         try:
             with open(bin_path, "wb") as fh:
-                fh.write(decoded)
-            LOG.debug("[BOOTSTRAP] Wrote decoded blob to %s", bin_path)
+                fh.write(primary_bytes)
+            artifacts["decoded_blob_path"] = bin_path
+            LOG.debug("[BOOTSTRAP] Wrote primary decoded blob to %s", bin_path)
         except OSError as exc:  # pragma: no cover - filesystem errors are rare in CI
             LOG.warning("[BOOTSTRAP] Failed to write decoded blob %s: %s", bin_path, exc)
 
+        json_payload = dict(aggregate_metadata)
+        json_payload["raw_matches"] = raw_matches
+        if primary_name is not None:
+            json_payload.setdefault("primary_blob", {})
+            json_payload["primary_blob"].update(
+                {"name": primary_name, "size": len(primary_bytes)}
+            )
+
+        json_path = os.path.join(
+            out_logs_dir, f"bootstrapper_metadata_{sanitized_input}.json"
+        )
+        paths_for_json = dict(artifacts)
+        paths_for_json["metadata_path"] = json_path
+        if debug_path:
+            paths_for_json["debug_log_path"] = debug_path
+        json_payload["artifact_paths"] = paths_for_json
+
         try:
             with open(json_path, "w", encoding="utf-8") as fh:
-                json.dump(meta, fh, indent=2, ensure_ascii=False)
+                json.dump(json_payload, fh, indent=2, ensure_ascii=False)
+            artifacts["metadata_path"] = json_path
             LOG.debug("[BOOTSTRAP] Wrote metadata snapshot to %s", json_path)
         except OSError as exc:  # pragma: no cover
             LOG.warning("[BOOTSTRAP] Failed to write metadata json %s: %s", json_path, exc)
+
+        if debug_enabled and debug_path and debug_timestamp:
+            debug_payload = {
+                "timestamp": debug_timestamp,
+                "bootstrapper": input_name,
+                "artifacts": paths_for_json,
+                "raw_matches": raw_matches,
+                "metadata_preview": {
+                    "alphabet_len": aggregate_metadata.get("alphabet_len"),
+                    "opcode_map_count": aggregate_metadata.get("opcode_map_count"),
+                    "constants_count": len(aggregate_metadata.get("constants", {})),
+                },
+            }
+            try:
+                with open(debug_path, "w", encoding="utf-8") as fh:
+                    json.dump(debug_payload, fh, indent=2, ensure_ascii=False)
+                artifacts["debug_log_path"] = debug_path
+                LOG.info("[BOOTSTRAP] Debug extraction log written to %s", debug_path)
+            except OSError as exc:  # pragma: no cover
+                LOG.warning("[BOOTSTRAP] Failed to write debug log %s: %s", debug_path, exc)
+
+        return artifacts
 
     # ------------------------------------------------------------------
     @staticmethod
