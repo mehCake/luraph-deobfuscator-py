@@ -69,6 +69,8 @@ Frequently used flags:
 | `--profile` | Print a timing table for the executed passes |
 | `--script-key KEY` | Provide the decryption key required by Luraph v14.4.x payloads |
 | `--bootstrapper PATH` | Load an initv4 stub to recover its alphabet/opcode table automatically |
+| `--debug-bootstrap` | Dump detailed bootstrapper extraction logs and raw regex matches |
+| `--allow-lua-run` | Permit the sandboxed Lua fallback when Python decoding fails |
 | `--yes` | Auto-confirm detected versions and bootstrapper prompts |
 | `--force` | Continue even if required data (such as `--script-key`) is missing |
 | `--verbose` | Enable colourised console logging alongside `deobfuscator.log` |
@@ -118,6 +120,34 @@ embedded in the obfuscated script the detector reuses it, otherwise you must
 provide `--script-key` (or run with `--force` to request a best-effort decode)
 before devirtualisation proceeds.  `--bootstrapper` can then focus purely on
 opcode/alphabet extraction.
+
+When initv4 hides metadata inside high-entropy blobs, the extractor first tries
+to reproduce the Lua decode routine in pure Python.  If those heuristics fall
+short, the pipeline can **optionally** retry inside a sandboxed LuaJIT runtime
+powered by [`lupa`](https://pypi.org/project/lupa/).  This dual-mode flow
+defaults to the safer Python implementation and only executes Lua when:
+
+1. the Python reimplementation failed to recover usable metadata,
+2. `lupa` is installed locally, and
+3. you explicitly pass `--allow-lua-run` (or run unattended with `--force` and
+   `--debug-bootstrap`).
+
+The sandbox replaces the global environment, blocks file system and network
+primitives, enforces an instruction budget, and intercepts `load`/`loadstring`
+to capture the decoded chunk without executing arbitrary payloads.  **Because
+any third-party Lua code might still be hostile, only enable `--allow-lua-run`
+on machines you trust and that can be discarded if compromised. Never run the
+fallback on production hosts or with secrets accessible to the process.**
+Installing `lupa>=1.8.0` (LuaJIT must be available on the system) enables this
+fallback path; without it the extractor logs that emulation is required and
+keeps the partially decoded blob under `out/logs/` for manual analysis.
+
+Debugging bootstrapper extraction works best with `--debug-bootstrap`, which
+prints the recovered alphabet length, opcode previews, and extraction notes to
+the console and writes a full trace to `out/logs/bootstrap_extract_debug_*.log`.
+The decoded blobs and JSON metadata live under `out/logs/bootstrap_decoded_*.bin`
+and `out/logs/bootstrapper_metadata_*.json` respectively, making it easy to
+compare Python-vs-Lua paths or inspect partially decoded payloads.
 
 Practical combinations look like:
 

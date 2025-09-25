@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,8 @@ class LuaDeobfuscator:
         vm_trace: bool = False,
         script_key: str | None = None,
         bootstrapper: str | os.PathLike[str] | Path | None = None,
+        debug_bootstrap: bool = False,
+        allow_lua_run: bool = False,
     ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
@@ -83,6 +86,11 @@ class LuaDeobfuscator:
         self._bootstrapper_path = self._normalise_bootstrapper(bootstrapper)
         self._last_render_validation: Dict[str, Any] = {}
         self._last_handler: VersionHandler | None = None
+        self._debug_bootstrap = bool(debug_bootstrap)
+        self._allow_lua_run = bool(allow_lua_run)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._bootstrap_debug_log = Path("logs") / f"bootstrap_extract_debug_{timestamp}.log"
+        self._bootstrap_meta: Dict[str, Any] = {}
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -151,6 +159,30 @@ class LuaDeobfuscator:
                 handler = None
         if isinstance(handler, VersionHandler):
             handler_instance = handler
+            debug_enabled = self._debug_bootstrap
+            if hasattr(handler_instance, "set_bootstrap_debug_options"):
+                try:
+                    handler_instance.set_bootstrap_debug_options(
+                        enabled=debug_enabled,
+                        log_path=self._bootstrap_debug_log,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            else:
+                try:
+                    setattr(handler_instance, "debug_bootstrap", debug_enabled)
+                    setattr(
+                        handler_instance,
+                        "bootstrap_debug_log",
+                        self._bootstrap_debug_log if debug_enabled else None,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            allow_lua_run = getattr(self, "_allow_lua_run", False)
+            try:
+                setattr(handler_instance, "allow_lua_run", bool(allow_lua_run))
+            except Exception:  # pragma: no cover - defensive
+                pass
             if self._bootstrapper_path is not None:
                 setter = getattr(handler_instance, "set_bootstrapper", None)
                 if callable(setter):
@@ -160,7 +192,16 @@ class LuaDeobfuscator:
                         metadata["bootstrapper_error"] = str(exc)
                     else:
                         if isinstance(bootstrap_meta, dict) and bootstrap_meta:
-                            metadata.setdefault("bootstrapper", bootstrap_meta)
+                            extraction = bootstrap_meta.get("extraction")
+                            summary = {
+                                key: value
+                                for key, value in bootstrap_meta.items()
+                                if key != "extraction"
+                            }
+                            if summary:
+                                metadata.setdefault("bootstrapper", summary)
+                            if isinstance(extraction, dict) and extraction:
+                                metadata.setdefault("bootstrapper_metadata", extraction)
 
         self._last_handler = handler_instance
 
@@ -833,12 +874,21 @@ class LuaDeobfuscator:
         ctx = SimpleNamespace(
             script_key=script_key,
             bootstrapper_path=self._bootstrapper_path,
+            debug_bootstrap=self._debug_bootstrap,
+            bootstrap_debug_log=self._bootstrap_debug_log,
         )
         try:
             decoder = InitV4Decoder(ctx)
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.debug("initv4 decoder setup failed: %s", exc)
             return [], {}, {}
+
+        decoder_meta = getattr(ctx, "bootstrapper_metadata", None)
+        if isinstance(decoder_meta, dict) and decoder_meta:
+            try:
+                self._bootstrap_meta.setdefault("extraction", {}).update(decoder_meta)
+            except Exception:
+                self.logger.debug("Failed to merge decoder bootstrap metadata", exc_info=True)
 
         try:
             payloads = decoder.locate_payload(source)

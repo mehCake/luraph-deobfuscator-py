@@ -203,6 +203,8 @@ class Context:
     bootstrapper_path: Path | None = None
     yes: bool = False
     force: bool = False
+    debug_bootstrap: bool = False
+    allow_lua_run: bool = False
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
     vm_metadata: Dict[str, Any] = field(default_factory=dict)
@@ -212,12 +214,22 @@ class Context:
     version_handler: VersionHandler | None = None
     report: DeobReport = field(default_factory=_default_report)
     result: Dict[str, Any] = field(default_factory=dict)
+    bootstrapper_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if isinstance(self.options, dict):
+            self.options.setdefault("debug_bootstrap", bool(self.debug_bootstrap))
+            self.options.setdefault("allow_lua_run", bool(self.allow_lua_run))
+
         if self.deobfuscator is None:
+            if isinstance(self.options, dict):
+                debug_flag = bool(self.options.get("debug_bootstrap"))
+            else:
+                debug_flag = bool(self.debug_bootstrap)
             self.deobfuscator = LuaDeobfuscator(
                 script_key=self.script_key,
                 bootstrapper=self.bootstrapper_path,
+                debug_bootstrap=debug_flag,
             )
         if self.script_key and not self.report.script_key_used:
             self.report.script_key_used = self.script_key

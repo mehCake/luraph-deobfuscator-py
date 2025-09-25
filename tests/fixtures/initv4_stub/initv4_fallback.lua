@@ -1,4 +1,4 @@
-local alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+,-./:;<=>?@[]^_`{|}~"
+local encoded = [[local alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+,-./:;<=>?@[]^_`{|}~"
 
 local MAXSTACK = 250
 local NUPVAL = 12
@@ -65,3 +65,20 @@ return {
     DISPATCH_ENTRIES = DISPATCH_ENTRIES
   }
 }
+]]
+
+local function decode(blob, secret)
+  local out = {}
+  for i = #blob, 1, -1 do
+    out[#out + 1] = blob:sub(i, i)
+  end
+  local reversed = table.concat(out)
+  out = {}
+  for i = #reversed, 1, -1 do
+    out[#out + 1] = reversed:sub(i, i)
+  end
+  return table.concat(out)
+end
+
+local secret_value = (_G.script_key or _G.scriptKey or _G.SCRIPT_KEY or '')
+return load(decode(encoded, secret_value), 'fallback_chunk')()

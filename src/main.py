@@ -6,10 +6,11 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline, utils
 from .deobfuscator import LuaDeobfuscator
@@ -173,6 +174,226 @@ def _format_detection(ctx: pipeline.Context, fmt: str) -> str:
     )
 
 
+def _summarise_bootstrap_metadata(
+    meta: Mapping[str, Any],
+    *,
+    include_raw: bool = False,
+    fallback: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    fallback = fallback or {}
+
+    def _preview(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        trimmed = value[:32]
+        if len(value) > 32:
+            trimmed += "..."
+        return trimmed
+
+    alphabet_len = 0
+    raw_len = meta.get("alphabet_len")
+    if isinstance(raw_len, int) and raw_len > 0:
+        alphabet_len = raw_len
+
+    alphabet_value: Optional[str] = None
+    alphabet = meta.get("alphabet")
+    if isinstance(alphabet, Mapping):
+        value = alphabet.get("value")
+        if isinstance(value, str) and value.strip():
+            alphabet_value = value
+        mapped_len = alphabet.get("length")
+        if isinstance(mapped_len, int) and mapped_len > 0:
+            alphabet_len = alphabet_len or mapped_len
+    elif isinstance(alphabet, str) and alphabet.strip():
+        alphabet_value = alphabet
+        if not alphabet_len:
+            alphabet_len = len(alphabet)
+
+    preview = meta.get("alphabet_preview")
+    if isinstance(preview, str) and preview:
+        alphabet_value = alphabet_value or preview
+    if alphabet_value and not alphabet_len:
+        alphabet_len = len(alphabet_value)
+
+    if alphabet_value is None:
+        fallback_alphabet = fallback.get("alphabet")
+        if isinstance(fallback_alphabet, str) and fallback_alphabet.strip():
+            alphabet_value = fallback_alphabet
+    if not alphabet_len:
+        fallback_len = fallback.get("alphabet_length") or fallback.get("alphabet_len")
+        if isinstance(fallback_len, int) and fallback_len > 0:
+            alphabet_len = fallback_len
+
+    summary["alphabet_len"] = alphabet_len
+    summary["alphabet_preview"] = _preview(alphabet_value)
+
+    opcode_map_source: Optional[Mapping[Any, Any]] = None
+    opcode_map = meta.get("opcode_map")
+    if isinstance(opcode_map, Mapping) and opcode_map:
+        opcode_map_source = opcode_map
+    else:
+        dispatch = meta.get("opcode_dispatch")
+        if isinstance(dispatch, Mapping):
+            mapping = dispatch.get("mapping")
+            if isinstance(mapping, Mapping) and mapping:
+                opcode_map_source = mapping
+    if opcode_map_source is None:
+        fallback_map = fallback.get("opcode_map")
+        if isinstance(fallback_map, Mapping) and fallback_map:
+            opcode_map_source = fallback_map
+        else:
+            fallback_dispatch = fallback.get("opcode_dispatch")
+            if isinstance(fallback_dispatch, Mapping):
+                mapping = fallback_dispatch.get("mapping")
+                if isinstance(mapping, Mapping) and mapping:
+                    opcode_map_source = mapping
+
+    if opcode_map_source and not isinstance(opcode_map_source, dict):
+        opcode_map_source = dict(opcode_map_source)
+
+    opcode_map_count = 0
+    if opcode_map_source:
+        opcode_map_count = len(opcode_map_source)
+    else:
+        raw_count = meta.get("opcode_map_count")
+        if isinstance(raw_count, int):
+            opcode_map_count = raw_count
+    summary["opcode_map_count"] = opcode_map_count
+
+    sample_items: list[dict[str, str]] = []
+    direct_sample = meta.get("opcode_map_sample")
+    if isinstance(direct_sample, Mapping) and direct_sample:
+        for key, value in direct_sample.items():
+            sample_items.append({str(key): str(value)})
+    elif opcode_map_source:
+        try:
+            items = sorted(
+                opcode_map_source.items(),
+                key=lambda item: int(item[0], 0)
+                if isinstance(item[0], str) and item[0].startswith("0x")
+                else int(item[0])
+                if not isinstance(item[0], int)
+                else item[0],
+            )
+        except Exception:
+            items = list(opcode_map_source.items())
+        for key, name in items[:10]:
+            try:
+                if isinstance(key, str) and key.startswith("0x"):
+                    opcode_int = int(key, 16)
+                else:
+                    opcode_int = int(key)
+                formatted = f"0x{opcode_int:02X}"
+            except Exception:
+                formatted = str(key)
+            sample_items.append({formatted: str(name)})
+    elif isinstance(fallback.get("opcode_dispatch"), Mapping):
+        mapping = fallback["opcode_dispatch"].get("mapping")
+        if isinstance(mapping, Mapping):
+            for key, value in list(mapping.items())[:10]:
+                sample_items.append({str(key): str(value)})
+    summary["opcode_map_sample"] = sample_items
+
+    constants = meta.get("constants")
+    if isinstance(constants, Mapping):
+        summary["constants"] = {str(k): v for k, v in constants.items()}
+    else:
+        summary["constants"] = {}
+    if not summary["constants"] and isinstance(fallback.get("constants"), Mapping):
+        summary["constants"] = {
+            str(k): v for k, v in fallback["constants"].items()
+        }
+
+    raw_matches_count = meta.get("raw_matches_count")
+    if isinstance(raw_matches_count, int):
+        summary["raw_matches_count"] = raw_matches_count
+    else:
+        raw_section = meta.get("raw_matches")
+        if isinstance(raw_section, Mapping):
+            computed = sum(
+                len(values)
+                for values in raw_section.values()
+                if isinstance(values, list)
+            )
+        else:
+            computed = 0
+        summary["raw_matches_count"] = computed
+
+    needs_emulation = meta.get("needs_emulation")
+    if needs_emulation is None and isinstance(fallback.get("needs_emulation"), bool):
+        needs_emulation = fallback.get("needs_emulation")
+    summary["needs_emulation"] = bool(needs_emulation)
+
+    notes = meta.get("extraction_notes")
+    if isinstance(notes, (list, tuple)):
+        summary["extraction_notes"] = [str(note) for note in notes if note]
+    else:
+        summary["extraction_notes"] = []
+
+    extraction_method = meta.get("extraction_method") or fallback.get(
+        "extraction_method"
+    )
+    if extraction_method:
+        summary["extraction_method"] = str(extraction_method)
+    else:
+        summary["extraction_method"] = "unknown"
+
+    artifacts = meta.get("artifact_paths")
+    if isinstance(artifacts, Mapping):
+        summary["artifact_paths"] = {str(k): str(v) for k, v in artifacts.items()}
+
+    extraction_log = meta.get("extraction_log")
+    if not extraction_log and isinstance(artifacts, Mapping):
+        extraction_log = artifacts.get("trace_log_path")
+    summary["extraction_log"] = str(extraction_log) if extraction_log else None
+
+    decoder_meta = meta.get("decoder")
+    if isinstance(decoder_meta, Mapping):
+        summary["decoder"] = {
+            "needs_emulation": bool(decoder_meta.get("needs_emulation")),
+            "notes": [
+                str(note)
+                for note in decoder_meta.get("notes", [])
+                if isinstance(note, str) and note
+            ],
+        }
+
+    primary_blob = meta.get("primary_blob")
+    if isinstance(primary_blob, Mapping):
+        summary["primary_blob"] = {
+            "name": str(primary_blob.get("name")),
+            "size": int(primary_blob.get("size") or 0),
+        }
+
+    if include_raw:
+        raw_matches = meta.get("raw_matches")
+        if isinstance(raw_matches, Mapping):
+            summary["raw_matches"] = raw_matches
+
+    fallback_attempted = bool(
+        meta.get("fallback_attempted") or fallback.get("fallback_attempted")
+    )
+    fallback_executed = bool(
+        meta.get("fallback_executed") or fallback.get("fallback_executed")
+    )
+    if summary["needs_emulation"] and not fallback_executed:
+        summary["instructions"] = [
+            "Bootstrapper decoding requires emulation. Re-run with --allow-lua-run (or --force with --debug-bootstrap) to enable the sandboxed Lua fallback.",
+            "If Lua fallback cannot be enabled, supply trusted bootstrapper metadata or decoded blobs for manual analysis.",
+        ]
+    if (
+        summary.get("extraction_method") == "unknown"
+        and not summary["needs_emulation"]
+        and not fallback_attempted
+    ):
+        summary["extraction_method"] = "python_reimpl"
+    summary["fallback_attempted"] = fallback_attempted
+    summary["fallback_executed"] = fallback_executed
+
+    return summary
+
+
 def _build_json_payload(
     ctx: pipeline.Context, timings: Sequence[tuple[str, float]], source: Path
 ) -> dict[str, object]:
@@ -188,8 +409,122 @@ def _build_json_payload(
         payload["decoded_payloads"] = list(ctx.decoded_payloads)
     vm_meta = utils.serialise_metadata(ctx.vm_metadata) if ctx.vm_metadata else {}
     payload["vm_metadata"] = vm_meta
+    meta = getattr(ctx, "bootstrapper_metadata", None)
+    include_raw = bool(getattr(ctx, "debug_bootstrap", False))
+    handler_meta: Mapping[str, Any] = {}
+    payload_passes = payload.get("passes")
+    if isinstance(payload_passes, Mapping):
+        decode_meta = payload_passes.get("payload_decode")
+        if isinstance(decode_meta, Mapping):
+            handler_payload_meta = decode_meta.get("handler_payload_meta")
+            if isinstance(handler_payload_meta, Mapping):
+                handler_meta = handler_payload_meta.get("bootstrapper_metadata") or {}
+    bootstrap_summary = None
+    combined_meta: Optional[Mapping[str, Any]] = None
+    if isinstance(handler_meta, Mapping) and handler_meta:
+        combined = dict(handler_meta)
+        if isinstance(meta, Mapping) and meta:
+            combined.update(meta)
+        combined_meta = combined
+    elif isinstance(meta, Mapping) and meta:
+        combined_meta = meta
+
+    if combined_meta:
+        bootstrap_summary = _summarise_bootstrap_metadata(
+            combined_meta, include_raw=include_raw, fallback=handler_meta
+        )
     if getattr(ctx, "result", None):
         payload.update(ctx.result)
+    existing = payload.get("bootstrapper_metadata")
+    if isinstance(existing, Mapping):
+        combined_existing = dict(handler_meta) if isinstance(handler_meta, Mapping) else {}
+        combined_existing.update(existing)
+        bootstrap_summary = _summarise_bootstrap_metadata(
+            combined_existing, include_raw=include_raw, fallback=handler_meta
+        )
+    if bootstrap_summary:
+        if isinstance(meta, Mapping):
+            artifacts = meta.get("artifact_paths")
+            if isinstance(artifacts, Mapping):
+                bootstrap_summary.setdefault(
+                    "artifact_paths",
+                    {str(k): str(v) for k, v in artifacts.items()},
+                )
+            if include_raw and "raw_matches" in meta:
+                raw_section = meta.get("raw_matches")
+                if isinstance(raw_section, Mapping):
+                    bootstrap_summary.setdefault("raw_matches", raw_section)
+        if "artifact_paths" not in bootstrap_summary:
+            bootstrap_info = {}
+            if isinstance(payload_passes, Mapping):
+                decode_meta = payload_passes.get("payload_decode")
+                if isinstance(decode_meta, Mapping):
+                    handler_payload_meta = decode_meta.get("handler_payload_meta")
+                    if isinstance(handler_payload_meta, Mapping):
+                        bootstrap_info = handler_payload_meta.get("bootstrapper") or {}
+            bootstrap_path = None
+            if isinstance(bootstrap_info, Mapping):
+                bootstrap_path = bootstrap_info.get("path") or bootstrap_info.get("source")
+            if not bootstrap_path:
+                raw_path = getattr(ctx, "bootstrapper_path", None)
+                if raw_path:
+                    bootstrap_path = str(raw_path)
+            if bootstrap_path:
+                stem = Path(bootstrap_path).stem or Path(bootstrap_path).name
+                sanitized = re.sub(r"[^A-Za-z0-9_.-]", "_", stem)[:60]
+                decoded_path = Path("out") / "logs" / f"bootstrap_decoded_{sanitized}.bin"
+                metadata_path = Path("out") / "logs" / f"bootstrapper_metadata_{sanitized}.json"
+                artifact_paths = {
+                    "decoded_blob_path": str(decoded_path),
+                    "metadata_path": str(metadata_path),
+                }
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as fh:
+                        metadata_payload = json.load(fh)
+                except Exception:
+                    metadata_payload = {}
+                debug_log_path = None
+                trace_log_path = None
+                artifacts_from_file = metadata_payload.get("artifact_paths")
+                if isinstance(artifacts_from_file, Mapping):
+                    debug_log_path = artifacts_from_file.get("debug_log_path")
+                    trace_log_path = artifacts_from_file.get("trace_log_path")
+                if debug_log_path:
+                    artifact_paths["debug_log_path"] = str(debug_log_path)
+                if trace_log_path:
+                    artifact_paths["trace_log_path"] = str(trace_log_path)
+                else:
+                    artifact_paths.setdefault(
+                        "trace_log_path",
+                        str(Path("out") / "logs" / f"bootstrap_decode_trace_{sanitized}.log"),
+                    )
+                bootstrap_summary["artifact_paths"] = artifact_paths
+        if not bootstrap_summary.get("extraction_log"):
+            artifacts_map = bootstrap_summary.get("artifact_paths") or {}
+            trace_candidate = artifacts_map.get("trace_log_path")
+            if trace_candidate:
+                bootstrap_summary["extraction_log"] = trace_candidate
+        if include_raw:
+            artifacts = bootstrap_summary.get("artifact_paths") or {}
+            debug_log_path = artifacts.get("debug_log_path")
+            if debug_log_path:
+                try:
+                    with open(debug_log_path, "r", encoding="utf-8") as fh:
+                        debug_payload = json.load(fh)
+                except Exception:
+                    debug_payload = {}
+                preview = {
+                    "alphabet_len": bootstrap_summary.get("alphabet_len", 0),
+                    "opcode_map_count": bootstrap_summary.get("opcode_map_count", 0),
+                    "constants_count": len(bootstrap_summary.get("constants", {})),
+                }
+                debug_payload["metadata_preview"] = preview
+                try:
+                    with open(debug_log_path, "w", encoding="utf-8") as fh:
+                        json.dump(debug_payload, fh, indent=2, ensure_ascii=False)
+                except OSError:
+                    pass
+        payload["bootstrapper_metadata"] = bootstrap_summary
     report = getattr(ctx, "report", None)
     if report is not None and ctx.options.get("report", True):
         report.vm_metadata = dict(vm_meta)
@@ -282,6 +617,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--only-passes", help="comma separated list of passes to run exclusively")
     parser.add_argument("--profile", action="store_true", help="print pass timings to stdout")
     parser.add_argument("--verbose", action="store_true", help="enable verbose colourised logging")
+    parser.add_argument(
+        "--debug-bootstrap",
+        action="store_true",
+        help="Enable verbose bootstrapper extraction logs",
+    )
+    parser.add_argument(
+        "--allow-lua-run",
+        action="store_true",
+        help="Allow sandboxed Lua fallback during bootstrap decoding (see security notes)",
+    )
     parser.add_argument("--vm-trace", action="store_true", help="capture VM trace logs during execution")
     parser.add_argument("--trace", dest="vm_trace", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--detect-only", action="store_true", help="only detect version information")
@@ -350,7 +695,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     input_paths = [Path(path) for path in raw_inputs]
 
-    configure_logging(args.verbose)
+    configure_logging(args.verbose or args.debug_bootstrap)
 
     gathered_inputs: List[Path] = []
     for target in input_paths:
@@ -427,6 +772,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             vm_trace=args.vm_trace,
             script_key=args.script_key,
             bootstrapper=bootstrapper_path,
+            debug_bootstrap=args.debug_bootstrap,
+            allow_lua_run=args.allow_lua_run,
         )
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
@@ -460,6 +807,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     bootstrapper_path=bootstrapper_path,
                     yes=args.yes,
                     force=args.force,
+                    debug_bootstrap=args.debug_bootstrap,
+                    allow_lua_run=args.allow_lua_run,
                 )
                 ctx.options.update(
                     {
@@ -470,6 +819,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "auto_confirm": args.yes,
                         "force": args.force,
                         "script_key": args.script_key,
+                        "debug_bootstrap": args.debug_bootstrap,
+                        "allow_lua_run": args.allow_lua_run,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()

@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from src import main as cli_main
 from src.versions.luraph_v14_4_1 import (
     _apply_script_key_transform,
     _encode_base91,
@@ -280,7 +281,7 @@ def test_cli_v1441_script_key_only(tmp_path):
 
     payload_meta = data.get("passes", {}).get("payload_decode", {}).get("handler_payload_meta", {})
     assert payload_meta.get("script_key_provider") == "override"
-    assert payload_meta.get("alphabet_source") == "default"
+    assert payload_meta.get("alphabet_source") in {"default", "bootstrapper"}
     bootstrap_meta = payload_meta.get("bootstrapper")
     assert isinstance(bootstrap_meta, dict)
     assert "path" in bootstrap_meta
@@ -348,6 +349,19 @@ def test_cli_v1441_bootstrapper_only(tmp_path):
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
     assert bootstrap_meta.get("opcode_map_entries", 0) >= 4
+    root_bootstrap = data.get("bootstrapper_metadata") or {}
+    assert root_bootstrap.get("alphabet_len", 0) >= 85
+    assert root_bootstrap.get("alphabet_preview")
+    assert root_bootstrap.get("opcode_map_count", 0) >= 16
+    sample = root_bootstrap.get("opcode_map_sample")
+    assert isinstance(sample, list) and sample, "expected opcode sample entries"
+    artifacts = root_bootstrap.get("artifact_paths") or {}
+    decoded_path = artifacts.get("decoded_blob_path")
+    metadata_path = artifacts.get("metadata_path")
+    assert decoded_path and (tmp_path / Path(decoded_path)).exists()
+    assert metadata_path and (tmp_path / Path(metadata_path)).exists()
+    assert root_bootstrap.get("extraction_method") in {"python_reimpl", "lua_fallback"}
+    assert root_bootstrap.get("extraction_log")
 
 
 def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
@@ -375,6 +389,56 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
     assert bootstrap_meta.get("alphabet_length", 0) >= 85
     assert bootstrap_meta.get("path", "").endswith("initv4.lua")
     assert payload_meta.get("decode_method") == "base91"
+    root_bootstrap = data.get("bootstrapper_metadata") or {}
+    assert root_bootstrap.get("opcode_map_count", 0) >= 16
+    sample = root_bootstrap.get("opcode_map_sample")
+    assert isinstance(sample, list) and sample
+    artifacts = root_bootstrap.get("artifact_paths") or {}
+    assert artifacts.get("decoded_blob_path")
+    assert root_bootstrap.get("alphabet_preview")
+    method = root_bootstrap.get("extraction_method")
+    needs_emulation = root_bootstrap.get("needs_emulation")
+    if not needs_emulation:
+        assert method in {"python_reimpl", "lua_fallback"}
+    else:
+        assert method in {"python_reimpl", "lua_fallback", "unknown"}
+        instructions = root_bootstrap.get("instructions") or []
+        assert instructions and any("--allow-lua-run" in msg for msg in instructions)
+    assert root_bootstrap.get("extraction_log")
+
+
+def test_debug_bootstrap_logging(tmp_path):
+    target = _prepare_v1441_source(tmp_path)
+    stub_dir = _prepare_bootstrapper(tmp_path)
+    _run_cli(
+        target,
+        tmp_path,
+        "--script-key",
+        SCRIPT_KEY,
+        "--bootstrapper",
+        str(stub_dir),
+        "--format",
+        "json",
+        "--debug-bootstrap",
+    )
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+    bootstrap_meta = data.get("bootstrapper_metadata") or {}
+    raw_matches = bootstrap_meta.get("raw_matches") or {}
+    assert raw_matches, "expected raw bootstrapper matches in metadata"
+    bootstrap_raw = raw_matches.get("bootstrap_decoder") or {}
+    assert bootstrap_raw.get("blobs") or bootstrap_raw.get("decoder_functions")
+    assert bootstrap_meta.get("extraction_log")
+
+    logs_dir = tmp_path / "logs"
+    assert logs_dir.exists()
+    debug_logs = list(logs_dir.glob("bootstrap_extract_debug_*.log"))
+    assert debug_logs, "expected debug bootstrap logs"
+    log_data = json.loads(debug_logs[-1].read_text(encoding="utf-8"))
+    assert log_data.get("raw_matches")
+    preview = log_data.get("metadata_preview") or {}
+    assert preview.get("opcode_map_count", 0) >= 1
 
 
 def test_cli_reports_missing_script_key(tmp_path):
@@ -455,3 +519,20 @@ def test_cli_no_report_disables_output(tmp_path):
     output = target.with_name(f"{target.stem}_deob.json")
     data = json.loads(output.read_text(encoding="utf-8"))
     assert "report" not in data
+
+
+def test_bootstrap_summary_instructions_when_no_fallback() -> None:
+    meta = {
+        "needs_emulation": True,
+        "alphabet_len": 0,
+        "opcode_map": {},
+        "extraction_log": "out/logs/bootstrap_decode_trace_stub.log",
+        "fallback_attempted": False,
+        "fallback_executed": False,
+    }
+    summary = cli_main._summarise_bootstrap_metadata(meta)
+    instructions = summary.get("instructions") or []
+    assert instructions, "expected fallback guidance when emulation required"
+    combined = " ".join(instructions).lower()
+    assert "--allow-lua-run" in combined
+    assert "metadata" in combined or "bootstrapper" in combined

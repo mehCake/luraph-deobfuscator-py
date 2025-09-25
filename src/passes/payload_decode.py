@@ -9,11 +9,18 @@ import logging
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 from .. import utils
 from ..deobfuscator import VMIR
 from ..versions import PayloadInfo, VersionHandler, get_handler
+from ..versions.luraph_v14_4_1 import looks_like_vm_bytecode
+from ..versions.luraph_v14_4_initv4 import (
+    DEFAULT_ALPHABET as INITV4_DEFAULT_ALPHABET,
+    decode_blob as initv4_decode_blob,
+)
+from lph_handler import extract_vm_ir
+from opcode_lifter import OpcodeLifter
 
 from string_decryptor import StringDecryptor
 import string_decryptor as string_decryptor_mod
@@ -227,6 +234,43 @@ def _mask_script_key(script_key: Optional[str]) -> Optional[str]:
     return prefix + ("*" * masked_len)
 
 
+def _bootstrap_decoder_needs_emulation(
+    metadata: Optional[Mapping[str, Any]]
+) -> Tuple[bool, List[str]]:
+    if not isinstance(metadata, Mapping):
+        return False, []
+
+    needs_emulation = bool(metadata.get("needs_emulation"))
+    paths: List[str] = []
+    seen: Set[str] = set()
+
+    def _collect(container: Mapping[str, Any]) -> None:
+        blobs = container.get("blobs")
+        if not isinstance(blobs, list):
+            return
+        for entry in blobs:
+            if not isinstance(entry, Mapping):
+                continue
+            path = (
+                entry.get("decoded_path")
+                or entry.get("bin_path")
+                or entry.get("artifact")
+                or entry.get("path")
+            )
+            if isinstance(path, str) and path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+
+    _collect(metadata)
+
+    decoder_info = metadata.get("decoder")
+    if isinstance(decoder_info, Mapping):
+        needs_emulation = needs_emulation or bool(decoder_info.get("needs_emulation"))
+        _collect(decoder_info)
+
+    return needs_emulation, paths
+
+
 def _iterative_initv4_decode(
     ctx: "Context",
     source: str,
@@ -253,9 +297,16 @@ def _iterative_initv4_decode(
     except Exception:  # pragma: no cover - optional helper may fail to load
         return [], source, {}
 
+    existing_meta = getattr(ctx, "bootstrapper_metadata", None)
+    base_meta: Dict[str, Any] = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+
     ctx_proxy = SimpleNamespace(
         script_key=script_key,
         bootstrapper_path=getattr(ctx, "bootstrapper_path", None),
+        debug_bootstrap=bool(getattr(ctx, "debug_bootstrap", False)),
+        bootstrap_debug_log=getattr(ctx, "deobfuscator", None)
+        and getattr(ctx.deobfuscator, "_bootstrap_debug_log", None),
+        bootstrapper_metadata=base_meta,
     )
 
     try:
@@ -263,6 +314,13 @@ def _iterative_initv4_decode(
     except Exception as exc:  # pragma: no cover - defensive
         LOG.debug("initv4 decoder bootstrap failed: %s", exc)
         return [], source, {"warnings": [str(exc)]}
+
+    proxy_meta = getattr(ctx_proxy, "bootstrapper_metadata", None)
+    if isinstance(proxy_meta, dict) and proxy_meta:
+        try:
+            ctx.bootstrapper_metadata = dict(proxy_meta)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     masked_key = _mask_script_key(script_key)
     aggregate_meta: Dict[str, Any] = {
@@ -275,6 +333,9 @@ def _iterative_initv4_decode(
     warnings: List[str] = []
     decoded_chunks: List[Dict[str, Any]] = []
     current_text = source
+    key_bytes = script_key.encode("utf-8")
+
+    opcode_lifter: Optional[OpcodeLifter] = None
 
     for _iteration in range(max(1, max_iterations)):
         try:
@@ -297,7 +358,12 @@ def _iterative_initv4_decode(
             decoded_bytes = b""
 
             try:
-                decoded_bytes = decoder.extract_bytecode(blob)
+                alphabet = getattr(decoder, "alphabet", None) or INITV4_DEFAULT_ALPHABET
+                decoded_bytes = initv4_decode_blob(
+                    stripped,
+                    alphabet=alphabet,
+                    key_bytes=key_bytes,
+                )
             except Exception as exc:
                 if not force:
                     warnings.append(str(exc))
@@ -314,18 +380,113 @@ def _iterative_initv4_decode(
                     )
                     continue
 
+            opcode_map: Mapping[int, str] = getattr(decoder, "opcode_map", {})
+            suspicious = not looks_like_vm_bytecode(
+                decoded_bytes,
+                opcode_map=opcode_map,
+            )
+            blob_paths: List[str] = []
+            chunk_record: Dict[str, Any]
+            if suspicious:
+                needs_emulation, blob_paths = _bootstrap_decoder_needs_emulation(
+                    getattr(ctx, "bootstrapper_metadata", None)
+                )
+                warning = "Decoded initv4 chunk does not resemble VM bytecode."
+                if needs_emulation and blob_paths:
+                    aggregate_meta.setdefault("bootstrapper_decoded_blobs", [])
+                    for path in blob_paths:
+                        if isinstance(path, str) and path:
+                            aggregate_meta["bootstrapper_decoded_blobs"].append(path)
+                    warning += (
+                        " Bootstrapper decoder requires emulation; inspect: "
+                        + ", ".join(blob_paths)
+                        + ". Use --force to proceed with fallback decoding."
+                    )
+                chunk_record = {
+                    "vm_lift_skipped": True,
+                }
+                if not force:
+                    warnings.append(warning)
+                    continue
+                warnings.append(f"{warning} (ignored due to --force)")
+                chunk_record["vm_lift_forced"] = True
+            else:
+                chunk_record = {}
+
             aggregate_meta["chunk_count"] += 1
             aggregate_meta["chunk_decoded_bytes"].append(len(decoded_bytes))
             aggregate_meta["chunk_encoded_lengths"].append(encoded_length)
             aggregate_meta["chunk_success_count"] += 1 if decoded_bytes else 0
 
             chunk_index = len(decoded_chunks)
-            chunk_record = {
-                "index": chunk_index,
-                "encoded_size": encoded_length,
-                "decoded_byte_count": len(decoded_bytes),
-                "used_key_masked": masked_key,
-            }
+            chunk_record.update(
+                {
+                    "index": chunk_index,
+                    "encoded_size": encoded_length,
+                    "decoded_byte_count": len(decoded_bytes),
+                    "used_key_masked": masked_key,
+                }
+            )
+            alphabet_source = "bootstrapper" if decoder.alphabet else "default"
+            chunk_record["alphabet_source"] = alphabet_source
+            aggregate_meta.setdefault("chunk_alphabet_sources", []).append(alphabet_source)
+            chunk_record["suspicious"] = suspicious
+            aggregate_meta.setdefault("chunk_suspicious_flags", []).append(suspicious)
+            if blob_paths:
+                chunk_record["bootstrapper_decoded_blobs"] = list(blob_paths)
+
+            if not suspicious:
+                chunk_record["vm_lift_skipped"] = False
+                vm_summary: Dict[str, Any] = {}
+                decoded_text: Optional[str]
+                try:
+                    decoded_text = decoded_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded_text = None
+
+                payload_mapping: Optional[Dict[str, Any]] = None
+                if decoded_text:
+                    payload_mapping = extract_vm_ir(decoded_text)
+
+                if payload_mapping and isinstance(opcode_map, Mapping) and opcode_map:
+                    constants = payload_mapping.get("constants")
+                    bytecode_listing = payload_mapping.get("bytecode") or payload_mapping.get("code")
+                    prototypes = payload_mapping.get("prototypes")
+                    if isinstance(constants, list):
+                        vm_summary["constants"] = len(constants)
+                    if isinstance(bytecode_listing, list):
+                        vm_summary["bytecode"] = len(bytecode_listing)
+                    if isinstance(prototypes, list):
+                        vm_summary["prototypes"] = len(prototypes)
+
+                    try:
+                        if opcode_lifter is None:
+                            opcode_lifter = OpcodeLifter()
+                        module = opcode_lifter.lift_program(
+                            payload_mapping,
+                            version="luraph_v14_4_initv4",
+                            opcode_map=dict(opcode_map),
+                        )
+                    except Exception as exc:
+                        warning = f"Opcode lifting failed: {exc}"
+                        warnings.append(warning)
+                        chunk_record["vm_lift_error"] = str(exc)
+                    else:
+                        vm_summary["instructions"] = len(getattr(module, "instructions", []))
+                        table_meta = getattr(module, "metadata", {}).get("opcode_table")
+                        if isinstance(table_meta, Mapping):
+                            opcode_source = table_meta.get("source")
+                            if opcode_source:
+                                vm_summary["opcode_table_source"] = opcode_source
+                        aggregate_meta.setdefault("vm_lift_summaries", []).append(dict(vm_summary))
+                else:
+                    chunk_record["vm_lift_skipped"] = True
+
+                if vm_summary:
+                    chunk_record["vm_lift_summary"] = vm_summary
+            elif "vm_lift_skipped" not in chunk_record:
+                chunk_record["vm_lift_skipped"] = True
+
             decoded_chunks.append(chunk_record)
             aggregate_meta["chunk_details"].append(dict(chunk_record))
 
@@ -529,6 +690,14 @@ def _merge_chunk_meta(metadata: Dict[str, Any], chunk_meta: Dict[str, Any]) -> N
         if isinstance(flags, list):
             metadata["handler_chunk_suspicious"] = [bool(flag) for flag in flags]
 
+    blobs = chunk_meta.get("bootstrapper_decoded_blobs")
+    if isinstance(blobs, list):
+        existing = metadata.setdefault("bootstrapper_decoded_blobs", [])
+        if isinstance(existing, list):
+            for path in blobs:
+                if isinstance(path, str) and path:
+                    existing.append(path)
+
     if chunk_meta.get("vm_lift_skipped"):
         metadata["handler_vm_lift_skipped"] = True
     if chunk_meta.get("vm_lift_forced"):
@@ -655,6 +824,12 @@ def _merge_payload_meta(target: Dict[str, Any], meta: Any) -> None:
                     existing.append(item)
                 elif isinstance(item, int):
                     existing.append(bool(item))
+            continue
+        if key == "bootstrapper_decoded_blobs" and isinstance(value, list):
+            existing = target.setdefault(key, [])
+            for item in value:
+                if isinstance(item, str) and item:
+                    existing.append(item)
             continue
         if key == "warnings" and isinstance(value, list):
             existing = target.setdefault(key, [])
@@ -1034,6 +1209,29 @@ def run(ctx: "Context") -> Dict[str, Any]:
     ctx.detected_version = current_version
 
     metadata = _finalise_metadata(aggregated, last_metadata)
+
+    payload_meta = metadata.get("handler_payload_meta")
+    if isinstance(payload_meta, dict):
+        extraction_meta = payload_meta.get("bootstrapper_metadata")
+        if isinstance(extraction_meta, dict) and extraction_meta:
+            ctx.result.setdefault("bootstrapper_metadata", dict(extraction_meta))
+    ctx_bootstrap_meta = getattr(ctx, "bootstrapper_metadata", None)
+    if isinstance(ctx_bootstrap_meta, dict) and ctx_bootstrap_meta:
+        ctx.result.setdefault("bootstrapper_metadata", {})
+        try:
+            merged = dict(ctx.result["bootstrapper_metadata"])
+        except Exception:
+            merged = {}
+        merged.update(ctx_bootstrap_meta)
+        raw_existing = merged.get("raw_matches")
+        ctx_raw = ctx_bootstrap_meta.get("raw_matches")
+        if isinstance(ctx_raw, dict):
+            base_raw: Dict[str, Any] = {}
+            if isinstance(raw_existing, dict):
+                base_raw.update(raw_existing)
+            base_raw.update(ctx_raw)
+            merged["raw_matches"] = base_raw
+        ctx.result["bootstrapper_metadata"] = merged
 
     placeholder_source = metadata.get("handler_placeholder_source")
     if (
