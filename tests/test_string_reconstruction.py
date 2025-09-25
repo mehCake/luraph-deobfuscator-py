@@ -39,3 +39,26 @@ def test_string_reconstruction_promotes_code_literals(tmp_path: Path) -> None:
     assert "[[" in ctx.stage_output and "]]" in ctx.stage_output
     assert metadata["entropy_literals"] >= 1
     assert metadata["promoted_literals"] >= 1
+
+
+def test_string_reconstruction_decodes_string_char(tmp_path: Path) -> None:
+    snippet = "local value = string.char(72, 101, 108, 108, 111)"
+    ctx = _make_context(tmp_path, snippet)
+
+    metadata = string_reconstruction_run(ctx)
+
+    assert "string.char" not in ctx.stage_output
+    assert '"Hello"' in ctx.stage_output
+    assert metadata["string_char_decoded"] >= 1
+
+
+def test_string_reconstruction_inlines_loadstring(tmp_path: Path) -> None:
+    snippet = "return loadstring(\"print('hi')\")()"
+    ctx = _make_context(tmp_path, snippet)
+
+    metadata = string_reconstruction_run(ctx)
+
+    assert "(function()" in ctx.stage_output
+    assert "print('hi')" in ctx.stage_output
+    assert metadata["loadstrings_inlined"] >= 1
+    assert ctx.decoded_payloads and "print('hi')" in ctx.decoded_payloads[-1]

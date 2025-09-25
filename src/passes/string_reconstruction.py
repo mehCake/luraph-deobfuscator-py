@@ -7,6 +7,8 @@ import binascii
 import re
 from typing import Dict, List, Tuple, TYPE_CHECKING
 
+from lua_literal_parser import LuaTable, parse_lua_expression
+
 from .. import utils
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -16,7 +18,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _LITERAL_PATTERN = r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
 _LITERAL_RE = re.compile(_LITERAL_PATTERN)
 _CONCAT_RE = re.compile(
-    rf'(?P<seq>(?:{_LITERAL_PATTERN})(?:\s*\.\.\s*(?:{_LITERAL_PATTERN}))+)'
+    rf'(?P<seq>(?:{_LITERAL_PATTERN})(?:\s*\.\.\s*(?:{_LITERAL_PATTERN}))+)' 
+)
+_LOADSTRING_RE = re.compile(
+    rf"(?P<call>(?P<func>loadstring|load)\s*\(\s*(?P<literal>{_LITERAL_PATTERN})\s*\))"
+    rf"(?P<trailing>\s*\(\s*\))?",
+    re.IGNORECASE | re.DOTALL,
 )
 _DECIMAL_RE = re.compile(r"(?<!\\)\\(\d{2,3})")
 _HEX_RE = re.compile(r"(?<!\\)\\x([0-9A-Fa-f]{2})")
@@ -253,6 +260,23 @@ def _looks_like_code(value: str) -> bool:
     return any(token in stripped for token in _LIKELY_CODE_TOKENS)
 
 
+def _should_inline_loadstring(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if _looks_like_code(stripped):
+        return True
+    if "\n" in stripped or "\r" in stripped:
+        return True
+    if stripped.startswith("return ") or stripped.startswith("local "):
+        return True
+    if "(" in stripped and ")" in stripped:
+        return True
+    if len(stripped) >= 8 and any(ch.isalpha() for ch in stripped):
+        return True
+    return False
+
+
 def _encode_literal(value: str, original_quote: str) -> Tuple[str, bool]:
     multiline = "\n" in value or "\r" in value
     looks_like_code = _looks_like_code(value)
@@ -273,6 +297,73 @@ def _encode_literal(value: str, original_quote: str) -> Tuple[str, bool]:
     else:
         escaped = escaped.replace('"', '\\"')
     return f"{quote}{escaped}{quote}", False
+
+
+def _decode_string_char_calls(source: str) -> Tuple[str, int]:
+    """Replace ``string.char`` calls with literal strings when possible."""
+
+    if "string.char" not in source.lower():
+        return source, 0
+
+    result: List[str] = []
+    lower = source.lower()
+    idx = 0
+    replacements = 0
+    length = len(source)
+
+    while idx < length:
+        pos = lower.find("string.char", idx)
+        if pos == -1:
+            result.append(source[idx:])
+            break
+        result.append(source[idx:pos])
+        start = pos + len("string.char")
+        while start < length and source[start].isspace():
+            start += 1
+        if start >= length or source[start] != "(":
+            result.append(source[pos])
+            idx = pos + 1
+            continue
+        depth = 1
+        i = start + 1
+        while i < length and depth > 0:
+            ch = source[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            # Unterminated call – append rest and stop processing.
+            result.append(source[pos:])
+            idx = length
+            break
+        args = source[start + 1 : i - 1]
+        try:
+            parsed = parse_lua_expression("{" + args + "}")
+            if isinstance(parsed, LuaTable):
+                values = list(parsed.array)
+            else:
+                values = [parsed]
+            chars: List[str] = []
+            for value in values:
+                if isinstance(value, (int, float)):
+                    number = int(value)
+                    if 0 <= number <= 0x10FFFF:
+                        chars.append(chr(number))
+                        continue
+                elif isinstance(value, str) and len(value) == 1:
+                    chars.append(value)
+                    continue
+                raise ValueError("Unsupported string.char argument")
+            literal, _ = _encode_literal("".join(chars), '"')
+            result.append(literal)
+            replacements += 1
+        except Exception:
+            result.append(source[pos:i])
+        idx = i
+
+    return "".join(result), replacements
 
 
 def _collapse_concatenations(source: str) -> Tuple[str, int, int]:
@@ -333,6 +424,40 @@ def _rewrite_literals(source: str) -> Tuple[str, Dict[str, int]]:
     return "".join(result), stats
 
 
+def _inline_loadstrings(source: str, ctx: "Context | None" = None) -> Tuple[str, Dict[str, int]]:
+    stats = {
+        "loadstrings_inlined": 0,
+        "loadstrings_detected": 0,
+    }
+
+    def repl(match: re.Match[str]) -> str:
+        literal = match.group("literal")
+        trailing = match.group("trailing") or ""
+        body = literal[1:-1]
+        decoded, changed = _decode_literal_content(body)
+        if not changed:
+            decoded = body
+        stats["loadstrings_detected"] += 1
+        if not _should_inline_loadstring(decoded):
+            return match.group(0)
+
+        inlined = decoded.strip()
+        if ctx is not None and inlined:
+            snippet = inlined.strip()
+            if snippet:
+                if not ctx.decoded_payloads or ctx.decoded_payloads[-1].strip() != snippet:
+                    ctx.decoded_payloads.append(snippet)
+
+        if not inlined.endswith("\n"):
+            inlined += "\n"
+        block = f"(function()\n{inlined}end)"
+        stats["loadstrings_inlined"] += 1
+        return block + trailing
+
+    rewritten = _LOADSTRING_RE.sub(repl, source)
+    return rewritten, stats
+
+
 def run(ctx: "Context") -> Dict[str, object]:
     ctx.ensure_raw_input()
     text = ctx.stage_output or ctx.working_text or ctx.raw_input
@@ -342,14 +467,20 @@ def run(ctx: "Context") -> Dict[str, object]:
 
     metadata: Dict[str, object] = {"input_length": len(text)}
 
-    collapsed, concatenations, collapsed_decoded = _collapse_concatenations(text)
+    expanded_chars, char_calls = _decode_string_char_calls(text)
+    metadata["string_char_decoded"] = char_calls
+
+    collapsed, concatenations, collapsed_decoded = _collapse_concatenations(expanded_chars)
     metadata["concatenations_collapsed"] = concatenations
 
     rewritten, stats = _rewrite_literals(collapsed)
     stats["decoded_literals"] += collapsed_decoded
     metadata.update(stats)
 
-    cleaned = utils.strip_non_printable(rewritten)
+    inlined, loadstring_stats = _inline_loadstrings(rewritten, ctx)
+    metadata.update(loadstring_stats)
+
+    cleaned = utils.strip_non_printable(inlined)
     metadata["output_length"] = len(cleaned)
     metadata["changed"] = cleaned != text
 
