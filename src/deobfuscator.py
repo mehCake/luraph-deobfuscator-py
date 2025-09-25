@@ -86,6 +86,7 @@ class LuaDeobfuscator:
         self._last_handler: VersionHandler | None = None
         self._debug_bootstrap = bool(debug_bootstrap)
         self._bootstrap_debug_log = Path("logs") / "bootstrap_extract.log"
+        self._bootstrap_meta: Dict[str, Any] = {}
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -864,12 +865,21 @@ class LuaDeobfuscator:
         ctx = SimpleNamespace(
             script_key=script_key,
             bootstrapper_path=self._bootstrapper_path,
+            debug_bootstrap=self._debug_bootstrap,
+            bootstrap_debug_log=self._bootstrap_debug_log,
         )
         try:
             decoder = InitV4Decoder(ctx)
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.debug("initv4 decoder setup failed: %s", exc)
             return [], {}, {}
+
+        decoder_meta = getattr(ctx, "bootstrapper_metadata", None)
+        if isinstance(decoder_meta, dict) and decoder_meta:
+            try:
+                self._bootstrap_meta.setdefault("extraction", {}).update(decoder_meta)
+            except Exception:
+                self.logger.debug("Failed to merge decoder bootstrap metadata", exc_info=True)
 
         try:
             payloads = decoder.locate_payload(source)

@@ -253,9 +253,16 @@ def _iterative_initv4_decode(
     except Exception:  # pragma: no cover - optional helper may fail to load
         return [], source, {}
 
+    existing_meta = getattr(ctx, "bootstrapper_metadata", None)
+    base_meta: Dict[str, Any] = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+
     ctx_proxy = SimpleNamespace(
         script_key=script_key,
         bootstrapper_path=getattr(ctx, "bootstrapper_path", None),
+        debug_bootstrap=bool(getattr(ctx, "debug_bootstrap", False)),
+        bootstrap_debug_log=getattr(ctx, "deobfuscator", None)
+        and getattr(ctx.deobfuscator, "_bootstrap_debug_log", None),
+        bootstrapper_metadata=base_meta,
     )
 
     try:
@@ -263,6 +270,13 @@ def _iterative_initv4_decode(
     except Exception as exc:  # pragma: no cover - defensive
         LOG.debug("initv4 decoder bootstrap failed: %s", exc)
         return [], source, {"warnings": [str(exc)]}
+
+    proxy_meta = getattr(ctx_proxy, "bootstrapper_metadata", None)
+    if isinstance(proxy_meta, dict) and proxy_meta:
+        try:
+            ctx.bootstrapper_metadata = dict(proxy_meta)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     masked_key = _mask_script_key(script_key)
     aggregate_meta: Dict[str, Any] = {

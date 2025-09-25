@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 import re
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
@@ -13,6 +15,9 @@ from .initv4 import (
     _S8W_PAYLOAD_RE,
     _is_probably_alphabet,
 )
+from ..bootstrap_extractor import BootstrapExtractor
+
+LOG = logging.getLogger(__name__)
 
 DEFAULT_ALPHABET = (
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -96,7 +101,16 @@ class InitV4Decoder:
             raw_key = raw_key.strip()
         self.script_key: Optional[str] = raw_key if raw_key else None
         self.alphabet: Optional[str] = None
-        self.opcode_map: Dict[int, str] | None = None
+        self.opcode_map: Dict[int, str] = {}
+        self.constants: Dict[str, int] = {}
+        self.bootstrap_metadata: Dict[str, object] = {}
+        self._raw_matches: Dict[str, object] | None = None
+        self._debug_bootstrap = bool(getattr(ctx, "debug_bootstrap", False))
+        raw_log = getattr(ctx, "bootstrap_debug_log", None)
+        try:
+            self._bootstrap_debug_log: Optional[Path] = Path(raw_log) if raw_log else None
+        except TypeError:
+            self._bootstrap_debug_log = None
         self._has_custom_opcodes = False
         self._bootstrap = bootstrap
         self._bootstrap_path: Optional[Path] = None
@@ -110,10 +124,18 @@ class InitV4Decoder:
                 self._bootstrap = InitV4Bootstrap.load(candidate)
         if self._bootstrap is not None:
             self._bootstrap_path = self._bootstrap.path
+            text = self._bootstrap.text or ""
+            if text:
+                self._apply_bootstrap_extractor(text)
             self._prepare_from_bootstrap(self._bootstrap)
+            self._finalise_bootstrap_metadata()
+        else:
+            self._finalise_bootstrap_metadata()
 
     # ------------------------------------------------------------------
     def _prepare_from_bootstrap(self, bootstrap: InitV4Bootstrap) -> None:
+        opcode_map: Dict[int, str] = dict(self.opcode_map)
+
         alphabet = bootstrap.alphabet()
         if alphabet:
             self.alphabet = alphabet
@@ -126,14 +148,11 @@ class InitV4Decoder:
                 match = re.search(r'alphabet\s*=\s*"([^"]+)"', text)
                 if match and _is_probably_alphabet(match.group(1)):
                     self.alphabet = match.group(1)
-            opcode_map = self._extract_opcodes(text)
-            if opcode_map:
+            extracted_map = self._extract_opcodes(text)
+            if extracted_map:
                 self._has_custom_opcodes = True
-            else:
-                opcode_map = {}
-
-        else:
-            opcode_map = {}
+                for opcode, name in extracted_map.items():
+                    opcode_map.setdefault(opcode, name)
 
         mapping = bootstrap.opcode_mapping(_BASE_OPCODE_SPECS)
         if mapping:
@@ -151,7 +170,141 @@ class InitV4Decoder:
                 base_names = _BASE_OPCODE_NAMES
                 if any(base_names.get(code) != name for code, name in opcode_map.items()):
                     self._has_custom_opcodes = True
-            self.opcode_map = opcode_map
+            self.opcode_map = dict(sorted(opcode_map.items()))
+
+    # ------------------------------------------------------------------
+    def _apply_bootstrap_extractor(self, text: str) -> None:
+        try:
+            extractor = BootstrapExtractor(self.ctx)
+        except Exception:  # pragma: no cover - defensive
+            extractor = BootstrapExtractor()
+
+        extracted = extractor.extract(text)
+
+        alphabet = extracted.get("alphabet")
+        if isinstance(alphabet, str) and alphabet:
+            self.alphabet = alphabet
+
+        opcode_map = extracted.get("opcode_map") or {}
+        if isinstance(opcode_map, dict) and opcode_map:
+            normalised: Dict[int, str] = {}
+            for code, name in opcode_map.items():
+                try:
+                    numeric = int(code)
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    continue
+                normalised[numeric] = str(name)
+            if normalised:
+                self.opcode_map = dict(sorted(normalised.items()))
+                self._has_custom_opcodes = True
+
+        constants = extracted.get("constants") or {}
+        if isinstance(constants, dict) and constants:
+            self.constants.update({str(key): int(value) for key, value in constants.items()})
+
+        raw_matches = extracted.get("raw_matches")
+        if isinstance(raw_matches, dict) and raw_matches:
+            self._raw_matches = raw_matches
+
+    # ------------------------------------------------------------------
+    def _finalise_bootstrap_metadata(self) -> None:
+        alphabet = self.alphabet
+        opcode_map = dict(self.opcode_map)
+        constants = dict(self.constants)
+
+        warnings: List[str] = []
+        has_bootstrap = self._bootstrap_path is not None
+        if not alphabet and has_bootstrap:
+            warnings.append("alphabet_not_found")
+        if opcode_map and len(opcode_map) < 16:
+            warnings.append("opcode_mapping_incomplete")
+        if not opcode_map and has_bootstrap:
+            warnings.append("opcode_mapping_not_found")
+
+        if alphabet:
+            LOG.info("Bootstrapper alphabet length: %d", len(alphabet))
+            preview = alphabet[:32]
+            suffix = "..." if len(alphabet) > 32 else ""
+            LOG.info("Bootstrapper alphabet sample: %s%s", preview, suffix)
+        elif has_bootstrap:
+            LOG.warning("Bootstrapper alphabet missing; default alphabet will be used")
+
+        if opcode_map:
+            LOG.info("Bootstrapper opcode dispatch entries: %d", len(opcode_map))
+            for opcode, name in list(sorted(opcode_map.items()))[:10]:
+                LOG.info("  opcode 0x%02X -> %s", opcode, name)
+        elif has_bootstrap:
+            LOG.warning("Bootstrapper opcode dispatch table not discovered")
+
+        raw_matches = self._raw_matches if self._debug_bootstrap else None
+        if raw_matches:
+            try:
+                LOG.debug(
+                    "Bootstrapper raw matches:\n%s",
+                    json.dumps(raw_matches, indent=2, sort_keys=True),
+                )
+            except TypeError:  # pragma: no cover - safety
+                LOG.debug("Bootstrapper raw matches: %r", raw_matches)
+
+        dispatch_map = {f"0x{opcode:02X}": name for opcode, name in sorted(opcode_map.items())}
+        metadata: Dict[str, object] = {
+            "alphabet": {
+                "value": alphabet,
+                "length": len(alphabet) if alphabet else 0,
+                "sample": alphabet[:64] if alphabet else "",
+                "source": "bootstrapper" if alphabet else "default",
+            },
+            "opcode_dispatch": {
+                "count": len(opcode_map),
+                "mapping": dispatch_map,
+            },
+            "constants": constants,
+        }
+        if self._bootstrap_path is not None:
+            metadata["path"] = str(self._bootstrap_path)
+        if warnings:
+            metadata["warnings"] = warnings
+        if raw_matches:
+            metadata["raw_matches"] = raw_matches
+
+        preview = [
+            {"opcode": f"0x{opcode:02X}", "mnemonic": name}
+            for opcode, name in list(sorted(opcode_map.items()))[:10]
+        ]
+        dump_payload = {
+            "path": str(self._bootstrap_path) if self._bootstrap_path else None,
+            "warnings": warnings,
+            "opcode_preview": preview,
+            "alphabet": {
+                "length": len(alphabet) if alphabet else 0,
+                "sample": alphabet[:64] if alphabet else "",
+            },
+        }
+        if raw_matches:
+            dump_payload["raw_matches"] = raw_matches
+
+        if raw_matches and self._bootstrap_debug_log is not None and self._debug_bootstrap:
+            try:
+                self._bootstrap_debug_log.parent.mkdir(parents=True, exist_ok=True)
+                self._bootstrap_debug_log.write_text(
+                    json.dumps(dump_payload, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except Exception:  # pragma: no cover - best effort
+                LOG.debug(
+                    "Failed to write bootstrap debug log to %s",
+                    self._bootstrap_debug_log,
+                    exc_info=True,
+                )
+
+        if has_bootstrap or alphabet or opcode_map or constants or raw_matches:
+            self.bootstrap_metadata = metadata
+            try:
+                setattr(self.ctx, "bootstrapper_metadata", dict(metadata))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        else:
+            self.bootstrap_metadata = {}
 
     # ------------------------------------------------------------------
     def _extract_opcodes(self, src: str) -> Dict[int, str]:

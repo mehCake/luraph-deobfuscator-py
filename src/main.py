@@ -188,6 +188,9 @@ def _build_json_payload(
         payload["decoded_payloads"] = list(ctx.decoded_payloads)
     vm_meta = utils.serialise_metadata(ctx.vm_metadata) if ctx.vm_metadata else {}
     payload["vm_metadata"] = vm_meta
+    meta = getattr(ctx, "bootstrapper_metadata", None)
+    if isinstance(meta, dict) and meta:
+        payload.setdefault("bootstrapper_metadata", dict(meta))
     if getattr(ctx, "result", None):
         payload.update(ctx.result)
     report = getattr(ctx, "report", None)

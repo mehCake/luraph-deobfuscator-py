@@ -213,6 +213,7 @@ class Context:
     version_handler: VersionHandler | None = None
     report: DeobReport = field(default_factory=_default_report)
     result: Dict[str, Any] = field(default_factory=dict)
+    bootstrapper_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if isinstance(self.options, dict):

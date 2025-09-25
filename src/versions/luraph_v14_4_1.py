@@ -500,7 +500,12 @@ class LuraphV1441(VersionHandler):
             debug_log=self._bootstrap_debug_log,
         )
 
-        ctx = SimpleNamespace(script_key=None, bootstrapper_path=bootstrap.path)
+        ctx = SimpleNamespace(
+            script_key=None,
+            bootstrapper_path=bootstrap.path,
+            debug_bootstrap=self._debug_bootstrap,
+            bootstrap_debug_log=self._bootstrap_debug_log,
+        )
         decoder = InitV4Decoder(ctx, bootstrap=bootstrap)
 
         if decoder.alphabet:
