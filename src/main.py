@@ -257,13 +257,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
     parser.set_defaults(report=True)
     parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="Input file(s) or directories to process",
+    )
+    parser.add_argument(
         "-i",
         "--in",
         "--input",
         dest="input_path",
-        help="input file or directory",
+        action="append",
+        help="Additional input file or directory",
     )
-    parser.add_argument("path", nargs="?", help="input file or directory (fallback)")
     parser.add_argument("-o", "--out", "--output", dest="output", help="output file path")
     parser.add_argument(
         "--format",
@@ -335,20 +340,31 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    target_arg = args.input_path or args.path
-    if not target_arg:
-        parser.error("an input path must be supplied via --in or as a positional argument")
+    raw_inputs: List[str] = list(args.inputs)
+    if args.input_path:
+        raw_inputs.extend(args.input_path)
+    if not raw_inputs:
+        parser.error("at least one input file or directory must be supplied")
+
+    input_paths = [Path(path) for path in raw_inputs]
 
     configure_logging(args.verbose)
 
-    target = Path(target_arg)
-    try:
-        inputs = _gather_inputs(target)
-    except FileNotFoundError:
-        logging.getLogger(__name__).error("input %s not found", target)
-        return 2
+    gathered_inputs: List[Path] = []
+    for target in input_paths:
+        try:
+            gathered = _gather_inputs(target)
+        except FileNotFoundError:
+            logging.getLogger(__name__).error("input %s not found", target)
+            return 2
+        if not gathered:
+            logging.getLogger(__name__).warning("no input files discovered for %s", target)
+            continue
+        gathered_inputs.extend(gathered)
+
+    inputs = sorted({path for path in gathered_inputs})
     if not inputs:
-        logging.getLogger(__name__).warning("no input files discovered for %s", target)
+        logging.getLogger(__name__).warning("no input files discovered")
         return 0
 
     override_raw = args.output
