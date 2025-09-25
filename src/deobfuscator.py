@@ -1008,6 +1008,9 @@ class LuaDeobfuscator:
                             )
                         else:
                             vm_lift_attempted = True
+                            chunk_detail["lifted_instructions"] = getattr(
+                                module, "instruction_count", 0
+                            )
                             devirt = IRDevirtualizer(module, consts)
                             chunk_ast, _ = devirt.lower()
                             chunk_source = lua_ast.to_source(chunk_ast)
@@ -1045,6 +1048,7 @@ class LuaDeobfuscator:
                         renamed_chunk = chunk_source
 
             chunk_detail["vm_lift_attempted"] = vm_lift_attempted
+            chunk_detail["rename_count"] = rename_count
             chunk_details.append(chunk_detail)
 
             decoded_lengths.append(decoded_length)

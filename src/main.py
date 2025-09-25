@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -185,13 +185,14 @@ def _build_json_payload(
     }
     if ctx.decoded_payloads:
         payload["decoded_payloads"] = list(ctx.decoded_payloads)
-    if ctx.vm_metadata:
-        payload["vm_metadata"] = utils.serialise_metadata(ctx.vm_metadata)
+    vm_meta = utils.serialise_metadata(ctx.vm_metadata) if ctx.vm_metadata else {}
+    payload["vm_metadata"] = vm_meta
     if getattr(ctx, "result", None):
         payload.update(ctx.result)
     report = getattr(ctx, "report", None)
     if report is not None and ctx.options.get("report", True):
-        payload["report"] = asdict(report)
+        report.vm_metadata = dict(vm_meta)
+        payload["report"] = report.to_json()
     return payload
 
 
@@ -497,7 +498,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             and report is not None
             and final_ctx.options.get("report", True)
         ):
-            final_ctx.result["report"] = asdict(report)
+            vm_meta = (
+                utils.serialise_metadata(final_ctx.vm_metadata)
+                if final_ctx.vm_metadata
+                else {}
+            )
+            report.vm_metadata = dict(vm_meta)
+            final_ctx.result["report"] = report.to_json()
         else:
             final_ctx.result.pop("report", None)
 

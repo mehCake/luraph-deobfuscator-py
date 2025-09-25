@@ -17,7 +17,9 @@ from typing import (
     List,
     Optional,
     Sequence,
+    SupportsInt,
     Tuple,
+    cast,
 )
 
 from version_detector import VersionInfo
@@ -54,19 +56,119 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 def _default_report() -> DeobReport:
-    return DeobReport(
-        version_detected="unknown",
-        script_key_used=None,
-        bootstrapper_used=None,
-        blob_count=0,
-        decoded_bytes=0,
-        opcode_stats={},
-        unknown_opcodes=[],
-        traps_removed=0,
-        constants_decrypted=0,
-        variables_renamed=0,
-        output_length=0,
-    )
+    return DeobReport()
+
+
+def _int_list(value: Any) -> List[int]:
+    if not isinstance(value, list):
+        return []
+    result: List[int] = []
+    for entry in value:
+        if isinstance(entry, bool):
+            continue
+        if isinstance(entry, int):
+            result.append(entry)
+        else:
+            try:
+                result.append(int(entry))
+            except Exception:
+                continue
+    return result
+
+
+def _collect_chunk_entries(report: DeobReport, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload_meta = metadata.get("handler_payload_meta")
+    chunk_meta_raw: Any = None
+    if isinstance(payload_meta, dict):
+        chunk_meta_raw = payload_meta.get("chunk_meta")
+
+    chunk_meta: Dict[int, Dict[str, Any]] = {}
+    if isinstance(chunk_meta_raw, list):
+        for entry in chunk_meta_raw:
+            if not isinstance(entry, dict):
+                continue
+            index = entry.get("chunk_index")
+            if not isinstance(index, int):
+                index = entry.get("index")
+            if isinstance(index, int):
+                chunk_meta[index] = dict(entry)
+
+    encoded_lengths = _int_list(metadata.get("handler_chunk_encoded_lengths"))
+    if not encoded_lengths and isinstance(payload_meta, dict):
+        encoded_lengths = _int_list(payload_meta.get("chunk_encoded_lengths"))
+
+    decoded_lengths = _int_list(metadata.get("handler_chunk_decoded_bytes"))
+    if not decoded_lengths and isinstance(payload_meta, dict):
+        decoded_lengths = _int_list(payload_meta.get("chunk_decoded_bytes"))
+
+    suspicious_flags = metadata.get("handler_chunk_suspicious")
+    suspicious_list: List[bool] = []
+    if isinstance(suspicious_flags, list):
+        for flag in suspicious_flags:
+            suspicious_list.append(bool(flag))
+
+    chunk_count_candidates: List[int] = []
+    value = metadata.get("handler_payload_chunks")
+    if isinstance(value, int) and value > 0:
+        chunk_count_candidates.append(value)
+    if encoded_lengths:
+        chunk_count_candidates.append(len(encoded_lengths))
+    if decoded_lengths:
+        chunk_count_candidates.append(len(decoded_lengths))
+    if chunk_meta:
+        chunk_count_candidates.append(len(chunk_meta))
+
+    chunk_count = max(chunk_count_candidates) if chunk_count_candidates else 0
+    if chunk_count <= 0:
+        return []
+
+    masked_key = report.masked_script_key()
+    entries: List[Dict[str, Any]] = []
+    for index in range(chunk_count):
+        encoded_size: int | None = None
+        decoded_size: int | None = None
+        if index < len(encoded_lengths):
+            encoded_size = encoded_lengths[index]
+        if index < len(decoded_lengths):
+            decoded_size = decoded_lengths[index]
+        meta_entry = chunk_meta.get(index, {})
+        meta_decoded = meta_entry.get("decoded_bytes")
+        if decoded_size is None and isinstance(meta_decoded, int):
+            decoded_size = meta_decoded
+        raw_lifted = meta_entry.get("lifted_instructions")
+        if isinstance(raw_lifted, int):
+            lifted_count = raw_lifted
+        else:
+            lifted_count = 0
+            if isinstance(raw_lifted, (float, str)):
+                try:
+                    lifted_count = int(raw_lifted)
+                except (TypeError, ValueError):
+                    lifted_count = 0
+            elif raw_lifted not in (None, "") and hasattr(raw_lifted, "__int__"):
+                try:
+                    lifted_count = int(cast(SupportsInt, raw_lifted))
+                except Exception:
+                    lifted_count = 0
+        suspicious = meta_entry.get("suspicious")
+        if isinstance(suspicious, bool):
+            suspicious_flag = suspicious
+        elif index < len(suspicious_list):
+            suspicious_flag = suspicious_list[index]
+        else:
+            suspicious_flag = bool(suspicious)
+
+        entry = {
+            "index": index,
+            "size": encoded_size if encoded_size is not None else decoded_size or 0,
+            "decoded_byte_count": decoded_size or 0,
+            "lifted_instruction_count": lifted_count,
+            "used_key_masked": masked_key,
+            "suspicious": suspicious_flag,
+        }
+        entries.append(entry)
+
+    return entries
 
 
 @dataclass
@@ -434,6 +536,7 @@ def _pass_detect(ctx: Context) -> None:
 
     if ctx.report:
         ctx.report.version_detected = version.name
+        ctx.report.confirmed_by_user = bool(ctx.options.get("_version_confirmed"))
 
     metadata: Dict[str, Any] = {
         "name": version.name,
@@ -460,6 +563,10 @@ def _pass_preprocess(ctx: Context) -> None:
 
 def _pass_payload_decode(ctx: Context) -> None:
     metadata = payload_decode_run(ctx)
+    report = ctx.report
+    if report is not None and isinstance(metadata, dict):
+        chunk_entries = _collect_chunk_entries(report, metadata)
+        report.chunks = chunk_entries if chunk_entries else []
     ctx.record_metadata("payload_decode", metadata)
     if ctx.stage_output:
         ctx.write_artifact("payload_decode", ctx.stage_output)

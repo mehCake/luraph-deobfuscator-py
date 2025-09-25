@@ -160,6 +160,12 @@ def test_cli_reports_multi_chunk_payload(tmp_path):
     assert report.get("blob_count") == expected_chunks
     if decoded_lengths:
         assert report.get("decoded_bytes") == sum(decoded_lengths)
+    chunks = report.get("chunks", [])
+    assert isinstance(chunks, list) and len(chunks) == expected_chunks
+    for chunk in chunks:
+        assert {"index", "size", "decoded_byte_count", "lifted_instruction_count"}.issubset(
+            chunk.keys()
+        )
 
     output_text = data.get("output", "")
     for marker in ("Aimbot", "ESP", "KillAll"):
