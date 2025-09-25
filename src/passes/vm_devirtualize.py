@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from variable_renamer import VariableRenamer
 
@@ -65,6 +65,16 @@ class IRDevirtualizer:
         self._unreachable_blocks = set(self.blocks) - self._reachable_blocks
         self._unreachable_pcs = {
             inst.pc for inst in self.instructions if inst.pc not in self._reachable_pcs
+        }
+        self._pc_statement_map: Dict[int, List[int]] = {}
+        self._block_pc_map: Dict[str, List[int]] = {}
+        for label, block in self.blocks.items():
+            pcs = [inst.pc for inst in block.instructions]
+            self._block_pc_map[label] = pcs
+        self._cfg_edges: Dict[str, List[str]] = {
+            label: list(block.successors)
+            for label, block in self.blocks.items()
+            if isinstance(block, IRBasicBlock)
         }
 
         self._handlers = {
@@ -141,7 +151,20 @@ class IRDevirtualizer:
         ctx = _LoweringContext()
         body, _ = self._lower_range(ctx, 0, len(self.instructions))
         chunk = lua_ast.Chunk(body=body)
-        metadata = {
+        chunk.metadata.setdefault("original_pcs", sorted(self._reachable_pcs))
+        if self.blocks:
+            chunk.metadata.setdefault(
+                "cfg",
+                {
+                    label: {
+                        "start_pc": self.blocks[label].start_pc,
+                        "successors": self._cfg_edges.get(label, []),
+                    }
+                    for label in sorted(self.blocks)
+                    if label in self.blocks
+                },
+            )
+        metadata: Dict[str, Any] = {
             "statements": self._count_statements(body),
             "unknown_instructions": self._unknown,
             "loops": self._loop_count,
@@ -154,6 +177,40 @@ class IRDevirtualizer:
         eliminated = len(self._unreachable_pcs)
         if eliminated:
             metadata["eliminated_instructions"] = eliminated
+        if self._unreachable_pcs:
+            metadata["unreachable_pcs"] = sorted(self._unreachable_pcs)
+        if self._block_pc_map:
+            block_entries = []
+            for label, pcs in sorted(self._block_pc_map.items()):
+                block = self.blocks.get(label)
+                start_pc = block.start_pc if isinstance(block, IRBasicBlock) else pcs[0] if pcs else -1
+                block_entries.append(
+                    {
+                        "label": label,
+                        "start_pc": start_pc,
+                        "pcs": pcs,
+                    }
+                )
+            if block_entries:
+                metadata["block_map"] = block_entries
+        if self._pc_statement_map:
+            pc_map: List[Dict[str, Any]] = [
+                {"pc": pc, "statements": indices}
+                for pc, indices in sorted(self._pc_statement_map.items())
+            ]
+            metadata["pc_mapping"] = pc_map
+            stmt_entries: List[Dict[str, Any]] = []
+            for entry in pc_map:
+                pc_value = entry.get("pc")
+                stmt_indices = entry.get("statements")
+                if not isinstance(pc_value, int) or not isinstance(stmt_indices, list):
+                    continue
+                for stmt_index in stmt_indices:
+                    if isinstance(stmt_index, int):
+                        stmt_entries.append({"statement": stmt_index, "pc": pc_value})
+            if stmt_entries:
+                stmt_entries.sort(key=lambda item: item["statement"])
+                metadata["statement_map"] = stmt_entries
         if self._closure_count:
             metadata["closures"] = self._closure_count
         return chunk, metadata
@@ -177,10 +234,55 @@ class IRDevirtualizer:
                 self._unknown += 1
                 idx += 1
                 continue
+            before = len(statements)
             idx = handler(ctx, idx, end, statements)
+            after = len(statements)
+            if after > before:
+                indices = list(range(before, after))
+                self._pc_statement_map.setdefault(inst.pc, []).extend(indices)
+                related = self._collect_related_pcs(inst)
+                pcs = [inst.pc, *related]
+                for stmt_index in indices:
+                    stmt = statements[stmt_index]
+                    self._attach_metadata(stmt, pcs, inst.opcode)
+            else:
+                self._pc_statement_map.setdefault(inst.pc, [])
         return statements, idx
 
     # --- Helpers -----------------------------------------------------
+    def _attach_metadata(
+        self,
+        stmt: lua_ast.Stmt,
+        pcs: Iterable[int],
+        opcode: Optional[str] = None,
+    ) -> None:
+        meta = getattr(stmt, "metadata", None)
+        if not isinstance(meta, dict):
+            return
+        existing = meta.setdefault("original_pcs", [])
+        for pc in pcs:
+            if isinstance(pc, int) and pc not in existing:
+                existing.append(pc)
+        if opcode:
+            origin_ops = meta.setdefault("ir_opcodes", [])
+            if opcode not in origin_ops:
+                origin_ops.append(opcode)
+
+    def _collect_related_pcs(self, inst: IRInstruction) -> List[int]:
+        related: List[int] = []
+        target = inst.args.get("target")
+        if isinstance(target, int):
+            related.append(target)
+        origin = inst.origin.get("pc") if isinstance(inst.origin, dict) else None
+        if isinstance(origin, int):
+            related.append(origin)
+        extra = inst.origin.get("pcs") if isinstance(inst.origin, dict) else None
+        if isinstance(extra, list):
+            for pc in extra:
+                if isinstance(pc, int):
+                    related.append(pc)
+        return related
+
     def _literal(self, value: Any) -> lua_ast.Expr:
         if isinstance(value, lua_ast.Expr):
             return value
@@ -642,15 +744,17 @@ class IRDevirtualizer:
         loop_ctx = ctx.clone()
         body, _ = self._lower_range(loop_ctx, idx + 1, loop_end)
         var_name = self._register_name((reg or 0) + 3)
-        out.append(
-            lua_ast.NumericFor(
-                var=var_name,
-                start=start_expr,
-                stop=stop_expr,
-                step=step_expr,
-                body=body,
-            )
+        loop_stmt = lua_ast.NumericFor(
+            var=var_name,
+            start=start_expr,
+            stop=stop_expr,
+            step=step_expr,
+            body=body,
         )
+        out.append(loop_stmt)
+        loop_end_pc = self.instructions[loop_end].pc if 0 <= loop_end < len(self.instructions) else None
+        extra_pcs = [pc for pc in (inst.pc, loop_end_pc) if isinstance(pc, int)]
+        self._attach_metadata(loop_stmt, extra_pcs, inst.opcode)
         self._loop_count += 1
         return loop_end + 1
 
@@ -693,16 +797,19 @@ class IRDevirtualizer:
             self._expr_for_register(ctx, (base or 0) + 1),
             self._expr_for_register(ctx, (base or 0) + 2),
         ]
-        out.append(
-            lua_ast.GenericFor(
-                vars=var_names,
-                iterables=iterables,
-                body=body,
-            )
+        loop_stmt = lua_ast.GenericFor(
+            vars=var_names,
+            iterables=iterables,
+            body=body,
         )
+        out.append(loop_stmt)
         ctx.registers.update(loop_ctx.registers)
         ctx.defined.update(loop_ctx.defined)
         self._loop_count += 1
+        extra = [inst.pc]
+        if isinstance(target_pc, int):
+            extra.append(target_pc)
+        self._attach_metadata(loop_stmt, extra, inst.opcode)
         return target_idx
 
     def _handle_vararg(
@@ -812,6 +919,7 @@ class IRDevirtualizer:
                 is_local=True,
             )
             out.append(func_def)
+            self._attach_metadata(func_def, [inst.pc], inst.opcode)
             if reg_index is not None:
                 ctx.registers[reg_index] = lua_ast.Name(target_name)
                 ctx.defined.add(reg_index)

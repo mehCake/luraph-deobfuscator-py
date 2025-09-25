@@ -128,21 +128,46 @@ class OpcodeLifter:
                 reverse[f"0X{numeric:X}"] = canonical.upper()
                 reverse[str(numeric)] = canonical.upper()
             self._opcode_tables[name] = reverse
+        self._default_tokens: Dict[str, str] = {
+            mnemonic.upper(): mnemonic.upper() for mnemonic in INSTRUCTION_SIGNATURES
+        }
 
     # ------------------------------------------------------------------
-    def lift_program(self, payload: Mapping[str, Any], version: Optional[str] = None) -> VMFunction:
+    def lift_program(
+        self,
+        payload: Mapping[str, Any],
+        version: Optional[str] = None,
+        *,
+        opcode_map: Optional[Mapping[int, Any]] = None,
+    ) -> VMFunction:
         """Return a :class:`VMFunction` built from ``payload``."""
 
         constants = list(payload.get("constants", []))
         raw_instructions: Iterable[Any] = payload.get("bytecode") or payload.get("code") or []
         prototypes = payload.get("prototypes") or []
 
+        override_map = opcode_map if opcode_map is not None else payload.get("opcode_map")
+        token_map, map_meta = self._build_token_map(version, override_map)
+
         lifted_instructions: List[VMInstruction] = []
         register_max = -1
         upvalue_max = -1
+        ir_trace: List[Dict[str, Any]] = []
 
-        for raw in raw_instructions:
-            instr = self._lift_instruction(raw, constants, version)
+        for pc, raw in enumerate(raw_instructions):
+            instr, operand_data = self._lift_instruction(raw, constants, token_map)
+            instr.pc = pc
+            if isinstance(operand_data.get("offset"), int):
+                instr.offset = int(operand_data["offset"])
+            ir_entry = {
+                "pc": pc,
+                "op": instr.opcode,
+                "args": self._format_ir_args(instr.opcode, operand_data),
+            }
+            if isinstance(instr.offset, int):
+                ir_entry["offset"] = instr.offset
+            instr.ir = ir_entry
+            ir_trace.append(ir_entry)
             lifted_instructions.append(instr)
             for reg in self._register_operands(instr):
                 if reg is not None:
@@ -154,7 +179,13 @@ class OpcodeLifter:
         lifted_prototypes: List[VMFunction] = []
         for proto in prototypes:
             if isinstance(proto, Mapping):
-                lifted_prototypes.append(self.lift_program(proto, version))
+                lifted_prototypes.append(
+                    self.lift_program(proto, version, opcode_map=override_map)
+                )
+
+        metadata = dict(payload.get("metadata", {}))
+        metadata.setdefault("opcode_table", map_meta)
+        metadata["ir_trace"] = ir_trace
 
         return VMFunction(
             constants=constants,
@@ -164,6 +195,7 @@ class OpcodeLifter:
             is_vararg=bool(payload.get("is_vararg")),
             register_count=max(register_max + 1, int(payload.get("max_register", 0) or 0)),
             upvalue_count=max(upvalue_max + 1, int(payload.get("upvalue_count", 0) or 0)),
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------------
@@ -171,10 +203,10 @@ class OpcodeLifter:
         self,
         raw: Any,
         constants: List[Any],
-        version: Optional[str],
-    ) -> VMInstruction:
+        token_map: Mapping[str, str],
+    ) -> tuple[VMInstruction, MutableMapping[str, Any]]:
         opcode_token, operands = self._extract_opcode(raw)
-        opcode = self._normalise_opcode(opcode_token, version)
+        opcode = self._normalise_opcode(opcode_token, token_map)
         data = self._normalise_operands(opcode, operands)
         signature = INSTRUCTION_SIGNATURES.get(opcode)
 
@@ -218,7 +250,74 @@ class OpcodeLifter:
             b=data.get("b"),
             c=data.get("c"),
             aux=aux,
-        )
+        ), data
+
+    def _build_token_map(
+        self,
+        version: Optional[str],
+        override: Optional[Mapping[int, Any]],
+    ) -> tuple[Dict[str, str], Dict[str, Any]]:
+        table = dict(self._opcode_tables.get(version or "", {}))
+        source = "config" if table else "default"
+        trusted = bool(table)
+
+        # Ensure canonical mnemonics are always available as fallbacks.
+        for mnemonic, canonical in self._default_tokens.items():
+            table.setdefault(mnemonic, canonical)
+
+        if isinstance(override, Mapping) and override:
+            source = "bootstrapper"
+            trusted = True
+            for opcode, name in override.items():
+                canonical = str(name).upper()
+                table[canonical] = canonical
+                for token in self._token_variants(opcode):
+                    table[token] = canonical
+        else:
+            trusted = False
+
+        metadata = {
+            "source": source,
+            "trusted": trusted,
+            "entries": len({value for value in table.values() if value in self._default_tokens}),
+        }
+        return table, metadata
+
+    def _token_variants(self, opcode: Any) -> List[str]:
+        variants: List[str] = []
+        if isinstance(opcode, int):
+            variants.append(str(opcode))
+            variants.append(f"0X{opcode:X}")
+        else:
+            text = str(opcode).strip()
+            if not text:
+                return variants
+            upper = text.upper()
+            variants.append(upper)
+            try:
+                numeric = int(text, 0)
+            except Exception:
+                return variants
+            variants.append(str(numeric))
+            variants.append(f"0X{numeric:X}")
+        return variants
+
+    def _format_ir_args(
+        self, opcode: str, operands: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        args: List[Dict[str, Any]] = []
+        signature = INSTRUCTION_SIGNATURES.get(opcode)
+        consumed: set[str] = set()
+        if signature:
+            for field in signature.fields:
+                if field in operands:
+                    args.append({"name": field, "value": operands[field]})
+                    consumed.add(field)
+        for key, value in operands.items():
+            if key in consumed or key == "upvalues":
+                continue
+            args.append({"name": str(key), "value": value})
+        return args
 
     # ------------------------------------------------------------------
     def _extract_opcode(self, raw: Any) -> tuple[Any, Any]:
@@ -231,27 +330,22 @@ class OpcodeLifter:
             return raw[0], list(raw[1:])
         raise ValueError(f"Unsupported instruction format: {raw!r}")
 
-    def _normalise_opcode(self, token: Any, version: Optional[str]) -> str:
+    def _normalise_opcode(self, token: Any, token_map: Mapping[str, str]) -> str:
         if isinstance(token, str):
             candidate = token.upper()
-            table = self._opcode_tables.get(version or "", {})
-            if candidate in table:
-                return table[candidate]
-            if candidate in INSTRUCTION_SIGNATURES:
-                return candidate
+            if candidate in token_map:
+                return token_map[candidate]
             try:
                 numeric = int(candidate, 0)
             except Exception:
                 return candidate
-            candidate = f"0X{numeric:X}"
-            if candidate in table:
-                return table[candidate]
-            return f"0X{numeric:X}"
+            variant = f"0X{numeric:X}"
+            return token_map.get(variant, variant)
         if isinstance(token, int):
-            candidate = f"0X{token:X}"
-            table = self._opcode_tables.get(version or "", {})
-            return table.get(candidate, candidate)
-        return str(token).upper()
+            variant = f"0X{token:X}"
+            return token_map.get(variant, variant)
+        candidate = str(token).upper()
+        return token_map.get(candidate, candidate)
 
     def _normalise_operands(self, opcode: str, operands: Any) -> MutableMapping[str, Any]:
         if isinstance(operands, Mapping):

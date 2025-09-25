@@ -19,6 +19,7 @@ def test_numeric_opcode_mapping_produces_canonical_instructions():
     loadk = program.instructions[0]
     assert loadk.opcode == "LOADK"
     assert loadk.aux["const_b"] == "hello"
+    assert loadk.pc == 0
 
     call = program.instructions[2]
     assert call.opcode == "CALL"
@@ -28,3 +29,9 @@ def test_numeric_opcode_mapping_produces_canonical_instructions():
     ret = program.instructions[3]
     assert ret.opcode == "RETURN"
     assert ret.aux["immediate_b"] == 1
+
+    metadata = program.metadata
+    assert metadata["opcode_table"]["trusted"] is False
+    trace = metadata.get("ir_trace")
+    assert isinstance(trace, list) and trace[0]["pc"] == 0
+    assert trace[2]["op"] == "CALL"

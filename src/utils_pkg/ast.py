@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -17,6 +17,7 @@ class Expr:
 @dataclass(slots=True)
 class Literal(Expr):
     value: object
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         if self.value is None:
@@ -31,6 +32,7 @@ class Literal(Expr):
 @dataclass(slots=True)
 class Name(Expr):
     ident: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         return self.ident
@@ -41,6 +43,7 @@ class BinOp(Expr):
     left: Expr
     op: str
     right: Expr
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         return f"{render_expr(self.left)} {self.op} {render_expr(self.right)}"
@@ -50,6 +53,7 @@ class BinOp(Expr):
 class UnOp(Expr):
     op: str
     operand: Expr
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         operand = render_expr(self.operand)
@@ -62,6 +66,7 @@ class UnOp(Expr):
 class Call(Expr):
     func: Expr
     args: List[Expr] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         args = ", ".join(render_expr(arg) for arg in self.args)
@@ -72,6 +77,7 @@ class Call(Expr):
 class TableAccess(Expr):
     table: Expr
     key: Expr
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         return f"{render_expr(self.table)}[{render_expr(self.key)}]"
@@ -80,6 +86,7 @@ class TableAccess(Expr):
 @dataclass(slots=True)
 class TableConstructor(Expr):
     fields: List[tuple[Expr | None, Expr]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         if not self.fields:
@@ -106,16 +113,19 @@ class Assignment(Stmt):
     targets: List[Expr]
     values: List[Expr]
     is_local: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class CallStmt(Stmt):
     call: Call
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class Return(Stmt):
     values: List[Expr] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -123,12 +133,14 @@ class If(Stmt):
     test: Expr
     body: List[Stmt] = field(default_factory=list)
     orelse: List[Stmt] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class While(Stmt):
     test: Expr
     body: List[Stmt]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -138,6 +150,7 @@ class NumericFor(Stmt):
     stop: Expr
     step: Expr
     body: List[Stmt]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -145,11 +158,13 @@ class GenericFor(Stmt):
     vars: List[str]
     iterables: List[Expr]
     body: List[Stmt]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class DoBlock(Stmt):
     body: List[Stmt] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -158,11 +173,13 @@ class FunctionDef(Stmt):
     params: List[str]
     body: List[Stmt]
     is_local: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class Chunk:
     body: List[Stmt] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

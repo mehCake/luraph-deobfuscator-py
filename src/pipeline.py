@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import (
 from version_detector import VersionInfo
 
 from . import utils
+from .detect import ask_confirm, detect_version_from_text, legacy_detector
 from .report import DeobReport
 from .deobfuscator import LuaDeobfuscator, VMIR
 from .versions import VersionHandler
@@ -30,9 +32,20 @@ from .passes.payload_decode import run as payload_decode_run
 from .passes.vm_devirtualize import run as vm_devirtualize_run
 from .passes.vm_lift import run as vm_lift_run
 from .passes.cleanup import run as cleanup_run
+from .passes.string_reconstruction import run as string_reconstruction_run
 from .passes.render import run as render_run
 
 LOG = logging.getLogger(__name__)
+
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_KNOWN_BOOTSTRAPPERS = {
+    "initv4": _ROOT_DIR / "initv4.lua",
+}
+
+_VERSION_BOOTSTRAPPERS = {
+    "luraph_v14_4_initv4": "initv4",
+    "v14.4.1": "initv4",
+}
 
 PassFn = Callable[["Context"], None]
 
@@ -86,8 +99,11 @@ class Context:
     options: Dict[str, Any] = field(default_factory=dict)
     script_key: str | None = None
     bootstrapper_path: Path | None = None
+    yes: bool = False
+    force: bool = False
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
+    vm_metadata: Dict[str, Any] = field(default_factory=dict)
     ir_module: "IRModule | None" = None
     from_json: bool = False
     reconstructed_lua: str = ""
@@ -176,6 +192,154 @@ class Context:
         path.write_text(content, encoding="utf-8")
 
 
+def _is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _should_prompt_confirmation(ctx: Context) -> bool:
+    if getattr(ctx, "force", False):
+        return False
+    if getattr(ctx, "yes", False):
+        return False
+    option = ctx.options.get("confirm_detected_version") if isinstance(ctx.options, dict) else None
+    if isinstance(ctx.options, dict) and ctx.options.get("auto_confirm"):
+        return False
+    if isinstance(ctx.options, dict) and ctx.options.get("force"):
+        return False
+    if option is False:
+        return False
+    if option is True:
+        return _is_interactive()
+    if ctx.iteration > 0:
+        return False
+    return _is_interactive()
+
+
+def _prompt_yes_no(message: str) -> bool:
+    prompt = message
+    while True:
+        try:
+            response = input(prompt)
+        except EOFError:  # pragma: no cover - treat EOF as acceptance
+            return True
+        answer = response.strip().lower()
+        if not answer:
+            return True
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        prompt = "Please answer Y or N: "
+
+
+def _confirm_detected_version(ctx: Context, version: VersionInfo) -> None:
+    if version.is_unknown or ctx.version_override:
+        return
+    if ctx.options.get("_version_confirmed"):
+        return
+    if not _should_prompt_confirmation(ctx):
+        ctx.options["_version_confirmed"] = True
+        return
+    accepted = _prompt_yes_no(
+        f"Detected Luraph version '{version.name}'. Is this correct? [Y/n]: "
+    )
+    if not accepted:
+        raise RuntimeError(
+            "User rejected detected Luraph version. Rerun with --force-version to override."
+        )
+    ctx.options["_version_confirmed"] = True
+
+
+def _expected_bootstrapper(version: VersionInfo) -> str | None:
+    return _VERSION_BOOTSTRAPPERS.get(version.name)
+
+
+def _locate_bootstrapper(name: str) -> Path | None:
+    candidate = _KNOWN_BOOTSTRAPPERS.get(name.lower())
+    if candidate and candidate.exists():
+        return candidate
+    fallback = Path(f"{name}.lua")
+    if fallback.exists():
+        try:
+            return fallback.resolve()
+        except OSError:  # pragma: no cover - defensive
+            return fallback
+    return None
+
+
+def _bootstrap_matches(path: Path, expected: str) -> bool:
+    try:
+        if expected.lower() in path.name.lower():
+            return True
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return expected.lower() in text.lower()
+
+
+def _validate_bootstrapper(ctx: Context, version: VersionInfo) -> None:
+    if ctx.options.get("_bootstrap_validated"):
+        return
+    expected = _expected_bootstrapper(version)
+    if not expected:
+        ctx.options["_bootstrap_validated"] = True
+        return
+
+    expected_key = expected.lower()
+    bootstrap_path = ctx.bootstrapper_path
+    resolved: Path | None = None
+    if bootstrap_path is None:
+        resolved = _locate_bootstrapper(expected_key)
+        if resolved:
+            ctx.bootstrapper_path = resolved
+            if ctx.report is not None:
+                ctx.report.bootstrapper_used = str(resolved)
+            ctx.options.setdefault("bootstrapper", str(resolved))
+            LOG.info("Using default %s bootstrapper at %s", expected, resolved)
+        else:
+            LOG.warning(
+                "Detected version %s expects %s bootstrapper but none was provided",
+                version.name,
+                expected,
+            )
+            ctx.options["_bootstrap_validated"] = True
+            return
+    else:
+        resolved = Path(bootstrap_path)
+        if not resolved.exists():
+            LOG.warning("Bootstrapper path %s does not exist", resolved)
+            ctx.options["_bootstrap_validated"] = True
+            return
+        ctx.bootstrapper_path = resolved
+
+    assert resolved is not None
+    if not _bootstrap_matches(resolved, expected_key):
+        if _should_prompt_confirmation(ctx):
+            accepted = _prompt_yes_no(
+                (
+                    f"Bootstrapper '{resolved.name}' does not appear to match expected "
+                    f"'{expected}'. Continue? [Y/n]: "
+                )
+            )
+            if not accepted:
+                raise RuntimeError(
+                    "Bootstrapper rejected by user confirmation. Provide the correct init stub."
+                )
+        else:
+            LOG.warning(
+                "Bootstrapper %s may not match expected %s for version %s",
+                resolved,
+                expected,
+                version.name,
+            )
+    if ctx.report is not None and ctx.report.bootstrapper_used is None:
+        ctx.report.bootstrapper_used = str(resolved)
+    ctx.options["_bootstrap_validated"] = True
+
+
 class PassRegistry:
     def __init__(self) -> None:
         self._passes: Dict[str, Tuple[int, PassFn]] = {}
@@ -243,15 +407,30 @@ def _pass_detect(ctx: Context) -> None:
     deob = ctx.deobfuscator
     assert deob is not None
 
+    raw_text = ctx.raw_input
+    candidate_name = detect_version_from_text(raw_text)
+
     if ctx.version_override:
         version = deob._resolve_version(  # type: ignore[attr-defined]
-            ctx.raw_input,
+            raw_text,
             ctx.version_override,
             from_json=ctx.from_json,
         )
+    elif candidate_name:
+        if candidate_name.startswith("luraph_v14_4"):
+            version = deob._version_detector.info_for_name(candidate_name)  # type: ignore[attr-defined]
+            prompt = f"Detected Luraph v14.4.1 in {ctx.input_path}. Use v14.4.1 handler?"
+            if _should_prompt_confirmation(ctx):
+                if not ask_confirm(ctx, prompt):
+                    version = legacy_detector(raw_text, from_json=ctx.from_json)
+        else:
+            version = legacy_detector(raw_text, from_json=ctx.from_json)
     else:
-        version = deob.detect_version(ctx.raw_input, from_json=ctx.from_json)
+        version = deob.detect_version(raw_text, from_json=ctx.from_json)
     ctx.detected_version = version
+
+    _confirm_detected_version(ctx, version)
+    _validate_bootstrapper(ctx, version)
 
     if ctx.report:
         ctx.report.version_detected = version.name
@@ -265,6 +444,8 @@ def _pass_detect(ctx: Context) -> None:
     }
     if version.matched_categories:
         metadata["matched_categories"] = list(version.matched_categories)
+    if ctx.bootstrapper_path:
+        metadata["bootstrapper_path"] = str(ctx.bootstrapper_path)
     ctx.record_metadata("detect", metadata)
     if ctx.iteration == 0:
         ctx.write_artifact("raw_input", ctx.raw_input)
@@ -286,6 +467,52 @@ def _pass_payload_decode(ctx: Context) -> None:
 
 def _pass_vm_lift(ctx: Context) -> None:
     metadata = vm_lift_run(ctx)
+    module = ctx.ir_module
+    if module is not None:
+        lifter_meta = ctx.vm_metadata.setdefault("lifter", {})
+        lifter_meta.update(
+            {
+                "instruction_count": module.instruction_count,
+                "block_count": module.block_count,
+                "bytecode_size": module.bytecode_size,
+            }
+        )
+        block_lookup: Dict[int, str] = {}
+        for label, block in module.blocks.items():
+            for inst in block.instructions:
+                block_lookup[inst.pc] = label
+        markers: List[Dict[str, Any]] = []
+        for inst in module.instructions:
+            entry: Dict[str, Any] = {"pc": inst.pc, "opcode": inst.opcode}
+            if inst.args:
+                entry["args"] = dict(inst.args)
+            if inst.dest is not None:
+                entry["dest"] = inst.dest
+            origin_offset = inst.origin.get("offset") if isinstance(inst.origin, dict) else None
+            if isinstance(origin_offset, int):
+                entry["offset"] = origin_offset
+            block_label = block_lookup.get(inst.pc)
+            if block_label:
+                entry["block"] = block_label
+            markers.append(entry)
+        if markers:
+            lifter_meta["instruction_total"] = len(markers)
+            sample_limit = 256
+            lifter_meta["instruction_markers"] = markers[:sample_limit]
+            if len(markers) > sample_limit:
+                lifter_meta["instruction_sample_size"] = sample_limit
+        block_meta: List[Dict[str, Any]] = []
+        for label, block in sorted(module.blocks.items()):
+            block_meta.append(
+                {
+                    "label": label,
+                    "start_pc": block.start_pc,
+                    "size": len(block.instructions),
+                    "successors": list(block.successors),
+                }
+            )
+        if block_meta:
+            lifter_meta["blocks"] = block_meta
     report = ctx.report
     if report is not None and ctx.ir_module is not None:
         stats: Dict[str, int] = {}
@@ -311,6 +538,28 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
         ctx.record_metadata("vm_devirtualize", {"skipped": True})
         return
     metadata = vm_devirtualize_run(ctx)
+    if metadata:
+        devirt_meta = ctx.vm_metadata.setdefault("devirtualizer", {})
+        for key in (
+            "pc_mapping",
+            "statement_map",
+            "block_map",
+            "reachable_blocks",
+            "unreachable_blocks",
+            "unreachable_pcs",
+            "eliminated_instructions",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                devirt_meta[key] = value
+        unreachable = metadata.get("unreachable_pcs")
+        if isinstance(unreachable, list) and unreachable:
+            traps_meta = ctx.vm_metadata.setdefault("traps", {})
+            traps_meta["unreachable_pcs"] = list(unreachable)
+        eliminated = metadata.get("eliminated_instructions")
+        if isinstance(eliminated, int) and eliminated > 0:
+            traps_meta = ctx.vm_metadata.setdefault("traps", {})
+            traps_meta["eliminated_instructions"] = eliminated
     ctx.record_metadata("vm_devirtualize", dict(metadata))
     if ctx.stage_output:
         ctx.write_artifact("vm_devirtualize", ctx.stage_output)
@@ -328,6 +577,12 @@ def _pass_cleanup(ctx: Context) -> None:
         if isinstance(dummy_loops, int):
             traps += max(dummy_loops, 0)
         report.traps_removed = traps
+        trap_meta = ctx.vm_metadata.setdefault("traps", {})
+        if isinstance(assert_traps, int):
+            trap_meta["assert_traps"] = max(assert_traps, 0)
+        if isinstance(dummy_loops, int):
+            trap_meta["dummy_loops"] = max(dummy_loops, 0)
+        trap_meta["total_removed"] = traps
 
         constants = 0
         if metadata.get("constant_folded"):
@@ -343,6 +598,18 @@ def _pass_cleanup(ctx: Context) -> None:
     ctx.record_metadata("cleanup", metadata)
     if ctx.stage_output:
         ctx.write_artifact("cleanup", ctx.stage_output)
+
+
+def _pass_string_reconstruction(ctx: Context) -> None:
+    metadata = string_reconstruction_run(ctx)
+    report = ctx.report
+    if report is not None:
+        warnings = metadata.get("warnings")
+        if isinstance(warnings, list):
+            report.warnings.extend(str(item) for item in warnings if item)
+    ctx.record_metadata("string_reconstruction", metadata)
+    if ctx.stage_output:
+        ctx.write_artifact("string_reconstruction", ctx.stage_output)
 
 
 def _pass_render(ctx: Context) -> None:
@@ -366,6 +633,7 @@ PIPELINE.register_pass("payload_decode", _pass_payload_decode, 30)
 PIPELINE.register_pass("vm_lift", _pass_vm_lift, 40)
 PIPELINE.register_pass("vm_devirtualize", _pass_vm_devirtualize, 50)
 PIPELINE.register_pass("cleanup", _pass_cleanup, 60)
+PIPELINE.register_pass("string_reconstruction", _pass_string_reconstruction, 65)
 PIPELINE.register_pass("render", _pass_render, 70)
 
 

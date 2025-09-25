@@ -5,6 +5,7 @@ import base64
 import json
 
 from version_detector import VersionDetector
+from src import pipeline
 from src.deobfuscator import LuaDeobfuscator
 from src.vm.emulator import LuraphVM
 from src.versions import VersionHandler, decode_constant_pool, get_handler
@@ -18,21 +19,25 @@ def test_detect_version_examples() -> None:
 
     assert detector.detect_version(json_wrapped).name == 'v14.0.2'
     assert detector.detect_version(simple).name == 'v14.1'
-    assert detector.detect_version(complex_payload).name in {
-        'v14.2',
-        'luraph_v14_2_json',
-        'luraph_v14_4_initv4',
-        'v14.4.1',
-    }
+    assert detector.detect_version(complex_payload).name == 'luraph_v14_4_initv4'
 
     deob = LuaDeobfuscator()
     assert deob.detect_version(json_wrapped).name == 'v14.0.2'
-    assert deob.detect_version(complex_payload).name in {
-        'v14.2',
-        'luraph_v14_2_json',
-        'luraph_v14_4_initv4',
-        'v14.4.1',
-    }
+    assert deob.detect_version(complex_payload).name == 'luraph_v14_4_initv4'
+
+
+def test_detect_version_from_banner_only() -> None:
+    detector = VersionDetector()
+    sample = "-- Luraph Obfuscator v14.4.1"
+    detected = detector.detect(sample)
+    assert detected.name == 'luraph_v14_4_initv4'
+
+
+def test_detect_version_banner_in_json() -> None:
+    detector = VersionDetector()
+    sample = '{"banner": "Luraph v14.2"}'
+    detected = detector.detect(sample, from_json=True)
+    assert detected.name == 'luraph_v14_2_json'
 
 
 def test_v142_pcall_bypass() -> None:
@@ -83,6 +88,24 @@ def test_luraph_v142_json_handler_detection() -> None:
 
     deob = LuaDeobfuscator()
     assert deob.detect_version(sample).name == "luraph_v14_2_json"
+
+
+def test_detect_pass_assigns_initv4_bootstrapper() -> None:
+    sample_path = Path('examples/complex_obfuscated')
+    text = sample_path.read_text()
+    ctx = pipeline.Context(
+        input_path=sample_path,
+        raw_input=text,
+        stage_output=text,
+        original_text=text,
+        working_text=text,
+        deobfuscator=LuaDeobfuscator(),
+    )
+    ctx.options["confirm_detected_version"] = False
+    pipeline._pass_detect(ctx)
+    assert ctx.bootstrapper_path is not None
+    assert Path(ctx.bootstrapper_path).name == 'initv4.lua'
+    assert ctx.report.bootstrapper_used is not None
 
 
 def test_version_detector_initv4_heuristics_trigger() -> None:

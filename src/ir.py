@@ -30,6 +30,9 @@ class VMInstruction:
     b: Optional[int] = None
     c: Optional[int] = None
     aux: Dict[str, Any] = field(default_factory=dict)
+    pc: int = 0
+    offset: Optional[int] = None
+    ir: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -43,6 +46,7 @@ class VMFunction:
     is_vararg: bool = False
     register_count: int = 0
     upvalue_count: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 __all__ = [

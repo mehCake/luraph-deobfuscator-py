@@ -33,6 +33,36 @@ def _render(module: IRModule) -> str:
     return lua_ast.to_source(chunk)
 
 
+def test_ir_devirtualizer_attaches_pc_metadata() -> None:
+    instructions = [
+        IRInstruction(pc=0, opcode="LoadK", args={"dest": 0, "const_value": True}, dest=0),
+        IRInstruction(
+            pc=1,
+            opcode="Test",
+            args={"reg": 0, "target": 4, "conditional": "JMPIFNOT"},
+        ),
+        IRInstruction(pc=2, opcode="LoadK", args={"dest": 1, "const_value": "then"}, dest=1),
+        IRInstruction(pc=3, opcode="Jump", args={"target": 5}),
+        IRInstruction(pc=4, opcode="LoadK", args={"dest": 1, "const_value": "else"}, dest=1),
+        IRInstruction(pc=5, opcode="Return", args={"base": 1, "count": 1}),
+    ]
+    module = _make_module(instructions)
+    chunk, metadata = IRDevirtualizer(module, module.constants).lower()
+
+    assert sorted(chunk.metadata.get("original_pcs", [])) == [0, 1, 2, 3, 4, 5]
+
+    first_stmt = chunk.body[0]
+    assert isinstance(first_stmt.metadata, dict)
+    assert first_stmt.metadata.get("original_pcs") == [0]
+
+    branch_stmt = next(stmt for stmt in chunk.body if isinstance(stmt, lua_ast.If))
+    pcs = branch_stmt.metadata.get("original_pcs")
+    assert pcs is not None and set(pcs) >= {1, 4}
+    assert "Test" in branch_stmt.metadata.get("ir_opcodes", [])
+
+    assert metadata.get("pc_mapping")
+
+
 def test_ir_devirtualizer_handles_if_else() -> None:
     instructions = [
         IRInstruction(pc=0, opcode="LoadK", args={"dest": 0, "const_value": True}, dest=0),
@@ -118,6 +148,9 @@ def test_ir_devirtualizer_skips_unreachable_blocks() -> None:
     assert "trap" not in source
     assert metadata.get("unreachable_blocks") == 1
     assert metadata.get("eliminated_instructions") == 2
+    assert metadata.get("unreachable_pcs") == [2, 3]
+    pc_map = metadata.get("pc_mapping")
+    assert isinstance(pc_map, list) and any(entry.get("pc") == 0 for entry in pc_map)
 
 
 def test_ir_devirtualizer_lowers_closures() -> None:
@@ -161,3 +194,4 @@ def test_vm_devirtualize_pass_renames_and_formats(tmp_path) -> None:
     assert metadata["renamed_identifiers"] is True
     assert metadata["renamed_count"] >= 2
     assert ctx.report.variables_renamed == metadata["renamed_count"]
+    assert "pc_mapping" in metadata

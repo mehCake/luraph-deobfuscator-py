@@ -4,9 +4,10 @@ import json
 import logging
 import os
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 from lph_handler import extract_vm_ir
 from version_detector import VersionDetector, VersionInfo
@@ -16,8 +17,12 @@ from lua_vm_simulator import LuaVMSimulator
 from variable_renamer import VariableRenamer
 
 from . import utils, versions
-from .versions import VersionHandler, PayloadInfo
+from .versions import VersionHandler, PayloadInfo, decode_constant_pool, OpSpec
+from .versions.luraph_v14_4_1 import looks_like_vm_bytecode
 from .passes import Devirtualizer
+from .passes.vm_lift import VMLifter
+from .passes.vm_devirtualize import IRDevirtualizer
+from .utils_pkg import ast as lua_ast
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
 
@@ -44,6 +49,7 @@ class VMIR:
     bytecode: list[list[Any]]
     version: str | None = None
     prototypes: list[Any] | None = None
+    opcode_map: Dict[int, Any] | None = None
 
 
 @dataclass
@@ -104,6 +110,7 @@ class LuaDeobfuscator:
         features: FrozenSet[str] | None = None,
         script_key: str | None = None,
         bootstrapper: str | os.PathLike[str] | Path | None = None,
+        force: bool | None = None,
     ) -> DeobResult:
         """Decode known payload formats and return a :class:`DeobResult`."""
 
@@ -127,6 +134,8 @@ class LuaDeobfuscator:
             self._bootstrapper_path = bootstrapper_path
         if self._bootstrapper_path is not None:
             metadata["bootstrapper_path"] = str(self._bootstrapper_path)
+
+        force_flag = bool(force)
 
         def feature_enabled(flag: str) -> bool:
             return active_features is None or flag in active_features
@@ -184,14 +193,15 @@ class LuaDeobfuscator:
 
                 if override_key:
                     payload_info.metadata[override_token] = override_key
-                raw_bytes: bytes | None = None
+                chunk_meta_updates: Dict[str, Any] = {}
+                chunk_parts: list[bytes] = []
                 try:
                     raw_bytes = handler_instance.extract_bytecode(payload_info)
                 except Exception as exc:  # pragma: no cover - best effort
                     message = str(exc)
                     metadata["handler_bytecode_error"] = message
-                    payload_meta = payload_info.metadata or {}
-                    literal_key = bool(payload_meta.get("script_key"))
+                    payload_info_meta = payload_info.metadata or {}
+                    literal_key = bool(payload_info_meta.get("script_key"))
                     env_key = os.environ.get("LURAPH_SCRIPT_KEY", "")
                     if (
                         version.name in {"luraph_v14_4_initv4", "v14.4.1"}
@@ -208,36 +218,183 @@ class LuaDeobfuscator:
                     metadata["handler_bytecode_bytes"] = len(raw_bytes)
                     metadata["handler_vm_bytecode"] = raw_bytes
                     if payload_dict is None:
-                        decoded_text = raw_bytes.decode("utf-8", errors="ignore")
-                        cleaned_text = utils.strip_non_printable(decoded_text)
-                        mapping: Any = None
-                        if cleaned_text:
-                            stripped = cleaned_text.lstrip()
-                            if stripped.startswith("{") or stripped.startswith("["):
-                                try:
-                                    mapping = json.loads(cleaned_text)
-                                except json.JSONDecodeError:
-                                    mapping = None
-                            if mapping is None:
-                                mapping = extract_vm_ir(cleaned_text)
-                        if isinstance(mapping, dict):
+                        mapping, _, mapping_meta = self._decode_payload_mapping(raw_bytes)
+                        if mapping is not None:
                             payload_dict = mapping
                             payload_info.data = mapping
-                            metadata["handler_decoded_json"] = True
-                        elif isinstance(mapping, list):
-                            converted = extract_vm_ir(json.dumps(mapping))
-                            if isinstance(converted, dict):
-                                payload_dict = converted
-                                payload_info.data = converted
-                                metadata["handler_decoded_json"] = True
+                        for key, value in mapping_meta.items():
+                            if key not in metadata or not metadata.get(key):
+                                metadata[key] = value
+
+                    if version.name in {"luraph_v14_4_initv4", "v14.4.1"}:
+                        chunk_key: str | None = override_key or payload_info.metadata.get("script_key")
+                        if not chunk_key:
+                            chunk_key = os.environ.get("LURAPH_SCRIPT_KEY", "") or None
+                        if chunk_key:
+                            (
+                                chunk_parts,
+                                chunk_meta_updates,
+                                chunk_analysis,
+                            ) = self._decode_initv4_chunks(
+                                text,
+                                script_key=chunk_key,
+                                handler=handler_instance,
+                                version=version,
+                                force=force_flag,
+                            )
+                            if chunk_parts:
+                                combined_bytes = b"".join(chunk_parts)
+                                if combined_bytes:
+                                    existing_vm = metadata.get("handler_vm_bytecode")
+                                    if not existing_vm:
+                                        metadata["handler_vm_bytecode"] = combined_bytes
+                                        metadata["handler_bytecode_bytes"] = len(combined_bytes)
+                                    elif isinstance(existing_vm, (bytes, bytearray)) and len(combined_bytes) > len(existing_vm):
+                                        metadata.setdefault("handler_chunk_combined_bytes", len(combined_bytes))
+                                    if payload_dict is None:
+                                        mapping, _, mapping_meta = self._decode_payload_mapping(combined_bytes)
+                                        if mapping is not None:
+                                            payload_dict = mapping
+                                            payload_info.data = mapping
+                                        for key, value in mapping_meta.items():
+                                            if key not in metadata or not metadata.get(key):
+                                                metadata[key] = value
+                                if chunk_analysis:
+                                    sources = chunk_analysis.get("sources")
+                                    if sources:
+                                        metadata.setdefault(
+                                            "handler_chunk_sources",
+                                            list(sources),
+                                        )
+                                    rename_counts = chunk_analysis.get("rename_counts")
+                                    if rename_counts and "handler_chunk_rename_counts" not in metadata:
+                                        metadata["handler_chunk_rename_counts"] = list(rename_counts)
+                                    cleaned_flags = chunk_analysis.get("cleaned_chunks")
+                                    if cleaned_flags and "handler_chunk_cleaned" not in metadata:
+                                        metadata["handler_chunk_cleaned"] = list(cleaned_flags)
+                                    combined_source = chunk_analysis.get("final_source")
+                                    if combined_source:
+                                        metadata.setdefault(
+                                            "handler_chunk_combined_source",
+                                            combined_source,
+                                        )
+                                        if payload_dict is None or (
+                                            isinstance(sources, list)
+                                            and len([src for src in sources if src.strip()]) > 1
+                                        ):
+                                            payload_dict = {"script": combined_source}
+                                            metadata["script_payload"] = True
+                                            if payload_info is not None:
+                                                payload_info.data = {"script": combined_source}
                 finally:
                     if override_key:
                         payload_info.metadata.pop(override_token, None)
 
                 cleaned_meta = dict(payload_info.metadata)
                 cleaned_meta.pop(override_token, None)
+                cleaned_meta.pop("_chunks", None)
+                chunk_count = cleaned_meta.get("chunk_count")
+                if isinstance(chunk_count, int) and chunk_count > 0:
+                    metadata["handler_payload_chunks"] = chunk_count
+                chunk_bytes = cleaned_meta.get("chunk_decoded_bytes")
+                if isinstance(chunk_bytes, list):
+                    metadata["handler_chunk_decoded_bytes"] = list(chunk_bytes)
+                success_value = cleaned_meta.get("chunk_success_count")
+                if isinstance(success_value, int) and success_value >= 0:
+                    metadata["handler_chunk_success_count"] = success_value
                 if cleaned_meta:
                     metadata["handler_payload_meta"] = cleaned_meta
+
+                if chunk_meta_updates:
+                    if (
+                        isinstance(chunk_meta_updates.get("chunk_count"), int)
+                        and chunk_meta_updates["chunk_count"] > 0
+                        and "handler_payload_chunks" not in metadata
+                    ):
+                        metadata["handler_payload_chunks"] = chunk_meta_updates["chunk_count"]
+                    if (
+                        isinstance(chunk_meta_updates.get("chunk_decoded_bytes"), list)
+                        and "handler_chunk_decoded_bytes" not in metadata
+                    ):
+                        metadata["handler_chunk_decoded_bytes"] = list(
+                            chunk_meta_updates["chunk_decoded_bytes"]
+                        )
+                    success_value = chunk_meta_updates.get("chunk_success_count")
+                    if (
+                        isinstance(success_value, int)
+                        and success_value >= 0
+                        and "handler_chunk_success_count" not in metadata
+                    ):
+                        metadata["handler_chunk_success_count"] = success_value
+                    encoded_lengths = chunk_meta_updates.get("chunk_encoded_lengths")
+                    if isinstance(encoded_lengths, list) and encoded_lengths:
+                        metadata.setdefault("handler_chunk_encoded_lengths", list(encoded_lengths))
+                    errors = chunk_meta_updates.get("chunk_errors")
+                    if isinstance(errors, list) and errors:
+                        metadata.setdefault("handler_chunk_errors", list(errors))
+                    suspicious_flags = chunk_meta_updates.get("chunk_suspicious_flags")
+                    if (
+                        isinstance(suspicious_flags, list)
+                        and "handler_chunk_suspicious" not in metadata
+                    ):
+                        metadata["handler_chunk_suspicious"] = [
+                            bool(flag) for flag in suspicious_flags
+                        ]
+                    warning_entries = chunk_meta_updates.get("warnings")
+                    if isinstance(warning_entries, list) and warning_entries:
+                        bucket = metadata.setdefault("warnings", [])
+                        bucket.extend(str(entry) for entry in warning_entries if entry)
+                    if chunk_meta_updates.get("vm_lift_skipped"):
+                        metadata["handler_vm_lift_skipped"] = True
+                    if chunk_meta_updates.get("vm_lift_forced"):
+                        metadata["handler_vm_lift_forced"] = True
+                    existing_payload_meta_obj = metadata.get("handler_payload_meta")
+                    if isinstance(existing_payload_meta_obj, dict):
+                        existing_payload_meta: Dict[str, Any] = existing_payload_meta_obj
+                        for key in (
+                            "chunk_count",
+                            "chunk_decoded_bytes",
+                            "chunk_encoded_lengths",
+                            "chunk_success_count",
+                        ):
+                            value = chunk_meta_updates.get(key)
+                            if value is not None and key not in existing_payload_meta:
+                                existing_payload_meta[key] = value
+                        for extra in (
+                            "chunk_suspicious_flags",
+                            "warnings",
+                            "vm_lift_skipped",
+                            "vm_lift_forced",
+                        ):
+                            if extra in chunk_meta_updates and extra not in existing_payload_meta:
+                                existing_payload_meta[extra] = chunk_meta_updates[extra]
+                    elif any(
+                        key in chunk_meta_updates
+                        for key in (
+                            "chunk_count",
+                            "chunk_decoded_bytes",
+                            "chunk_encoded_lengths",
+                            "chunk_success_count",
+                        )
+                    ):
+                        metadata["handler_payload_meta"] = {
+                            key: chunk_meta_updates[key]
+                            for key in (
+                                "chunk_count",
+                                "chunk_decoded_bytes",
+                                "chunk_encoded_lengths",
+                                "chunk_success_count",
+                            )
+                            if key in chunk_meta_updates
+                        }
+                        for extra in (
+                            "chunk_suspicious_flags",
+                            "warnings",
+                            "vm_lift_skipped",
+                            "vm_lift_forced",
+                        ):
+                            if extra in chunk_meta_updates:
+                                metadata["handler_payload_meta"][extra] = chunk_meta_updates[extra]
 
                 if data_candidate is not None:
                     payload_dict = data_candidate
@@ -334,13 +491,17 @@ class LuaDeobfuscator:
         canonical: Optional[Any] = None
         if vm_ir.bytecode and all(isinstance(ins, dict) for ins in vm_ir.bytecode):
             try:
+                payload: Dict[str, Any] = {
+                    "constants": vm_ir.constants,
+                    "bytecode": vm_ir.bytecode,
+                    "prototypes": vm_ir.prototypes or [],
+                }
+                if vm_ir.opcode_map:
+                    payload["opcode_map"] = vm_ir.opcode_map
                 canonical = self._opcode_lifter.lift_program(
-                    {
-                        "constants": vm_ir.constants,
-                        "bytecode": vm_ir.bytecode,
-                        "prototypes": vm_ir.prototypes or [],
-                    },
+                    payload,
                     version=vm_ir.version,
+                    opcode_map=vm_ir.opcode_map,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 self.logger.debug("Opcode lifting failed: %s", exc)
@@ -589,6 +750,347 @@ class LuaDeobfuscator:
             return False
         return (snippet[0], snippet[-1]) in {("{", "}"), ("[", "]")}
 
+    def _decode_payload_mapping(
+        self, raw_bytes: bytes
+    ) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
+        """Return a mapping derived from ``raw_bytes`` when possible."""
+
+        metadata: Dict[str, Any] = {}
+        if not raw_bytes:
+            return None, "", metadata
+
+        try:
+            decoded_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "", metadata
+
+        cleaned_text = utils.strip_non_printable(decoded_text)
+        if not cleaned_text:
+            return None, "", metadata
+
+        mapping: Any = None
+        stripped = cleaned_text.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                mapping = json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                mapping = None
+            else:
+                metadata["handler_decoded_json"] = True
+
+        if isinstance(mapping, list):
+            converted = extract_vm_ir(json.dumps(mapping))
+            if isinstance(converted, dict):
+                mapping = converted
+
+        if isinstance(mapping, dict):
+            if isinstance(mapping.get("script"), str):
+                metadata.setdefault("script_payload", True)
+            return mapping, cleaned_text, metadata
+
+        return None, cleaned_text, metadata
+
+    def _decode_initv4_chunks(
+        self,
+        source: str,
+        *,
+        script_key: str,
+        handler: VersionHandler | None = None,
+        version: VersionInfo | None = None,
+        force: bool = False,
+    ) -> Tuple[list[bytes], Dict[str, Any], Dict[str, Any]]:
+        """Decode every initv4 payload chunk discovered in ``source``."""
+
+        if not script_key:
+            return [], {}, {}
+
+        try:
+            from .versions.initv4 import InitV4Decoder
+        except Exception:  # pragma: no cover - optional dependency
+            return [], {}, {}
+
+        ctx = SimpleNamespace(
+            script_key=script_key,
+            bootstrapper_path=self._bootstrapper_path,
+        )
+        try:
+            decoder = InitV4Decoder(ctx)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.debug("initv4 decoder setup failed: %s", exc)
+            return [], {}, {}
+
+        try:
+            payloads = decoder.locate_payload(source)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.debug("initv4 chunk discovery failed: %s", exc)
+            return [], {}, {}
+
+        try:
+            decoder_opcode_table = decoder.opcode_table()
+        except Exception:  # pragma: no cover - best effort
+            decoder_opcode_table = {}
+        opcode_table_trusted = decoder.has_custom_opcodes()
+        opcode_table_source = "bootstrapper" if opcode_table_trusted else "default"
+
+        decoded_parts: list[bytes] = []
+        decoded_lengths: list[int] = []
+        encoded_lengths: list[int] = []
+        errors: list[Dict[str, Any]] = []
+        chunk_sources: list[str] = []
+        rename_counts: list[int] = []
+        cleaned_flags: list[bool] = []
+        chunk_details: list[Dict[str, Any]] = []
+        chunk_suspicious_flags: list[bool] = []
+        chunk_warnings: list[str] = []
+        any_lift_skipped = False
+        any_lift_forced = False
+
+        opcode_table: Dict[int, Any] = {}
+        if handler is not None:
+            try:
+                opcode_table = handler.opcode_table()
+            except Exception:  # pragma: no cover - best effort
+                opcode_table = {}
+        if decoder_opcode_table:
+            merged_table: Dict[int, OpSpec] = {}
+            name_lookup: Dict[str, OpSpec] = {}
+            for key, spec in opcode_table.items():
+                if isinstance(spec, OpSpec):
+                    try:
+                        merged_table[int(key)] = spec
+                    except Exception:
+                        continue
+                    name_lookup[spec.mnemonic.upper()] = spec
+            for raw_opcode, name in decoder_opcode_table.items():
+                try:
+                    if isinstance(raw_opcode, str):
+                        opcode_int = int(raw_opcode, 0)
+                    else:
+                        opcode_int = int(raw_opcode)
+                except (TypeError, ValueError):
+                    continue
+                canonical = str(name).upper()
+                spec = name_lookup.get(canonical)
+                if spec is None:
+                    spec = OpSpec(canonical, ())
+                    name_lookup[canonical] = spec
+                merged_table[opcode_int] = spec
+            if merged_table:
+                opcode_table = merged_table
+        const_decoder = handler.const_decoder() if handler is not None else None
+
+        discovered_chunks = 0
+
+        for index, blob in enumerate(payloads):
+            if not isinstance(blob, str):
+                continue
+            discovered_chunks += 1
+            cleaned = blob.strip()
+            if cleaned.startswith('"') and cleaned.endswith('"'):
+                encoded_lengths.append(max(len(cleaned) - 2, 0))
+            else:
+                encoded_lengths.append(len(cleaned))
+
+            decoded_length = 0
+            cleaned_flag = False
+            rename_count = 0
+            renamed_chunk = ""
+            chunk_source: str | None = None
+
+            try:
+                chunk_bytes = decoder.extract_bytecode(blob)
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append({"chunk_index": index, "error": str(exc)})
+                continue
+
+            decoded_length = len(chunk_bytes)
+            decoded_parts.append(chunk_bytes)
+
+            opcode_probe: Optional[Mapping[int, object]]
+            opcode_probe = opcode_table if opcode_table else None
+            is_vm_like = looks_like_vm_bytecode(chunk_bytes, opcode_probe)
+            suspicious_chunk = not is_vm_like
+            chunk_suspicious_flags.append(suspicious_chunk)
+
+            allow_vm_lift = True
+            vm_lift_attempted = False
+            chunk_detail: Dict[str, Any] = {
+                "index": index,
+                "decoded_bytes": decoded_length,
+            }
+
+            if suspicious_chunk:
+                message = (
+                    f"Chunk {index + 1} does not resemble VM bytecode "
+                    f"({decoded_length} bytes)."
+                )
+                if force:
+                    any_lift_forced = True
+                    chunk_detail["vm_lift_forced"] = True
+                    warning_text = f"{message} Proceeding due to --force."
+                    chunk_warnings.append(warning_text)
+                    self.logger.warning(warning_text)
+                else:
+                    allow_vm_lift = False
+                    any_lift_skipped = True
+                    chunk_detail["vm_lift_skipped"] = True
+                    warning_text = (
+                        f"{message} Skipping VM lifter; rerun with --force to override."
+                    )
+                    chunk_warnings.append(warning_text)
+                    self.logger.warning(warning_text)
+
+            chunk_detail["suspicious"] = suspicious_chunk
+
+            mapping, _, _ = self._decode_payload_mapping(chunk_bytes)
+            if isinstance(mapping, dict):
+                if decoder_opcode_table:
+                    mapping.setdefault("opcode_map", dict(decoder_opcode_table))
+                script_text = mapping.get("script")
+                if isinstance(script_text, str) and script_text.strip():
+                    chunk_source = utils.strip_non_printable(script_text)
+                else:
+                    byte_values = mapping.get("bytecode") or mapping.get("code")
+                    if (
+                        handler is not None
+                        and isinstance(byte_values, list)
+                        and byte_values
+                        and all(
+                            isinstance(value, int) and 0 <= value <= 255
+                            for value in byte_values
+                        )
+                        and allow_vm_lift
+                    ):
+                        consts = list(mapping.get("constants", []))
+                        if const_decoder is not None:
+                            try:
+                                consts = decode_constant_pool(const_decoder, consts)
+                            except Exception:  # pragma: no cover - defensive
+                                consts = list(mapping.get("constants", []))
+                        lifter = VMLifter()
+                        try:
+                            module = lifter.lift(
+                                bytes(byte_values),
+                                opcode_table,
+                                consts,
+                                endianness=(
+                                    mapping.get("endianness")
+                                    or mapping.get("endian")
+                                ),
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            errors.append(
+                                {
+                                    "chunk_index": index,
+                                    "error": str(exc),
+                                }
+                            )
+                        else:
+                            vm_lift_attempted = True
+                            devirt = IRDevirtualizer(module, consts)
+                            chunk_ast, _ = devirt.lower()
+                            chunk_source = lua_ast.to_source(chunk_ast)
+                    elif (
+                        handler is not None
+                        and isinstance(byte_values, list)
+                        and byte_values
+                        and not allow_vm_lift
+                    ):
+                        chunk_detail["vm_lift_skipped"] = True
+
+            if chunk_source:
+                cleaned_source = self.cleanup(chunk_source)
+                cleaned_flag = cleaned_source != chunk_source
+                renamer = VariableRenamer()
+                renamed_chunk = renamer.rename_variables(cleaned_source)
+                stats = getattr(renamer, "last_stats", {})
+                if isinstance(stats, dict):
+                    count_value = stats.get("replacements")
+                    if isinstance(count_value, int):
+                        rename_count = max(count_value, 0)
+            else:
+                try:
+                    decoded_text = chunk_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded_text = ""
+                if decoded_text:
+                    stripped = utils.strip_non_printable(decoded_text)
+                    if stripped and any(
+                        token in stripped for token in ("function", "local ", "return", "init_fn")
+                    ):
+                        chunk_source = stripped
+                        cleaned_source = chunk_source
+                        cleaned_flag = False
+                        renamed_chunk = chunk_source
+
+            chunk_detail["vm_lift_attempted"] = vm_lift_attempted
+            chunk_details.append(chunk_detail)
+
+            decoded_lengths.append(decoded_length)
+            cleaned_flags.append(cleaned_flag)
+            rename_counts.append(rename_count)
+            chunk_sources.append(renamed_chunk)
+
+        meta: Dict[str, Any] = {}
+        if discovered_chunks:
+            meta["chunk_count"] = discovered_chunks
+        if decoded_parts:
+            meta["chunk_success_count"] = len(decoded_parts)
+        if decoded_lengths:
+            meta["chunk_decoded_bytes"] = decoded_lengths
+        if encoded_lengths:
+            meta["chunk_encoded_lengths"] = encoded_lengths
+        if errors:
+            meta["chunk_errors"] = errors
+        if chunk_details:
+            meta["chunk_meta"] = chunk_details
+        if chunk_suspicious_flags:
+            meta["chunk_suspicious_flags"] = chunk_suspicious_flags
+        if chunk_warnings:
+            meta.setdefault("warnings", []).extend(chunk_warnings)
+        if any_lift_skipped:
+            meta["vm_lift_skipped"] = True
+        if any_lift_forced:
+            meta["vm_lift_forced"] = True
+        if decoder_opcode_table:
+            meta.setdefault("opcode_table_entries", len(decoder_opcode_table))
+        meta.setdefault(
+            "opcode_table_source",
+            opcode_table_source,
+        )
+        meta.setdefault("opcode_table_trusted", bool(opcode_table_trusted))
+
+        merged_source = ""
+        combined_script = ""
+        if decoded_parts:
+            combined_bytes = b"".join(decoded_parts)
+            mapping, _, _ = self._decode_payload_mapping(combined_bytes)
+            if isinstance(mapping, dict):
+                script_text = mapping.get("script")
+                if isinstance(script_text, str) and script_text.strip():
+                    combined_script = utils.strip_non_printable(script_text)
+
+        if combined_script:
+            merged_source = combined_script
+        elif any(text.strip() for text in chunk_sources):
+            merged_source = "\n\n".join(
+                text.strip()
+                for text in chunk_sources
+                if text.strip()
+            )
+
+        analysis: Dict[str, Any] = {}
+        if chunk_sources:
+            analysis["sources"] = chunk_sources
+        if merged_source:
+            analysis["final_source"] = merged_source
+        if rename_counts and any(rename_counts):
+            analysis["rename_counts"] = rename_counts
+        if cleaned_flags and any(cleaned_flags):
+            analysis["cleaned_chunks"] = cleaned_flags
+
+        return decoded_parts, meta, analysis
+
     def _vm_ir_from_mapping(self, payload: Optional[Dict[str, Any]]) -> Optional[VMIR]:
         if not payload:
             return None
@@ -600,7 +1102,25 @@ class LuaDeobfuscator:
         if not all(isinstance(instr, list) and instr for instr in bytecode):
             return None
         proto_list = list(prototypes) if isinstance(prototypes, list) else None
-        return VMIR(constants=list(constants), bytecode=[list(instr) for instr in bytecode], prototypes=proto_list)
+        opcode_map = payload.get("opcode_map")
+        prepared_map: Dict[int, Any] | None = None
+        if isinstance(opcode_map, Mapping) and opcode_map:
+            prepared_map = {}
+            for raw_opcode, name in opcode_map.items():
+                try:
+                    if isinstance(raw_opcode, str):
+                        opcode_int = int(raw_opcode, 0)
+                    else:
+                        opcode_int = int(raw_opcode)
+                except (TypeError, ValueError):
+                    continue
+                prepared_map[opcode_int] = name
+        return VMIR(
+            constants=list(constants),
+            bytecode=[list(instr) for instr in bytecode],
+            prototypes=proto_list,
+            opcode_map=prepared_map,
+        )
 
     def _try_parse_vm(self, text: str) -> Optional[VMIR]:
         try:
