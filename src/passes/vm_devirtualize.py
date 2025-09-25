@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from variable_renamer import VariableRenamer
+from .variable_rename import rename_chunk
 
 from .. import utils
 from ..utils_pkg import ast as lua_ast
@@ -962,27 +962,32 @@ def run(ctx: "Context") -> Dict[str, Any]:  # type: ignore[name-defined]
 
     devirt = IRDevirtualizer(module, constants)
     chunk, metadata = devirt.lower()
+    rename_info = rename_chunk(chunk)
+    rename_count = 0
+    rename_mapping: List[Dict[str, object]] | None = None
+    if isinstance(rename_info, dict):
+        count_value = rename_info.get("replacements")
+        if isinstance(count_value, int):
+            rename_count = max(count_value, 0)
+        mapping_value = rename_info.get("mapping")
+        if isinstance(mapping_value, list):
+            rename_mapping = mapping_value
+
     raw_source = lua_ast.to_source(chunk)
     if ctx.artifacts:
         ctx.write_artifact("vm_devirtualize_ast", raw_source)
 
-    renamer = VariableRenamer()
-    renamed = renamer.rename_variables(raw_source)
-    rename_stats = getattr(renamer, "last_stats", {})
-    renamed_count = 0
-    if isinstance(rename_stats, dict):
-        count_value = rename_stats.get("replacements")
-        if isinstance(count_value, int):
-            renamed_count = max(count_value, 0)
     report = getattr(ctx, "report", None)
     if report is not None:
-        report.variables_renamed = renamed_count
+        report.variables_renamed = rename_count
     formatter = utils.LuaFormatter()
-    pretty = formatter.format_source(renamed)
+    pretty = formatter.format_source(raw_source)
 
-    metadata["renamed_identifiers"] = renamed != raw_source
-    metadata["renamed_count"] = renamed_count
-    metadata["formatted"] = pretty != renamed
+    metadata["renamed_identifiers"] = rename_count > 0
+    metadata["renamed_count"] = rename_count
+    if rename_mapping is not None:
+        metadata["rename_mapping"] = rename_mapping
+    metadata["formatted"] = pretty != raw_source
 
     ctx.stage_output = pretty
     if ctx.artifacts:
