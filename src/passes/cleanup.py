@@ -6,7 +6,7 @@ import ast
 import math
 import operator
 import re
-from typing import Callable, Dict, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, List, Tuple, TYPE_CHECKING
 
 from string_decryptor import StringDecryptor
 
@@ -40,6 +40,13 @@ _DOUBLE_LOADSTRING_RE = re.compile(
 _TRAMPOLINE_RE = re.compile(
     r"(?P<full>(?:local\s+)?function\s+(?P<name>[A-Za-z_]\w*)\s*\((?P<params>[^)]*)\)\s*"
     r"return\s+(?P<target>[A-Za-z_]\w*)\s*\((?P<args>[^)]*)\)\s*end)",
+    re.DOTALL,
+)
+
+_ANON_WRAPPER_CALL_RE = re.compile(
+    r"\(\s*function\s*\((?P<params>[^)]*)\)\s*return\s+"
+    r"(?P<target>[A-Za-z_]\w*)\s*\((?P<inner_args>[^)]*)\)\s*end\s*\)\s*"
+    r"\((?P<call_args>[^)]*)\)",
     re.DOTALL,
 )
 
@@ -93,6 +100,13 @@ _SIMPLE_DO_BLOCK_RE = re.compile(
 _ALLOWED_EXPR_CHARS = set("0123456789+-*/%.() \t\r\n")
 
 _CONST_EXPR_RE = re.compile(r"(?P<expr>(?:[-+*/%().0-9]+\s*){2,})")
+
+_STRING_CONCAT_RE = re.compile(
+    r"(?P<left>(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'))"
+    r"\s*\.\.\s*"
+    r"(?P<right>(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'))",
+    re.DOTALL,
+)
 
 Number = float | int
 BinOpEvaluator = Callable[[Number, Number], Number]
@@ -194,6 +208,60 @@ def _fold_constant_expressions(source: str) -> Tuple[str, int]:
     return updated, folded
 
 
+def _decode_lua_literal(literal: str) -> Tuple[str, str] | None:
+    if len(literal) < 2 or literal[0] not in {'"', "'"}:
+        return None
+    quote = literal[0]
+    inner = literal[1:-1]
+    try:
+        value = bytes(inner, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        # Fallback: replace simple escapes only
+        value = (
+            inner.replace(r"\\", "\\")
+            .replace(r"\n", "\n")
+            .replace(r"\r", "\r")
+            .replace(r"\t", "\t")
+        )
+    return value, quote
+
+
+def _encode_lua_literal(value: str, quote: str) -> str:
+    escaped = value.replace("\\", "\\\\")
+    if quote == '"':
+        escaped = escaped.replace('"', '\\"')
+    else:
+        escaped = escaped.replace("'", "\\'")
+    return f"{quote}{escaped}{quote}"
+
+
+def _fold_string_concatenations(source: str) -> Tuple[str, int]:
+    folded = 0
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal folded
+        left_literal = match.group("left")
+        right_literal = match.group("right")
+        left_value = _decode_lua_literal(left_literal)
+        right_value = _decode_lua_literal(right_literal)
+        if left_value is None or right_value is None:
+            return match.group(0)
+        left_text, left_quote = left_value
+        right_text, right_quote = right_value
+        folded += 1
+        quote = left_quote if left_quote == right_quote else '"'
+        combined = left_text + right_text
+        return _encode_lua_literal(combined, quote)
+
+    updated = source
+    while True:
+        rewritten = _STRING_CONCAT_RE.sub(_replace, updated)
+        if rewritten == updated:
+            break
+        updated = rewritten
+    return updated, folded
+
+
 def _simplify_conditionals(source: str) -> Tuple[str, int]:
     removed = 0
 
@@ -268,6 +336,28 @@ def _strip_trampolines(source: str) -> Tuple[str, int]:
     return rewritten, removed
 
 
+def _inline_trivial_wrappers(source: str) -> Tuple[str, int]:
+    replaced = 0
+
+    def _rewrite(match: re.Match[str]) -> str:
+        nonlocal replaced
+        params = [p.strip() for p in match.group("params").split(",") if p.strip()]
+        inner_args = [a.strip() for a in match.group("inner_args").split(",") if a.strip()]
+        call_args = [a.strip() for a in match.group("call_args").split(",") if a.strip()]
+        if params == inner_args == call_args or (
+            params == ["..."] and inner_args == ["..."] and call_args == ["..."]
+        ) or (not params and not inner_args and not call_args):
+            replaced += 1
+            call = match.group("call_args").strip()
+            if call:
+                return f"{match.group('target')}({call})"
+            return f"{match.group('target')}()"
+        return match.group(0)
+
+    rewritten = _ANON_WRAPPER_CALL_RE.sub(_rewrite, source)
+    return rewritten, replaced
+
+
 def _strip_do_return(source: str) -> Tuple[str, int]:
     rewritten, count = _DO_RETURN_RE.subn("return", source)
     return rewritten, count
@@ -302,30 +392,36 @@ def _strip_init_fn_calls(source: str) -> Tuple[str, int]:
     return rewritten, count
 
 
-def _strip_dummy_loops(source: str) -> Tuple[str, int]:
+def _strip_dummy_loops(source: str) -> Tuple[str, int, List[int]]:
     removed = 0
+    lines: List[int] = []
 
     def _rewrite(match: re.Match[str]) -> str:
         nonlocal removed
         removed += 1
+        line = match.string.count("\n", 0, match.start()) + 1
+        lines.append(line)
         return ""
 
-    rewritten = _DUMMY_LOOP_RE.sub(_rewrite, source)
-    rewritten = _IDLE_LOOP_RE.sub(_rewrite, rewritten)
-    rewritten = _REPEAT_FALSE_RE.sub(_rewrite, rewritten)
-    return rewritten, removed
+    rewritten = source
+    for pattern in (_DUMMY_LOOP_RE, _IDLE_LOOP_RE, _REPEAT_FALSE_RE):
+        rewritten = pattern.sub(_rewrite, rewritten)
+    return rewritten, removed, lines
 
 
-def _strip_assert_traps(source: str) -> Tuple[str, int]:
+def _strip_assert_traps(source: str) -> Tuple[str, int, List[int]]:
     removed = 0
+    lines: List[int] = []
 
     def _rewrite(match: re.Match[str]) -> str:
         nonlocal removed
         removed += 1
+        line = match.string.count("\n", 0, match.start()) + 1
+        lines.append(line)
         return ""
 
     rewritten = _ASSERT_FALSE_RE.sub(_rewrite, source)
-    return rewritten, removed
+    return rewritten, removed, lines
 
 
 def _flatten_simple_do_blocks(source: str) -> Tuple[str, int]:
@@ -362,6 +458,9 @@ def run(ctx: "Context") -> Dict[str, object]:
     text, const_expr = _fold_constant_expressions(text)
     metadata["constant_expressions"] = const_expr
 
+    text, concat_folded = _fold_string_concatenations(text)
+    metadata["string_concats"] = concat_folded
+
     text, removed_blocks = _simplify_conditionals(text)
     metadata["dead_code_blocks"] = removed_blocks
 
@@ -374,6 +473,9 @@ def run(ctx: "Context") -> Dict[str, object]:
     text, trampolines_removed = _strip_trampolines(text)
     metadata["vm_trampolines"] = trampolines_removed
 
+    text, wrappers_inlined = _inline_trivial_wrappers(text)
+    metadata["wrappers_inlined"] = wrappers_inlined
+
     text, script_key_removed = _strip_script_key(text)
     metadata["bootstrap_keys"] = script_key_removed
 
@@ -383,11 +485,15 @@ def run(ctx: "Context") -> Dict[str, object]:
     text, init_fn_calls_removed = _strip_init_fn_calls(text)
     metadata["bootstrap_init_call"] = init_fn_calls_removed
 
-    text, assert_traps_removed = _strip_assert_traps(text)
+    text, assert_traps_removed, assert_lines = _strip_assert_traps(text)
     metadata["assert_traps"] = assert_traps_removed
+    if assert_lines:
+        metadata["assert_trap_lines"] = assert_lines
 
-    text, dummy_loops_removed = _strip_dummy_loops(text)
+    text, dummy_loops_removed, dummy_lines = _strip_dummy_loops(text)
     metadata["dummy_loops"] = dummy_loops_removed
+    if dummy_lines:
+        metadata["dummy_loop_lines"] = dummy_lines
 
     text, flattened_blocks = _flatten_simple_do_blocks(text)
     metadata["flattened_blocks"] = flattened_blocks

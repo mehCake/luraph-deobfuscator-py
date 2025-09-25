@@ -529,8 +529,9 @@ def test_payload_decode_with_wrong_key_returns_bootstrap(tmp_path: Path) -> None
 
     metadata = payload_decode_run(ctx)
 
-    assert ctx.stage_output.startswith("-- Example Luraph")
+    assert ctx.stage_output.startswith("--[[ undecoded initv4 chunk")
     assert metadata.get("handler_decoded_json") is not True
+    assert metadata.get("placeholder_output") is True
     assert "script_payload" not in metadata or not metadata["script_payload"]
     payload_meta = metadata.get("handler_payload_meta", {})
     assert payload_meta.get("decode_method") in {"base91", "base64", "base64-relaxed"}

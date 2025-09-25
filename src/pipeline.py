@@ -580,8 +580,14 @@ def _pass_cleanup(ctx: Context) -> None:
         trap_meta = ctx.vm_metadata.setdefault("traps", {})
         if isinstance(assert_traps, int):
             trap_meta["assert_traps"] = max(assert_traps, 0)
+        lines = metadata.get("assert_trap_lines")
+        if isinstance(lines, list) and lines:
+            trap_meta["assert_trap_lines"] = [int(line) for line in lines]
         if isinstance(dummy_loops, int):
             trap_meta["dummy_loops"] = max(dummy_loops, 0)
+        loop_lines = metadata.get("dummy_loop_lines")
+        if isinstance(loop_lines, list) and loop_lines:
+            trap_meta["dummy_loop_lines"] = [int(line) for line in loop_lines]
         trap_meta["total_removed"] = traps
 
         constants = 0

@@ -846,6 +846,19 @@ def run(ctx: "Context") -> Dict[str, Any]:
 
     metadata = _finalise_metadata(aggregated, last_metadata)
 
+    placeholder_source = metadata.get("handler_placeholder_source")
+    if (
+        isinstance(placeholder_source, str)
+        and placeholder_source.strip()
+        and not metadata.get("script_payload")
+    ):
+        final_output = placeholder_source
+        ctx.stage_output = final_output
+        ctx.working_text = final_output
+        metadata["placeholder_output"] = True
+        if not ctx.decoded_payloads or ctx.decoded_payloads[-1] != final_output:
+            ctx.decoded_payloads.append(final_output)
+
     script_key_value: Optional[str] = None
     if isinstance(script_key, str) and script_key.strip():
         script_key_value = script_key.strip()

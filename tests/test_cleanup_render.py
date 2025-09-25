@@ -40,7 +40,7 @@ def test_cleanup_constant_folding_and_strings(tmp_path) -> None:
     snippet = """
 local sum = 2 + 2 * 3
 local other = (10 - 4) / 3
-return "hello" .. " world" -- concatenation left intact for string decryptor
+return "hello" .. " world"
 """.strip()
 
     ctx = _make_context(tmp_path, snippet)
@@ -51,6 +51,9 @@ return "hello" .. " world" -- concatenation left intact for string decryptor
     assert "sum = 8" in ctx.stage_output
     assert "other = 2" in ctx.stage_output or "other = 2.0" in ctx.stage_output
     assert metadata["constant_expressions"] >= 2
+    assert '"hello" .. " world"' not in ctx.stage_output
+    assert '"hello world"' in ctx.stage_output
+    assert metadata["string_concats"] >= 1
 
 
 def test_cleanup_strips_bootstrap_scaffolding(tmp_path) -> None:
@@ -98,6 +101,23 @@ repeat until false
     assert metadata["assert_traps"] >= 1
     assert metadata["dummy_loops"] >= 1
     assert metadata["flattened_blocks"] >= 1
+    assert metadata["assert_trap_lines"]
+    assert metadata["dummy_loop_lines"]
+
+
+def test_cleanup_inlines_trivial_wrappers(tmp_path) -> None:
+    snippet = """
+return (function(...) return real_dispatch(...) end)(...)
+return (function() return finish() end)()
+""".strip()
+
+    ctx = _make_context(tmp_path, snippet)
+    metadata = cleanup_run(ctx)
+
+    assert "function(" not in ctx.stage_output
+    assert "return real_dispatch(...)" in ctx.stage_output
+    assert "return finish()" in ctx.stage_output
+    assert metadata["wrappers_inlined"] >= 1
 
 
 def test_render_writes_output_file(tmp_path) -> None:

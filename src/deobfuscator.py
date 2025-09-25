@@ -273,14 +273,35 @@ class LuaDeobfuscator:
                                     if cleaned_flags and "handler_chunk_cleaned" not in metadata:
                                         metadata["handler_chunk_cleaned"] = list(cleaned_flags)
                                     combined_source = chunk_analysis.get("final_source")
+                                    placeholder_only = bool(
+                                        chunk_analysis.get("placeholders_only")
+                                    )
                                     if combined_source:
                                         metadata.setdefault(
                                             "handler_chunk_combined_source",
                                             combined_source,
                                         )
-                                        if payload_dict is None or (
-                                            isinstance(sources, list)
-                                            and len([src for src in sources if src.strip()]) > 1
+                                        if placeholder_only:
+                                            metadata.setdefault(
+                                                "handler_placeholder_source",
+                                                combined_source,
+                                            )
+                                        if (
+                                            not placeholder_only
+                                            and (
+                                                payload_dict is None
+                                                or (
+                                                    isinstance(sources, list)
+                                                    and len(
+                                                        [
+                                                            src
+                                                            for src in sources
+                                                            if src.strip()
+                                                        ]
+                                                    )
+                                                    > 1
+                                                )
+                                            )
                                         ):
                                             payload_dict = {"script": combined_source}
                                             metadata["script_payload"] = True
@@ -1029,7 +1050,15 @@ class LuaDeobfuscator:
             decoded_lengths.append(decoded_length)
             cleaned_flags.append(cleaned_flag)
             rename_counts.append(rename_count)
-            chunk_sources.append(renamed_chunk)
+            emitted = renamed_chunk or chunk_source or ""
+            if not emitted.strip():
+                placeholder = (
+                    f"--[[ undecoded initv4 chunk {index + 1} ({decoded_length} bytes) ]]"
+                )
+                chunk_detail["placeholder"] = placeholder
+                chunk_sources.append(placeholder)
+            else:
+                chunk_sources.append(emitted)
 
         meta: Dict[str, Any] = {}
         if discovered_chunks:
@@ -1061,6 +1090,7 @@ class LuaDeobfuscator:
         meta.setdefault("opcode_table_trusted", bool(opcode_table_trusted))
 
         merged_source = ""
+        placeholder_only = False
         combined_script = ""
         if decoded_parts:
             combined_bytes = b"".join(decoded_parts)
@@ -1072,18 +1102,27 @@ class LuaDeobfuscator:
 
         if combined_script:
             merged_source = combined_script
-        elif any(text.strip() for text in chunk_sources):
-            merged_source = "\n\n".join(
+        else:
+            actual_sources = [
                 text.strip()
-                for text in chunk_sources
-                if text.strip()
-            )
+                for text, detail in zip(chunk_sources, chunk_details)
+                if text.strip() and not detail.get("placeholder")
+            ]
+            if actual_sources:
+                merged_source = "\n\n".join(actual_sources)
+            else:
+                placeholder_texts = [text.strip() for text in chunk_sources if text.strip()]
+                if placeholder_texts:
+                    placeholder_only = True
+                    merged_source = "\n\n".join(placeholder_texts)
 
         analysis: Dict[str, Any] = {}
         if chunk_sources:
             analysis["sources"] = chunk_sources
         if merged_source:
             analysis["final_source"] = merged_source
+        if placeholder_only:
+            analysis["placeholders_only"] = True
         if rename_counts and any(rename_counts):
             analysis["rename_counts"] = rename_counts
         if cleaned_flags and any(cleaned_flags):
