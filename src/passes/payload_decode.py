@@ -9,11 +9,16 @@ import logging
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 from .. import utils
 from ..deobfuscator import VMIR
 from ..versions import PayloadInfo, VersionHandler, get_handler
+from ..versions.luraph_v14_4_1 import looks_like_vm_bytecode
+from ..versions.luraph_v14_4_initv4 import (
+    DEFAULT_ALPHABET as INITV4_DEFAULT_ALPHABET,
+    decode_blob as initv4_decode_blob,
+)
 
 from string_decryptor import StringDecryptor
 import string_decryptor as string_decryptor_mod
@@ -227,6 +232,43 @@ def _mask_script_key(script_key: Optional[str]) -> Optional[str]:
     return prefix + ("*" * masked_len)
 
 
+def _bootstrap_decoder_needs_emulation(
+    metadata: Optional[Mapping[str, Any]]
+) -> Tuple[bool, List[str]]:
+    if not isinstance(metadata, Mapping):
+        return False, []
+
+    needs_emulation = bool(metadata.get("needs_emulation"))
+    paths: List[str] = []
+    seen: Set[str] = set()
+
+    def _collect(container: Mapping[str, Any]) -> None:
+        blobs = container.get("blobs")
+        if not isinstance(blobs, list):
+            return
+        for entry in blobs:
+            if not isinstance(entry, Mapping):
+                continue
+            path = (
+                entry.get("decoded_path")
+                or entry.get("bin_path")
+                or entry.get("artifact")
+                or entry.get("path")
+            )
+            if isinstance(path, str) and path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+
+    _collect(metadata)
+
+    decoder_info = metadata.get("decoder")
+    if isinstance(decoder_info, Mapping):
+        needs_emulation = needs_emulation or bool(decoder_info.get("needs_emulation"))
+        _collect(decoder_info)
+
+    return needs_emulation, paths
+
+
 def _iterative_initv4_decode(
     ctx: "Context",
     source: str,
@@ -289,6 +331,7 @@ def _iterative_initv4_decode(
     warnings: List[str] = []
     decoded_chunks: List[Dict[str, Any]] = []
     current_text = source
+    key_bytes = script_key.encode("utf-8")
 
     for _iteration in range(max(1, max_iterations)):
         try:
@@ -311,7 +354,8 @@ def _iterative_initv4_decode(
             decoded_bytes = b""
 
             try:
-                decoded_bytes = decoder.extract_bytecode(blob)
+                alphabet = decoder.alphabet or INITV4_DEFAULT_ALPHABET
+                decoded_bytes = initv4_decode_blob(stripped, alphabet, key_bytes)
             except Exception as exc:
                 if not force:
                     warnings.append(str(exc))
@@ -328,6 +372,25 @@ def _iterative_initv4_decode(
                     )
                     continue
 
+            opcode_map: Mapping[int, str] = getattr(decoder, "opcode_map", {})
+            suspicious = not looks_like_vm_bytecode(decoded_bytes, opcode_map=opcode_map)
+            blob_paths: List[str] = []
+            if suspicious:
+                needs_emulation, blob_paths = _bootstrap_decoder_needs_emulation(
+                    getattr(ctx, "bootstrapper_metadata", None)
+                )
+                warning = "Decoded initv4 chunk does not resemble VM bytecode."
+                if needs_emulation and blob_paths:
+                    aggregate_meta.setdefault("bootstrapper_decoded_blobs", [])
+                    for path in blob_paths:
+                        if isinstance(path, str) and path:
+                            aggregate_meta["bootstrapper_decoded_blobs"].append(path)
+                    warning += " Bootstrapper decoder requires emulation; inspect: " + ", ".join(blob_paths)
+                if not force:
+                    warnings.append(warning)
+                    continue
+                warnings.append(f"{warning} (ignored due to --force)")
+
             aggregate_meta["chunk_count"] += 1
             aggregate_meta["chunk_decoded_bytes"].append(len(decoded_bytes))
             aggregate_meta["chunk_encoded_lengths"].append(encoded_length)
@@ -340,6 +403,14 @@ def _iterative_initv4_decode(
                 "decoded_byte_count": len(decoded_bytes),
                 "used_key_masked": masked_key,
             }
+            alphabet_source = "bootstrapper" if decoder.alphabet else "default"
+            chunk_record["alphabet_source"] = alphabet_source
+            aggregate_meta.setdefault("chunk_alphabet_sources", []).append(alphabet_source)
+            chunk_record["suspicious"] = suspicious
+            aggregate_meta.setdefault("chunk_suspicious_flags", []).append(suspicious)
+            if blob_paths:
+                chunk_record["bootstrapper_decoded_blobs"] = list(blob_paths)
+
             decoded_chunks.append(chunk_record)
             aggregate_meta["chunk_details"].append(dict(chunk_record))
 
@@ -543,6 +614,14 @@ def _merge_chunk_meta(metadata: Dict[str, Any], chunk_meta: Dict[str, Any]) -> N
         if isinstance(flags, list):
             metadata["handler_chunk_suspicious"] = [bool(flag) for flag in flags]
 
+    blobs = chunk_meta.get("bootstrapper_decoded_blobs")
+    if isinstance(blobs, list):
+        existing = metadata.setdefault("bootstrapper_decoded_blobs", [])
+        if isinstance(existing, list):
+            for path in blobs:
+                if isinstance(path, str) and path:
+                    existing.append(path)
+
     if chunk_meta.get("vm_lift_skipped"):
         metadata["handler_vm_lift_skipped"] = True
     if chunk_meta.get("vm_lift_forced"):
@@ -669,6 +748,12 @@ def _merge_payload_meta(target: Dict[str, Any], meta: Any) -> None:
                     existing.append(item)
                 elif isinstance(item, int):
                     existing.append(bool(item))
+            continue
+        if key == "bootstrapper_decoded_blobs" and isinstance(value, list):
+            existing = target.setdefault(key, [])
+            for item in value:
+                if isinstance(item, str) and item:
+                    existing.append(item)
             continue
         if key == "warnings" and isinstance(value, list):
             existing = target.setdefault(key, [])
@@ -1054,6 +1139,23 @@ def run(ctx: "Context") -> Dict[str, Any]:
         extraction_meta = payload_meta.get("bootstrapper_metadata")
         if isinstance(extraction_meta, dict) and extraction_meta:
             ctx.result.setdefault("bootstrapper_metadata", dict(extraction_meta))
+    ctx_bootstrap_meta = getattr(ctx, "bootstrapper_metadata", None)
+    if isinstance(ctx_bootstrap_meta, dict) and ctx_bootstrap_meta:
+        ctx.result.setdefault("bootstrapper_metadata", {})
+        try:
+            merged = dict(ctx.result["bootstrapper_metadata"])
+        except Exception:
+            merged = {}
+        merged.update(ctx_bootstrap_meta)
+        raw_existing = merged.get("raw_matches")
+        ctx_raw = ctx_bootstrap_meta.get("raw_matches")
+        if isinstance(ctx_raw, dict):
+            base_raw: Dict[str, Any] = {}
+            if isinstance(raw_existing, dict):
+                base_raw.update(raw_existing)
+            base_raw.update(ctx_raw)
+            merged["raw_matches"] = base_raw
+        ctx.result["bootstrapper_metadata"] = merged
 
     placeholder_source = metadata.get("handler_placeholder_source")
     if (

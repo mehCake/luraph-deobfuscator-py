@@ -108,31 +108,41 @@ class BootstrapDecoder:
         original script context.
         """
 
+
         patterns: List[Tuple[re.Pattern[str], str]] = [
             (
                 re.compile(
-                    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<quote>["'])"
-                    r"(?P<payload>s8W-[^"']{50,}|[! -~]{200,})(?P=quote)",
+                    r"""(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<quote>[\"'])"""
+                    r"""(?P<payload>s8W-[^\"']{50,}|[! -~]{200,})(?P=quote)""",
                     re.DOTALL,
                 ),
                 "quoted",
             ),
             (
                 re.compile(
-                    r"(?P<quote>["'])(?P<payload>[! -~]{240,})(?P=quote)", re.DOTALL
+                    r"""(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<quote>[\"'])"""
+                    r"""(?P<payload>[! -~]{80,})(?P=quote)""",
+                    re.DOTALL,
                 ),
                 "quoted",
             ),
             (
                 re.compile(
-                    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{(?P<payload>[0-9,\s]+)\}",
+                    r"""(?P<quote>[\"'])(?P<payload>[! -~]{240,})(?P=quote)""",
+                    re.DOTALL,
+                ),
+                "quoted",
+            ),
+            (
+                re.compile(
+                    r"""(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{(?P<payload>[0-9,\s]+)\}""",
                     re.DOTALL,
                 ),
                 "table",
             ),
             (
                 re.compile(
-                    r"superflow_bytecode_ext\w*\s*=\s*(?P<quote>["'])(?P<payload>.+?)(?P=quote)",
+                    r"""superflow_bytecode_ext\w*\s*=\s*(?P<quote>[\"'])(?P<payload>.+?)(?P=quote)""",
                     re.DOTALL,
                 ),
                 "quoted",
@@ -182,19 +192,19 @@ class BootstrapDecoder:
         i = 0
         while i < len(lit):
             ch = lit[i]
-            if ch != "\":
+            if ch != "\\":
                 buf.append(ord(ch))
                 i += 1
                 continue
 
             i += 1
             if i >= len(lit):
-                buf.append(ord("\"))
+                buf.append(ord("\\"))
                 break
 
             esc = lit[i]
             i += 1
-            if esc in "\"'\":
+            if esc in {"\\", '"', "'"}:
                 buf.append(ord(esc))
             elif esc in "abfnrtv":
                 mapping = {
@@ -209,11 +219,11 @@ class BootstrapDecoder:
                 buf.append(mapping[esc])
             elif esc == "x" and i + 1 <= len(lit):
                 hex_digits = lit[i : i + 2]
-                if re.fullmatch(r"[0-9A-Fa-f]{2}", hex_digits or ""):
+                if re.fullmatch(r'[0-9A-Fa-f]{2}', hex_digits or ''):
                     buf.append(int(hex_digits, 16))
                     i += 2
                 else:
-                    LOG.warning("[BOOTSTRAP] Invalid hex escape \x%s", hex_digits)
+                    LOG.warning('[BOOTSTRAP] Invalid hex escape \\x%s', hex_digits)
             elif esc.isdigit():
                 digits = esc
                 while i < len(lit) and len(digits) < 3 and lit[i].isdigit():
@@ -395,7 +405,7 @@ class BootstrapDecoder:
             metadata["constants"][key] = int(value, 0)
 
         nested_candidates = []
-        for match in re.finditer(r'(?P<quote>["'])[! -~]{120,}(?P=quote)', text):
+        for match in re.finditer(r"(?P<quote>['\"])[! -~]{120,}(?P=quote)", text):
             nested_candidates.append(
                 {
                     "start": match.start(),
@@ -465,7 +475,7 @@ class BootstrapDecoder:
                 bytes_list = [int(v.strip(), 0) for v in literal.split("{")[1].split("}")[0].split(",") if v.strip()]
                 blob_bytes = bytes([b & 0xFF for b in bytes_list])
             else:
-                payload_match = re.search(r'(["']).*(?P<payload>.+)(?:\1)', literal, re.DOTALL)
+                payload_match = re.search(r"(['\"]).*(?P<payload>.+)(?:\\1)", literal, re.DOTALL)
                 payload = payload_match.group("payload") if payload_match else literal
                 blob_bytes = self.unescape_lua_string(payload)
 
@@ -484,16 +494,6 @@ class BootstrapDecoder:
             if error:
                 errors.append(error)
 
-            decoded_blobs[f"blob_{idx}"] = decoded
-            aggregate_metadata["blobs"].append(
-                {
-                    "name": blob.name,
-                    "kind": blob.kind,
-                    "size": len(blob_bytes),
-                    "decoded_size": len(decoded),
-                }
-            )
-
             meta = self.extract_metadata_from_decoded(decoded)
             if meta.get("alphabet") and not aggregate_metadata.get("alphabet"):
                 aggregate_metadata["alphabet"] = meta["alphabet"]
@@ -501,6 +501,24 @@ class BootstrapDecoder:
             aggregate_metadata["constants"].update(meta.get("constants", {}))
 
             self._persist_artifacts(blob, decoded, meta)
+
+            sanitized_name = re.sub(
+                r"[^A-Za-z0-9_.-]", "_", (blob.name or f"offset_{blob.start}")
+            )[:60]
+            blob_entry = {
+                "name": blob.name,
+                "kind": blob.kind,
+                "size": len(blob_bytes),
+                "decoded_size": len(decoded),
+                "decoded_path": os.path.join(
+                    "logs", f"bootstrap_decoded_{sanitized_name}.bin"
+                ),
+                "metadata_path": os.path.join(
+                    "logs", f"bootstrapper_metadata_{sanitized_name}.json"
+                ),
+            }
+            aggregate_metadata["blobs"].append(blob_entry)
+            decoded_blobs[f"blob_{idx}"] = decoded
 
         success = bool(decoded_blobs)
         result = BootstrapperExtractionResult(

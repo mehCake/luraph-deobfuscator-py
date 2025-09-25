@@ -402,8 +402,8 @@ def test_debug_bootstrap_logging(tmp_path):
     bootstrap_meta = data.get("bootstrapper_metadata") or {}
     raw_matches = bootstrap_meta.get("raw_matches") or {}
     assert raw_matches, "expected raw bootstrapper matches in metadata"
-    bootstrap_raw = raw_matches.get("bootstrap_extractor") or {}
-    assert bootstrap_raw.get("opcodes") or bootstrap_raw.get("alphabets")
+    bootstrap_raw = raw_matches.get("bootstrap_decoder") or {}
+    assert bootstrap_raw.get("blobs") or bootstrap_raw.get("decoder_functions")
 
     log_path = tmp_path / "logs" / "bootstrap_extract.log"
     assert log_path.exists()

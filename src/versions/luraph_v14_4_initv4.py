@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from .initv4 import (
     InitV4Bootstrap,
     _BASE_OPCODE_NAMES,
@@ -15,7 +15,7 @@ from .initv4 import (
     _S8W_PAYLOAD_RE,
     _is_probably_alphabet,
 )
-from ..bootstrap_extractor import BootstrapExtractor
+from ..bootstrap_decoder import BootstrapDecoder, BootstrapperExtractionResult
 
 LOG = logging.getLogger(__name__)
 
@@ -109,6 +109,13 @@ class InitV4Decoder:
         self.constants: Dict[str, int] = {}
         self.bootstrap_metadata: Dict[str, object] = {}
         self._raw_matches: Dict[str, object] | None = None
+        self._bootstrap_decoder_result: Optional[BootstrapperExtractionResult] = None
+        self._bootstrap_decoder_metadata: Dict[str, Any] = {}
+        self._bootstrap_decoder_errors: List[str] = []
+        self._bootstrap_decoder_blobs: List[Dict[str, Any]] = []
+        self._bootstrap_decoder_success = False
+        self._bootstrap_needs_emulation = False
+        self._bootstrap_warnings: List[str] = []
         self._debug_bootstrap = bool(getattr(ctx, "debug_bootstrap", False))
         raw_log = getattr(ctx, "bootstrap_debug_log", None)
         try:
@@ -118,25 +125,146 @@ class InitV4Decoder:
         self._has_custom_opcodes = False
         self._bootstrap = bootstrap
         self._bootstrap_path: Optional[Path] = None
+        self._bootstrap_source: Optional[str] = None
+        self._script_key_bytes: bytes = (
+            self.script_key.encode("utf-8") if isinstance(self.script_key, str) else b""
+        )
         self._default_opcodes: Dict[int, str] = dict(
             default_opcodes or self._DEFAULT_OPCODE_TABLE
         )
 
-        if self._bootstrap is None:
-            candidate = getattr(ctx, "bootstrapper_path", None)
-            if candidate:
+        candidate = getattr(ctx, "bootstrapper_path", None)
+        path_for_decoder: Optional[str] = None
+        if self._bootstrap is None and candidate:
+            try:
                 self._bootstrap = InitV4Bootstrap.load(candidate)
-        if self._bootstrap is not None:
+            except Exception as exc:
+                _bootstrap_log(logging.WARNING, "Failed to load bootstrapper: %s", exc)
+                self._bootstrap_warnings.append("bootstrap_load_failed")
+            else:
+                self._bootstrap_path = self._bootstrap.path
+                path_for_decoder = str(self._bootstrap.path)
+                self._bootstrap_source = path_for_decoder
+        elif self._bootstrap is not None:
             self._bootstrap_path = self._bootstrap.path
+            path_for_decoder = str(self._bootstrap.path)
+            self._bootstrap_source = path_for_decoder
+
+        if path_for_decoder is None and isinstance(candidate, (str, Path)):
+            path_for_decoder = str(candidate)
+            self._bootstrap_source = path_for_decoder
+
+        if path_for_decoder and self._script_key_bytes:
+            self._run_bootstrap_decoder(path_for_decoder)
+        elif path_for_decoder and not self._script_key_bytes:
+            _bootstrap_log(
+                logging.WARNING,
+                "Script key missing; bootstrap decoder cannot run.",
+            )
+            self._bootstrap_warnings.append("script_key_missing")
+
+        if self._bootstrap is not None:
             text = self._bootstrap.text or ""
-            if text:
-                self._apply_bootstrap_extractor(text)
+            if text and not self.alphabet:
+                match = re.search(r'alphabet\s*=\s*"([^"]+)"', text)
+                if match and _is_probably_alphabet(match.group(1)):
+                    self.alphabet = match.group(1)
             self._prepare_from_bootstrap(self._bootstrap)
-            self._finalise_bootstrap_metadata()
-        else:
-            self._finalise_bootstrap_metadata()
+
+        self._finalise_bootstrap_metadata()
 
     # ------------------------------------------------------------------
+    def _run_bootstrap_decoder(self, bootstrap_path: str) -> None:
+        decoder: BootstrapDecoder
+        try:
+            decoder = BootstrapDecoder(self.ctx)
+        except Exception:  # pragma: no cover - defensive
+            decoder = BootstrapDecoder()
+
+        try:
+            result = decoder.run_extraction(bootstrap_path, self._script_key_bytes)
+        except Exception as exc:  # pragma: no cover - defensive
+            _bootstrap_log(logging.ERROR, "Bootstrap decoder crashed: %s", exc)
+            self._bootstrap_warnings.append("decoder_exception")
+            return
+
+        self._bootstrap_decoder_result = result
+        self._bootstrap_decoder_success = bool(result.success)
+        self._bootstrap_needs_emulation = bool(result.needs_emulation)
+        self._bootstrap_decoder_errors = list(result.errors)
+
+        if result.raw_matches:
+            self._raw_matches = {"bootstrap_decoder": result.raw_matches}
+
+        metadata = result.bootstrapper_metadata or {}
+        if isinstance(metadata, dict):
+            self._bootstrap_decoder_metadata = dict(metadata)
+            blobs = metadata.get("blobs")
+            if isinstance(blobs, list):
+                self._bootstrap_decoder_blobs = [
+                    dict(entry) for entry in blobs if isinstance(entry, dict)
+                ]
+            self._ingest_bootstrap_metadata(metadata)
+            if result.raw_matches and self._debug_bootstrap:
+                raw_section = metadata.setdefault("raw_matches", {})
+                if isinstance(raw_section, Mapping):
+                    raw_section = dict(raw_section)
+                else:
+                    raw_section = {}
+                raw_section.setdefault("bootstrap_decoder", result.raw_matches)
+                metadata["raw_matches"] = raw_section
+
+        if not result.success:
+            if not self.alphabet:
+                self.alphabet = DEFAULT_ALPHABET
+            warning = "bootstrap_decoder_incomplete"
+            self._bootstrap_warnings.append(warning)
+            if result.errors:
+                _bootstrap_log(
+                    logging.WARNING,
+                    "Bootstrap decoder failed: %s",
+                    "; ".join(str(err) for err in result.errors if err),
+                )
+        else:
+            decoded_count = len(result.decoded_blobs)
+            _bootstrap_log(
+                logging.INFO,
+                "Bootstrap decoder recovered %d blob(s).",
+                decoded_count,
+            )
+
+    # ------------------------------------------------------------------
+    def _ingest_bootstrap_metadata(self, metadata: Mapping[str, Any]) -> None:
+        alphabet = metadata.get("alphabet")
+        if isinstance(alphabet, str) and alphabet.strip():
+            self.alphabet = alphabet
+
+        opcode_map = metadata.get("opcode_map")
+        if isinstance(opcode_map, Mapping):
+            normalised: Dict[int, str] = {}
+            for key, name in opcode_map.items():
+                try:
+                    opcode = int(key)
+                except (TypeError, ValueError):
+                    continue
+                cleaned = str(name).strip().upper()
+                if cleaned:
+                    normalised[opcode] = cleaned
+            if normalised:
+                if not self.opcode_map:
+                    self.opcode_map = {}
+                self.opcode_map.update(normalised)
+                self._has_custom_opcodes = True
+
+        constants = metadata.get("constants")
+        if isinstance(constants, Mapping):
+            for key, value in constants.items():
+                try:
+                    numeric = int(value)
+                except (TypeError, ValueError):
+                    continue
+                self.constants[str(key)] = numeric
+
     def _prepare_from_bootstrap(self, bootstrap: InitV4Bootstrap) -> None:
         opcode_map: Dict[int, str] = dict(self.opcode_map)
 
@@ -177,47 +305,14 @@ class InitV4Decoder:
             self.opcode_map = dict(sorted(opcode_map.items()))
 
     # ------------------------------------------------------------------
-    def _apply_bootstrap_extractor(self, text: str) -> None:
-        try:
-            extractor = BootstrapExtractor(self.ctx)
-        except Exception:  # pragma: no cover - defensive
-            extractor = BootstrapExtractor()
-
-        extracted = extractor.extract(text)
-
-        alphabet = extracted.get("alphabet")
-        if isinstance(alphabet, str) and alphabet:
-            self.alphabet = alphabet
-
-        opcode_map = extracted.get("opcode_map") or {}
-        if isinstance(opcode_map, dict) and opcode_map:
-            normalised: Dict[int, str] = {}
-            for code, name in opcode_map.items():
-                try:
-                    numeric = int(code)
-                except (TypeError, ValueError):  # pragma: no cover - defensive
-                    continue
-                normalised[numeric] = str(name)
-            if normalised:
-                self.opcode_map = dict(sorted(normalised.items()))
-                self._has_custom_opcodes = True
-
-        constants = extracted.get("constants") or {}
-        if isinstance(constants, dict) and constants:
-            self.constants.update({str(key): int(value) for key, value in constants.items()})
-
-        raw_matches = extracted.get("raw_matches")
-        if isinstance(raw_matches, dict) and raw_matches:
-            self._raw_matches = raw_matches
-
     # ------------------------------------------------------------------
     def _finalise_bootstrap_metadata(self) -> None:
         alphabet = self.alphabet
         opcode_map = dict(self.opcode_map)
         constants = dict(self.constants)
 
-        warnings: List[str] = []
-        has_bootstrap = self._bootstrap_path is not None
+        warnings: List[str] = list(self._bootstrap_warnings)
+        has_bootstrap = bool(self._bootstrap_path) or bool(self._bootstrap_decoder_result)
         if not alphabet and has_bootstrap:
             warnings.append("alphabet_not_found")
         if opcode_map and len(opcode_map) < 16:
@@ -277,13 +372,25 @@ class InitV4Decoder:
         elif has_bootstrap:
             _bootstrap_log(logging.INFO, "No bootstrapper constants discovered.")
 
-        raw_matches = self._raw_matches if self._debug_bootstrap else None
+        raw_matches: Optional[Dict[str, Any]] = None
+        if self._debug_bootstrap:
+            if self._raw_matches:
+                raw_matches = dict(self._raw_matches)
         if raw_matches:
             try:
                 pretty = json.dumps(raw_matches, indent=2, sort_keys=True)
             except TypeError:  # pragma: no cover - safety
                 pretty = repr(raw_matches)
             LOG.debug("[BOOTSTRAP] Raw matches:%s%s", "\n", pretty)
+
+        decoder_summary: Dict[str, Any] = {
+            "success": self._bootstrap_decoder_success,
+            "needs_emulation": self._bootstrap_needs_emulation,
+        }
+        if self._bootstrap_decoder_errors:
+            decoder_summary["errors"] = list(self._bootstrap_decoder_errors)
+        if self._bootstrap_decoder_blobs:
+            decoder_summary["blobs"] = [dict(entry) for entry in self._bootstrap_decoder_blobs]
 
         dispatch_map = {f"0x{opcode:02X}": name for opcode, name in sorted(opcode_map.items())}
         metadata: Dict[str, object] = {
@@ -298,13 +405,31 @@ class InitV4Decoder:
                 "mapping": dispatch_map,
             },
             "constants": constants,
+            "decoder": decoder_summary,
+            "needs_emulation": self._bootstrap_needs_emulation,
         }
         if self._bootstrap_path is not None:
             metadata["path"] = str(self._bootstrap_path)
+        elif self._bootstrap_source:
+            metadata["source"] = self._bootstrap_source
         if warnings:
             metadata["warnings"] = warnings
+        if self._bootstrap_decoder_blobs:
+            metadata["blobs"] = [dict(entry) for entry in self._bootstrap_decoder_blobs]
+        if self._bootstrap_decoder_metadata and self._debug_bootstrap:
+            metadata.setdefault("decoder", {}).setdefault(
+                "metadata", dict(self._bootstrap_decoder_metadata)
+            )
+        merged_raw_matches: Optional[Dict[str, Any]] = None
+        existing_raw = metadata.get("raw_matches")
+        if isinstance(existing_raw, Mapping):
+            merged_raw_matches = dict(existing_raw)
         if raw_matches:
-            metadata["raw_matches"] = raw_matches
+            if merged_raw_matches is None:
+                merged_raw_matches = {}
+            merged_raw_matches.update(raw_matches)
+        if merged_raw_matches:
+            metadata["raw_matches"] = merged_raw_matches
 
         preview = [
             {"opcode": f"0x{opcode:02X}", "mnemonic": name}
@@ -318,9 +443,10 @@ class InitV4Decoder:
                 "length": len(alphabet) if alphabet else 0,
                 "sample": alphabet[:64] if alphabet else "",
             },
+            "decoder": decoder_summary,
         }
-        if raw_matches:
-            dump_payload["raw_matches"] = raw_matches
+        if merged_raw_matches:
+            dump_payload["raw_matches"] = merged_raw_matches
 
         if raw_matches and self._bootstrap_debug_log is not None and self._debug_bootstrap:
             try:
