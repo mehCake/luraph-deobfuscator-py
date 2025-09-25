@@ -555,6 +555,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Enable verbose bootstrapper extraction logs",
     )
+    parser.add_argument(
+        "--allow-lua-run",
+        action="store_true",
+        help="Allow sandboxed Lua fallback during bootstrap decoding (see security notes)",
+    )
     parser.add_argument("--vm-trace", action="store_true", help="capture VM trace logs during execution")
     parser.add_argument("--trace", dest="vm_trace", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--detect-only", action="store_true", help="only detect version information")
@@ -701,6 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             script_key=args.script_key,
             bootstrapper=bootstrapper_path,
             debug_bootstrap=args.debug_bootstrap,
+            allow_lua_run=args.allow_lua_run,
         )
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
@@ -735,6 +741,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     yes=args.yes,
                     force=args.force,
                     debug_bootstrap=args.debug_bootstrap,
+                    allow_lua_run=args.allow_lua_run,
                 )
                 ctx.options.update(
                     {
@@ -746,6 +753,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "force": args.force,
                         "script_key": args.script_key,
                         "debug_bootstrap": args.debug_bootstrap,
+                        "allow_lua_run": args.allow_lua_run,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()

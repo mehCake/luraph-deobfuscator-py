@@ -151,6 +151,7 @@ class BootstrapDecoder:
         self._trace_lock = threading.Lock()
         self._primary_blob_written = False
         self._primary_blob_path: Optional[str] = None
+        self._warned_about_lua = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -509,14 +510,21 @@ class BootstrapDecoder:
                 notes=["lua-fallback-unavailable"],
             )
 
-        allow_lua = bool(getattr(self.ctx, "allow_lua_fallback", False))
+        allow_flag = bool(getattr(self.ctx, "allow_lua_run", False))
+        legacy_flag = bool(getattr(self.ctx, "allow_lua_fallback", False))
+        force_flag = bool(getattr(self.ctx, "force", False))
+        debug_flag = bool(getattr(self.ctx, "debug_bootstrap", False))
+        allow_lua = allow_flag or legacy_flag or (force_flag and debug_flag)
         if not allow_lua:
             return DecodingResult(
                 success=False,
                 decoded=None,
                 needs_emulation=True,
-                error="Lua fallback disabled (set allow_lua_fallback/--force to enable)",
-                notes=["lua-fallback-disabled"],
+                error="Lua fallback disabled (use --allow-lua-run or --force with --debug-bootstrap)",
+                notes=[
+                    "lua-fallback-disabled",
+                    "set --allow-lua-run or (--force and --debug-bootstrap) to permit sandbox",
+                ],
             )
 
         if not self._decoder_candidates:
@@ -528,23 +536,40 @@ class BootstrapDecoder:
                 notes=["lua-fallback-no-candidate"],
             )
 
-        runtime = LuaRuntime(unpack_returned_tuples=True)
-        lua_globals = runtime.globals()
+        if not self._warned_about_lua:
+            LOG.warning(
+                "[BOOTSTRAP] SECURITY WARNING: running bootstrapper decode logic inside a sandboxed Lua runtime."
+            )
+            LOG.warning(
+                "[BOOTSTRAP] Only proceed if you trust the bootstrapper. Provide --allow-lua-run or --force with --debug-bootstrap to acknowledge."
+            )
+            self._warned_about_lua = True
 
-        # Disable dangerous modules/APIs
-        def _blocked(*_args, **_kwargs):
-            raise LuaError("blocked")
-
-        for key in ["os", "io", "package", "debug", "ffi", "require", "dofile", "loadfile", "load"]:
-            lua_globals[key] = _blocked
-        lua_globals["print"] = lambda *_args, **_kwargs: None
+        runtime = LuaRuntime(unpack_returned_tuples=True, register_eval=False)
+        base_env = self._build_sandbox_env(runtime)
+        loader = runtime.eval(
+            "return function(src, env)\n"
+            "  local chunk, err = load(src, 'bootstrap', 't', env)\n"
+            "  if not chunk then return nil, err end\n"
+            "  local ok, res = pcall(chunk)\n"
+            "  if not ok then return nil, res end\n"
+            "  return env\n"
+            "end"
+        )
 
         notes: List[str] = []
         for candidate in self._decoder_candidates:
             try:
-                runtime.execute(candidate.source)
-                decode_func = lua_globals.get(candidate.name) if candidate.name else None
+                env = runtime.table_from(base_env)
+                env["_G"] = env
+                compiled_env, err = loader(candidate.source, env)
+                if not compiled_env:
+                    reason = f"lua-fallback-load-error {candidate.name}: {err}"
+                    notes.append(reason)
+                    continue
+                decode_func = compiled_env.get(candidate.name) if candidate.name else None
                 if decode_func is None:
+                    notes.append(f"lua-fallback-missing-func {candidate.name}")
                     continue
                 self._trace(f"Executing Lua decoder candidate {candidate.name!r}")
                 start_time = time.time()
@@ -552,7 +577,10 @@ class BootstrapDecoder:
 
                 def _invoke():
                     try:
-                        result_holder["value"] = decode_func(blob_bytes.decode("latin-1"), self.script_key)
+                        key_arg = self.script_key or ""
+                        result_holder["value"] = decode_func(
+                            blob_bytes.decode("latin-1"), key_arg
+                        )
                     except LuaError as exc:  # pragma: no cover - depends on runtime behaviour
                         result_holder["error"] = exc
 
@@ -590,6 +618,73 @@ class BootstrapDecoder:
             error="Lua fallback could not decode blob",
             notes=notes or ["lua-fallback-no-success"],
         )
+
+    def _build_sandbox_env(self, runtime: "LuaRuntime") -> Dict[str, Any]:
+        """Return a minimal environment table for sandboxed Lua execution."""
+
+        safe_env: Dict[str, Any] = {}
+
+        def _eval(expr: str) -> Any:
+            try:
+                return runtime.eval(expr)
+            except LuaError:
+                return None
+
+        string_mod = _eval(
+            "return {byte=string.byte, char=string.char, find=string.find, format=string.format,"
+            " gsub=string.gsub, len=string.len, lower=string.lower, upper=string.upper,"
+            " sub=string.sub, rep=string.rep}"
+        )
+        if string_mod is not None:
+            safe_env["string"] = string_mod
+
+        table_mod = _eval(
+            "return {insert=table.insert, remove=table.remove, unpack=table.unpack, pack=table.pack}"
+        )
+        if table_mod is not None:
+            safe_env["table"] = table_mod
+
+        math_mod = _eval(
+            "return {abs=math.abs, ceil=math.ceil, floor=math.floor, max=math.max, min=math.min,"
+            " sqrt=math.sqrt, modf=math.modf}"
+        )
+        if math_mod is not None:
+            safe_env["math"] = math_mod
+
+        bit32_mod = _eval(
+            "return bit32 and {band=bit32.band, bor=bit32.bor, bxor=bit32.bxor,"
+            " bnot=bit32.bnot, lshift=bit32.lshift, rshift=bit32.rshift, arshift=bit32.arshift}"
+        )
+        if bit32_mod is not None:
+            safe_env["bit32"] = bit32_mod
+
+        bit_mod = _eval(
+            "return bit and {band=bit.band, bor=bit.bor, bxor=bit.bxor, bnot=bit.bnot,"
+            " lshift=bit.lshift, rshift=bit.rshift}"
+        )
+        if bit_mod is not None:
+            safe_env["bit"] = bit_mod
+
+        for name in (
+            "assert",
+            "error",
+            "next",
+            "pairs",
+            "ipairs",
+            "pcall",
+            "xpcall",
+            "select",
+            "tonumber",
+            "tostring",
+            "type",
+        ):
+            value = _eval(f"return {name}")
+            if value is not None:
+                safe_env[name] = value
+
+        safe_env["print"] = lambda *_args, **_kwargs: None
+
+        return safe_env
 
     # ------------------------------------------------------------------
     def extract_metadata_from_decoded(self, decoded_bytes: bytes) -> Dict[str, Any]:

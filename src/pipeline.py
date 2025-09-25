@@ -204,6 +204,7 @@ class Context:
     yes: bool = False
     force: bool = False
     debug_bootstrap: bool = False
+    allow_lua_run: bool = False
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
     vm_metadata: Dict[str, Any] = field(default_factory=dict)
@@ -218,6 +219,7 @@ class Context:
     def __post_init__(self) -> None:
         if isinstance(self.options, dict):
             self.options.setdefault("debug_bootstrap", bool(self.debug_bootstrap))
+            self.options.setdefault("allow_lua_run", bool(self.allow_lua_run))
 
         if self.deobfuscator is None:
             if isinstance(self.options, dict):

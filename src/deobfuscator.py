@@ -71,6 +71,7 @@ class LuaDeobfuscator:
         script_key: str | None = None,
         bootstrapper: str | os.PathLike[str] | Path | None = None,
         debug_bootstrap: bool = False,
+        allow_lua_run: bool = False,
     ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
@@ -86,6 +87,7 @@ class LuaDeobfuscator:
         self._last_render_validation: Dict[str, Any] = {}
         self._last_handler: VersionHandler | None = None
         self._debug_bootstrap = bool(debug_bootstrap)
+        self._allow_lua_run = bool(allow_lua_run)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._bootstrap_debug_log = Path("logs") / f"bootstrap_extract_debug_{timestamp}.log"
         self._bootstrap_meta: Dict[str, Any] = {}
@@ -176,6 +178,11 @@ class LuaDeobfuscator:
                     )
                 except Exception:  # pragma: no cover - defensive
                     pass
+            allow_lua_run = getattr(self, "_allow_lua_run", False)
+            try:
+                setattr(handler_instance, "allow_lua_run", bool(allow_lua_run))
+            except Exception:  # pragma: no cover - defensive
+                pass
             if self._bootstrapper_path is not None:
                 setter = getattr(handler_instance, "set_bootstrapper", None)
                 if callable(setter):
