@@ -6,7 +6,7 @@ from src.report import DeobReport
 def test_report_to_text_includes_expected_sections():
     report = DeobReport(
         version_detected="luraph_v14_4_initv4",
-        confirmed_by_user=True,
+        confirmed=True,
         script_key_used="x5elqj5j4ibv9z3329g7b",
         bootstrapper_used="examples/initv4.lua",
         blob_count=3,

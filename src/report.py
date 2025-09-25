@@ -1,11 +1,13 @@
 """Structured deobfuscation report helpers."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List
 
 
 def _mask_script_key(value: str | None) -> str | None:
+    """Return the first six characters of the key followed by an ellipsis."""
+
     if not value:
         return None
     prefix = value[:6]
@@ -16,8 +18,8 @@ def _mask_script_key(value: str | None) -> str | None:
 class DeobReport:
     """Summarises a single deobfuscation run for maintainers."""
 
-    version_detected: str = "unknown"
-    confirmed_by_user: bool = False
+    version_detected: str | None = None
+    confirmed: bool = False
     script_key_used: str | None = None
     bootstrapper_used: str | None = None
     blob_count: int = 0
@@ -43,10 +45,7 @@ class DeobReport:
 
         lines: List[str] = []
         lines.append(f"Detected version: {self.version_detected}")
-        lines.append(
-            "User confirmed detection: "
-            + ("yes" if self.confirmed_by_user else "no")
-        )
+        lines.append("User confirmed detection: " + ("yes" if self.confirmed else "no"))
         masked_key = self.masked_script_key()
         if masked_key:
             lines.append(f"Script key: {masked_key}")
@@ -87,6 +86,9 @@ class DeobReport:
     def to_json(self) -> Dict[str, object]:
         """Return a JSON-serialisable representation with masked secrets."""
 
+        data = asdict(self)
+        data["script_key_used"] = self.masked_script_key()
+
         chunk_payload: List[Dict[str, object]] = []
         for entry in self.chunks:
             if not isinstance(entry, dict):
@@ -106,21 +108,5 @@ class DeobReport:
                 }
             )
 
-        return {
-            "detected_version": self.version_detected,
-            "confirmed_by_user": self.confirmed_by_user,
-            "script_key_used": self.masked_script_key(),
-            "bootstrapper_used": self.bootstrapper_used,
-            "blob_count": self.blob_count,
-            "decoded_bytes": self.decoded_bytes,
-            "chunks": chunk_payload,
-            "opcode_stats": dict(self.opcode_stats),
-            "unknown_opcodes": list(self.unknown_opcodes),
-            "traps_removed": self.traps_removed,
-            "constants_decrypted": self.constants_decrypted,
-            "variables_renamed": self.variables_renamed,
-            "output_length": self.output_length,
-            "vm_metadata": dict(self.vm_metadata),
-            "warnings": list(self.warnings),
-            "errors": list(self.errors),
-        }
+        data["chunks"] = chunk_payload
+        return data

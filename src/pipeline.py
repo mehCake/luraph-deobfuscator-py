@@ -536,7 +536,7 @@ def _pass_detect(ctx: Context) -> None:
 
     if ctx.report:
         ctx.report.version_detected = version.name
-        ctx.report.confirmed_by_user = bool(ctx.options.get("_version_confirmed"))
+        ctx.report.confirmed = bool(ctx.options.get("_version_confirmed"))
 
     metadata: Dict[str, Any] = {
         "name": version.name,
