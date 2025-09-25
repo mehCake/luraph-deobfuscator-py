@@ -32,3 +32,5 @@ def test_bootstrap_decoder_uses_lua_fallback(tmp_path: Path) -> None:
     notes = metadata.get("extraction_notes") or []
     assert any("lua-fallback" in note for note in notes)
     assert metadata.get("needs_emulation") is False
+    assert metadata.get("extraction_method") == "lua_fallback"
+    assert metadata.get("extraction_log")

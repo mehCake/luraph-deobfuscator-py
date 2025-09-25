@@ -183,32 +183,50 @@ def _summarise_bootstrap_metadata(
     summary: dict[str, Any] = {}
     fallback = fallback or {}
 
-    alphabet_value: Optional[str] = None
+    def _preview(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        trimmed = value[:32]
+        if len(value) > 32:
+            trimmed += "..."
+        return trimmed
+
     alphabet_len = 0
+    raw_len = meta.get("alphabet_len")
+    if isinstance(raw_len, int) and raw_len > 0:
+        alphabet_len = raw_len
+
+    alphabet_value: Optional[str] = None
     alphabet = meta.get("alphabet")
     if isinstance(alphabet, Mapping):
         value = alphabet.get("value")
         if isinstance(value, str) and value.strip():
             alphabet_value = value
-        raw_len = alphabet.get("length")
-        if isinstance(raw_len, int) and raw_len > 0:
-            alphabet_len = raw_len
+        mapped_len = alphabet.get("length")
+        if isinstance(mapped_len, int) and mapped_len > 0:
+            alphabet_len = alphabet_len or mapped_len
     elif isinstance(alphabet, str) and alphabet.strip():
         alphabet_value = alphabet
-        alphabet_len = len(alphabet)
+        if not alphabet_len:
+            alphabet_len = len(alphabet)
+
+    preview = meta.get("alphabet_preview")
+    if isinstance(preview, str) and preview:
+        alphabet_value = alphabet_value or preview
+    if alphabet_value and not alphabet_len:
+        alphabet_len = len(alphabet_value)
 
     if alphabet_value is None:
-        preview = meta.get("alphabet_preview")
-        if isinstance(preview, str) and preview:
-            alphabet_value = preview
-    if not alphabet_len and alphabet_value:
-        alphabet_len = len(alphabet_value)
+        fallback_alphabet = fallback.get("alphabet")
+        if isinstance(fallback_alphabet, str) and fallback_alphabet.strip():
+            alphabet_value = fallback_alphabet
     if not alphabet_len:
-        fallback_len = fallback.get("alphabet_length")
+        fallback_len = fallback.get("alphabet_length") or fallback.get("alphabet_len")
         if isinstance(fallback_len, int) and fallback_len > 0:
             alphabet_len = fallback_len
-    summary["alphabet"] = alphabet_value[:120] if isinstance(alphabet_value, str) else None
+
     summary["alphabet_len"] = alphabet_len
+    summary["alphabet_preview"] = _preview(alphabet_value)
 
     opcode_map_source: Optional[Mapping[Any, Any]] = None
     opcode_map = meta.get("opcode_map")
@@ -234,15 +252,20 @@ def _summarise_bootstrap_metadata(
     if opcode_map_source and not isinstance(opcode_map_source, dict):
         opcode_map_source = dict(opcode_map_source)
 
+    opcode_map_count = 0
     if opcode_map_source:
-        summary["opcode_map_count"] = len(opcode_map_source)
+        opcode_map_count = len(opcode_map_source)
     else:
-        summary["opcode_map_count"] = int(meta.get("opcode_map_count") or 0)
+        raw_count = meta.get("opcode_map_count")
+        if isinstance(raw_count, int):
+            opcode_map_count = raw_count
+    summary["opcode_map_count"] = opcode_map_count
 
-    sample_source: Optional[Mapping[str, Any]] = None
+    sample_items: list[dict[str, str]] = []
     direct_sample = meta.get("opcode_map_sample")
     if isinstance(direct_sample, Mapping) and direct_sample:
-        sample_source = direct_sample
+        for key, value in direct_sample.items():
+            sample_items.append({str(key): str(value)})
     elif opcode_map_source:
         try:
             items = sorted(
@@ -255,7 +278,6 @@ def _summarise_bootstrap_metadata(
             )
         except Exception:
             items = list(opcode_map_source.items())
-        sample: dict[str, str] = {}
         for key, name in items[:10]:
             try:
                 if isinstance(key, str) and key.startswith("0x"):
@@ -265,15 +287,13 @@ def _summarise_bootstrap_metadata(
                 formatted = f"0x{opcode_int:02X}"
             except Exception:
                 formatted = str(key)
-            sample[formatted] = str(name)
-        sample_source = sample
+            sample_items.append({formatted: str(name)})
     elif isinstance(fallback.get("opcode_dispatch"), Mapping):
         mapping = fallback["opcode_dispatch"].get("mapping")
         if isinstance(mapping, Mapping):
-            sample_source = mapping
-    summary["opcode_map_sample"] = {
-        str(k): str(v) for k, v in (sample_source.items() if sample_source else [])
-    }
+            for key, value in list(mapping.items())[:10]:
+                sample_items.append({str(key): str(value)})
+    summary["opcode_map_sample"] = sample_items
 
     constants = meta.get("constants")
     if isinstance(constants, Mapping):
@@ -311,9 +331,22 @@ def _summarise_bootstrap_metadata(
     else:
         summary["extraction_notes"] = []
 
+    extraction_method = meta.get("extraction_method") or fallback.get(
+        "extraction_method"
+    )
+    if extraction_method:
+        summary["extraction_method"] = str(extraction_method)
+    else:
+        summary["extraction_method"] = "unknown"
+
     artifacts = meta.get("artifact_paths")
     if isinstance(artifacts, Mapping):
         summary["artifact_paths"] = {str(k): str(v) for k, v in artifacts.items()}
+
+    extraction_log = meta.get("extraction_log")
+    if not extraction_log and isinstance(artifacts, Mapping):
+        extraction_log = artifacts.get("trace_log_path")
+    summary["extraction_log"] = str(extraction_log) if extraction_log else None
 
     decoder_meta = meta.get("decoder")
     if isinstance(decoder_meta, Mapping):
@@ -337,6 +370,26 @@ def _summarise_bootstrap_metadata(
         raw_matches = meta.get("raw_matches")
         if isinstance(raw_matches, Mapping):
             summary["raw_matches"] = raw_matches
+
+    fallback_attempted = bool(
+        meta.get("fallback_attempted") or fallback.get("fallback_attempted")
+    )
+    fallback_executed = bool(
+        meta.get("fallback_executed") or fallback.get("fallback_executed")
+    )
+    if summary["needs_emulation"] and not fallback_executed:
+        summary["instructions"] = [
+            "Bootstrapper decoding requires emulation. Re-run with --allow-lua-run (or --force with --debug-bootstrap) to enable the sandboxed Lua fallback.",
+            "If Lua fallback cannot be enabled, supply trusted bootstrapper metadata or decoded blobs for manual analysis.",
+        ]
+    if (
+        summary.get("extraction_method") == "unknown"
+        and not summary["needs_emulation"]
+        and not fallback_attempted
+    ):
+        summary["extraction_method"] = "python_reimpl"
+    summary["fallback_attempted"] = fallback_attempted
+    summary["fallback_executed"] = fallback_executed
 
     return summary
 
@@ -431,12 +484,26 @@ def _build_json_payload(
                 except Exception:
                     metadata_payload = {}
                 debug_log_path = None
+                trace_log_path = None
                 artifacts_from_file = metadata_payload.get("artifact_paths")
                 if isinstance(artifacts_from_file, Mapping):
                     debug_log_path = artifacts_from_file.get("debug_log_path")
+                    trace_log_path = artifacts_from_file.get("trace_log_path")
                 if debug_log_path:
                     artifact_paths["debug_log_path"] = str(debug_log_path)
+                if trace_log_path:
+                    artifact_paths["trace_log_path"] = str(trace_log_path)
+                else:
+                    artifact_paths.setdefault(
+                        "trace_log_path",
+                        str(Path("out") / "logs" / f"bootstrap_decode_trace_{sanitized}.log"),
+                    )
                 bootstrap_summary["artifact_paths"] = artifact_paths
+        if not bootstrap_summary.get("extraction_log"):
+            artifacts_map = bootstrap_summary.get("artifact_paths") or {}
+            trace_candidate = artifacts_map.get("trace_log_path")
+            if trace_candidate:
+                bootstrap_summary["extraction_log"] = trace_candidate
         if include_raw:
             artifacts = bootstrap_summary.get("artifact_paths") or {}
             debug_log_path = artifacts.get("debug_log_path")

@@ -44,4 +44,6 @@ def test_bootstrap_decoder_lua_fallback(tmp_path: Path) -> None:
     assert metadata.get("alphabet_len", 0) > 80
     assert metadata.get("opcode_map_count", 0) >= 16
     assert not metadata.get("needs_emulation"), metadata.get("extraction_notes")
+    assert metadata.get("extraction_method") == "lua_fallback"
+    assert metadata.get("extraction_log")
 

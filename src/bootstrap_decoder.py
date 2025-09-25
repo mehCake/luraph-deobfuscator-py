@@ -165,6 +165,7 @@ class BootstrapDecoder:
         metadata: Dict[str, Any] = {
             "alphabet": None,
             "alphabet_len": 0,
+            "alphabet_preview": "",
             "opcode_map": {},
             "opcode_map_count": 0,
             "constants": {},
@@ -172,6 +173,10 @@ class BootstrapDecoder:
             "raw_matches_count": 0,
             "needs_emulation": False,
             "extraction_notes": [],
+            "extraction_method": None,
+            "extraction_log": None,
+            "fallback_attempted": False,
+            "fallback_executed": False,
         }
         errors: List[str] = []
 
@@ -224,11 +229,28 @@ class BootstrapDecoder:
             self._trace(f"Decoded literal {label!r} to {len(blob_bytes)} bytes")
 
             decode_result = self.python_reimpl_decode(blob_bytes)
-            if not decode_result.success:
+            method_used: Optional[str] = None
+            if decode_result.success:
+                method_used = "python_reimpl"
+            else:
+                metadata["fallback_attempted"] = True
                 self._trace("Python reimplementation failed; attempting Lua fallback")
                 fallback_result = self.sandboxed_lua_decode(blob_bytes)
+                fallback_notes = fallback_result.notes or []
+                disabled_markers = {
+                    "lua-fallback-disabled",
+                    "lua-fallback-unavailable",
+                    "lua-fallback-no-candidate",
+                }
+                executed = fallback_result.success or any(
+                    note.startswith("lua-fallback-") and note not in disabled_markers
+                    for note in fallback_notes
+                )
+                if executed:
+                    metadata["fallback_executed"] = True
                 if fallback_result.success:
                     decode_result = fallback_result
+                    method_used = "lua_fallback"
                 else:
                     needs_emulation = needs_emulation or fallback_result.needs_emulation
                     errors.extend(filter(None, [fallback_result.error]))
@@ -243,6 +265,11 @@ class BootstrapDecoder:
             else:
                 decoded_any = True
 
+            if method_used == "lua_fallback":
+                metadata["extraction_method"] = "lua_fallback"
+            elif method_used == "python_reimpl" and not metadata.get("extraction_method"):
+                metadata["extraction_method"] = "python_reimpl"
+
             decoded_blobs[label] = decoded_bytes
             decoded_paths[label] = self._write_blob_artifact(label, decoded_bytes)
 
@@ -254,6 +281,7 @@ class BootstrapDecoder:
             if extracted["alphabet"] and not metadata["alphabet"]:
                 metadata["alphabet"] = extracted["alphabet"]
                 metadata["alphabet_len"] = len(extracted["alphabet"])
+                metadata["alphabet_preview"] = self._preview(extracted["alphabet"])
             if extracted["opcode_map"]:
                 metadata["opcode_map"].update(extracted["opcode_map"])
                 metadata["opcode_map_count"] = len(metadata["opcode_map"])
@@ -270,6 +298,10 @@ class BootstrapDecoder:
             len(v) for v in raw_matches.values() if isinstance(v, Iterable)
         )
         metadata["needs_emulation"] = needs_emulation
+        if metadata["alphabet"] and not metadata.get("alphabet_preview"):
+            metadata["alphabet_preview"] = self._preview(metadata["alphabet"])
+        metadata["fallback_attempted"] = bool(metadata.get("fallback_attempted"))
+        metadata["fallback_executed"] = bool(metadata.get("fallback_executed"))
 
         success = decoded_any and bool(metadata["alphabet"]) and bool(metadata["opcode_map"])
         if success:
@@ -290,6 +322,9 @@ class BootstrapDecoder:
             sample_consts = list(metadata["constants"].items())[:5]
             sample_desc = ", ".join(f"{k}={v}" for k, v in sample_consts)
             LOG.info("[BOOTSTRAP] Extracted %d constants: %s", len(metadata["constants"]), sample_desc)
+
+        if success and not metadata.get("extraction_method"):
+            metadata["extraction_method"] = "python_reimpl"
 
         return self._finalise_result(
             success=success,
@@ -929,6 +964,7 @@ class BootstrapDecoder:
 
         trace_path = self._write_trace()
         artifact_paths.setdefault("trace_log_path", trace_path)
+        metadata["extraction_log"] = trace_path
         debug_path: Optional[str] = None
         if self.debug:
             debug_logs_dir = os.path.abspath("logs")
