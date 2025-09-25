@@ -233,7 +233,7 @@ class BootstrapDecoder:
                     i += 1
                 buf.append(int(digits, 10) & 0xFF)
             else:
-                LOG.debug("[BOOTSTRAP] Preserving unknown escape \%s", esc)
+                LOG.debug("[BOOTSTRAP] Preserving unknown escape \\%s", esc)
                 buf.append(ord(esc))
 
         if quote:
