@@ -45,13 +45,16 @@ providing both the cleaned Lua script and a merged JSON report.  Use
 report to the primary output path while still emitting the Lua file.
 
 ```bash
-# basic invocation with positional argument
+# Quick start against the bundled v14.4.1 sample
+python main.py Obfuscated.json --script-key <your_key> --bootstrapper initv4.lua --yes
+
+# Basic invocation with positional argument
 python main.py path/to/obfuscated.lua
 
-# explicitly select JSON output and request per-pass artefacts
+# Explicitly select JSON output and request per-pass artefacts
 python main.py --in examples/json_wrapped.lua --format json --write-artifacts artefacts/
 
-# run the complex sample with multiple workers and iteration fixpoint
+# Run the complex sample with multiple workers and iteration fixpoint
 python main.py examples/complex_obfuscated --jobs 4 --max-iterations 3 --profile
 ```
 
@@ -136,6 +139,28 @@ The `examples/` directory contains small samples that can be used for quick
 testing.  The CLI remains a thin wrapper around
 `src.deobfuscator.LuaDeobfuscator`, which can also be used directly from Python
 code.
+
+### Script key policy and interactive confirmations
+
+- **Always provide `--script-key` for full initv4 decoding.** Keys rotate
+  frequently and the deobfuscator aborts before VM lifting when no key is
+  available.  Use `--force` only when you intentionally want a best-effort run
+  that skips encrypted payloads.
+- **No built-in production keys.** The tool never iterates over a list of
+  defaults; it only honours the explicit value you supply (or one embedded in
+  the script).  For CI and reproducible testing we keep a dedicated test vector
+  key (`x5elqj5j4ibv9z3329g7b`, previously `8ta4sq5m2gqw1fy1tq1sh`) inside the
+  test suite.  These helpers are not used at runtime.
+- **Bootstrapper checks remain interactive.** When detection spots a Luraph
+  banner or a supplied bootstrapper, the CLI requests confirmation before
+  proceeding.  Pass `--yes` for unattended workflows or CI pipelines.
+
+The CLI emits `<input>_deob.lua` together with `<input>_deob.json` by default.
+The Lua file contains the cleaned, formatted script; the JSON sidecar captures
+detected version data, confirmation status, decoded chunk statistics, VM
+metadata (opcode counts, traps removed, jump tables), warnings, and errors.  Use
+`--format lua` to skip the JSON report or `--format json` to prioritise the
+report while still writing the Lua file alongside it.
 
 ## JSON input (Luraph v14.2 JSON variant)
 
