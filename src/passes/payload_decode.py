@@ -385,7 +385,11 @@ def _iterative_initv4_decode(
                     for path in blob_paths:
                         if isinstance(path, str) and path:
                             aggregate_meta["bootstrapper_decoded_blobs"].append(path)
-                    warning += " Bootstrapper decoder requires emulation; inspect: " + ", ".join(blob_paths)
+                    warning += (
+                        " Bootstrapper decoder requires emulation; inspect: "
+                        + ", ".join(blob_paths)
+                        + ". Use --force to proceed with fallback decoding."
+                    )
                 if not force:
                     warnings.append(warning)
                     continue
