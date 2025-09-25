@@ -175,14 +175,11 @@ class InitV4Decoder:
 
     # ------------------------------------------------------------------
     def _run_bootstrap_decoder(self, bootstrap_path: str) -> None:
-        decoder: BootstrapDecoder
-        try:
-            decoder = BootstrapDecoder(self.ctx)
-        except Exception:  # pragma: no cover - defensive
-            decoder = BootstrapDecoder()
+        script_key = self.script_key or ""
+        decoder = BootstrapDecoder(self.ctx, bootstrap_path, script_key)
 
         try:
-            result = decoder.run_extraction(bootstrap_path, self._script_key_bytes)
+            result = decoder.run_full_extraction()
         except Exception as exc:  # pragma: no cover - defensive
             _bootstrap_log(logging.ERROR, "Bootstrap decoder crashed: %s", exc)
             self._bootstrap_warnings.append("decoder_exception")
