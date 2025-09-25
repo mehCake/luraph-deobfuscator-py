@@ -19,6 +19,8 @@ from ..versions.luraph_v14_4_initv4 import (
     DEFAULT_ALPHABET as INITV4_DEFAULT_ALPHABET,
     decode_blob as initv4_decode_blob,
 )
+from lph_handler import extract_vm_ir
+from opcode_lifter import OpcodeLifter
 
 from string_decryptor import StringDecryptor
 import string_decryptor as string_decryptor_mod
@@ -333,6 +335,8 @@ def _iterative_initv4_decode(
     current_text = source
     key_bytes = script_key.encode("utf-8")
 
+    opcode_lifter: Optional[OpcodeLifter] = None
+
     for _iteration in range(max(1, max_iterations)):
         try:
             payloads = decoder.locate_payload(current_text)
@@ -354,8 +358,12 @@ def _iterative_initv4_decode(
             decoded_bytes = b""
 
             try:
-                alphabet = decoder.alphabet or INITV4_DEFAULT_ALPHABET
-                decoded_bytes = initv4_decode_blob(stripped, alphabet, key_bytes)
+                alphabet = getattr(decoder, "alphabet", None) or INITV4_DEFAULT_ALPHABET
+                decoded_bytes = initv4_decode_blob(
+                    stripped,
+                    alphabet=alphabet,
+                    key_bytes=key_bytes,
+                )
             except Exception as exc:
                 if not force:
                     warnings.append(str(exc))
@@ -373,7 +381,10 @@ def _iterative_initv4_decode(
                     continue
 
             opcode_map: Mapping[int, str] = getattr(decoder, "opcode_map", {})
-            suspicious = not looks_like_vm_bytecode(decoded_bytes, opcode_map=opcode_map)
+            suspicious = not looks_like_vm_bytecode(
+                decoded_bytes,
+                opcode_map=opcode_map,
+            )
             blob_paths: List[str] = []
             if suspicious:
                 needs_emulation, blob_paths = _bootstrap_decoder_needs_emulation(
@@ -390,10 +401,16 @@ def _iterative_initv4_decode(
                         + ", ".join(blob_paths)
                         + ". Use --force to proceed with fallback decoding."
                     )
+                chunk_record = {  # predeclare for metadata capture
+                    "vm_lift_skipped": True,
+                }
                 if not force:
                     warnings.append(warning)
                     continue
                 warnings.append(f"{warning} (ignored due to --force)")
+                chunk_record["vm_lift_forced"] = True
+            else:
+                chunk_record = {}
 
             aggregate_meta["chunk_count"] += 1
             aggregate_meta["chunk_decoded_bytes"].append(len(decoded_bytes))
@@ -401,12 +418,14 @@ def _iterative_initv4_decode(
             aggregate_meta["chunk_success_count"] += 1 if decoded_bytes else 0
 
             chunk_index = len(decoded_chunks)
-            chunk_record = {
-                "index": chunk_index,
-                "encoded_size": encoded_length,
-                "decoded_byte_count": len(decoded_bytes),
-                "used_key_masked": masked_key,
-            }
+            chunk_record.update(
+                {
+                    "index": chunk_index,
+                    "encoded_size": encoded_length,
+                    "decoded_byte_count": len(decoded_bytes),
+                    "used_key_masked": masked_key,
+                }
+            )
             alphabet_source = "bootstrapper" if decoder.alphabet else "default"
             chunk_record["alphabet_source"] = alphabet_source
             aggregate_meta.setdefault("chunk_alphabet_sources", []).append(alphabet_source)
@@ -414,6 +433,58 @@ def _iterative_initv4_decode(
             aggregate_meta.setdefault("chunk_suspicious_flags", []).append(suspicious)
             if blob_paths:
                 chunk_record["bootstrapper_decoded_blobs"] = list(blob_paths)
+
+            if not suspicious:
+                chunk_record["vm_lift_skipped"] = False
+                vm_summary: Dict[str, Any] = {}
+                decoded_text: Optional[str]
+                try:
+                    decoded_text = decoded_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded_text = None
+
+                payload_mapping: Optional[Dict[str, Any]] = None
+                if decoded_text:
+                    payload_mapping = extract_vm_ir(decoded_text)
+
+                if payload_mapping and isinstance(opcode_map, Mapping) and opcode_map:
+                    constants = payload_mapping.get("constants")
+                    bytecode_listing = payload_mapping.get("bytecode") or payload_mapping.get("code")
+                    prototypes = payload_mapping.get("prototypes")
+                    if isinstance(constants, list):
+                        vm_summary["constants"] = len(constants)
+                    if isinstance(bytecode_listing, list):
+                        vm_summary["bytecode"] = len(bytecode_listing)
+                    if isinstance(prototypes, list):
+                        vm_summary["prototypes"] = len(prototypes)
+
+                    try:
+                        if opcode_lifter is None:
+                            opcode_lifter = OpcodeLifter()
+                        module = opcode_lifter.lift_program(
+                            payload_mapping,
+                            version="luraph_v14_4_initv4",
+                            opcode_map=dict(opcode_map),
+                        )
+                    except Exception as exc:
+                        warning = f"Opcode lifting failed: {exc}"
+                        warnings.append(warning)
+                        chunk_record["vm_lift_error"] = str(exc)
+                    else:
+                        vm_summary["instructions"] = len(getattr(module, "instructions", []))
+                        table_meta = getattr(module, "metadata", {}).get("opcode_table")
+                        if isinstance(table_meta, Mapping):
+                            source = table_meta.get("source")
+                            if source:
+                                vm_summary["opcode_table_source"] = source
+                        aggregate_meta.setdefault("vm_lift_summaries", []).append(dict(vm_summary))
+                else:
+                    chunk_record["vm_lift_skipped"] = True
+
+                if vm_summary:
+                    chunk_record["vm_lift_summary"] = vm_summary
+            elif "vm_lift_skipped" not in chunk_record:
+                chunk_record["vm_lift_skipped"] = True
 
             decoded_chunks.append(chunk_record)
             aggregate_meta["chunk_details"].append(dict(chunk_record))
