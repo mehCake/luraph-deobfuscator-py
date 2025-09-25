@@ -11,6 +11,7 @@ def test_report_to_text_includes_expected_sections():
         bootstrapper_used="examples/initv4.lua",
         blob_count=3,
         decoded_bytes=4096,
+        payload_iterations=3,
         opcode_stats={"CALL": 5, "LOADK": 8},
         unknown_opcodes=[255],
         traps_removed=2,
@@ -39,6 +40,7 @@ def test_report_to_text_includes_expected_sections():
         Script key: x5elqj... (len=21)
         Bootstrapper: examples/initv4.lua
         Decoded 3 blobs, total 4096 bytes
+        Payload iterations: 3
         Opcode counts:
           CALL: 5
           LOADK: 8
@@ -69,6 +71,7 @@ def test_report_to_text_handles_missing_optional_fields():
     assert "Script key" not in "\n".join(rendered)
     assert "Bootstrapper" not in "\n".join(rendered)
     assert "Unknown opcodes: none" in rendered
+    assert any(line.startswith("Payload iterations:") for line in rendered)
     assert rendered[-1] == "Final output length: 0 chars"
 
 
@@ -78,6 +81,7 @@ def test_report_to_json_masks_script_key_and_chunks():
         script_key_used="abcdef123456",
         blob_count=2,
         decoded_bytes=512,
+        payload_iterations=2,
         chunks=[
             {"index": 0, "size": 128, "decoded_byte_count": 64, "lifted_instruction_count": 10},
             {"index": 1, "size": 256, "decoded_byte_count": 128, "lifted_instruction_count": 20},
@@ -88,6 +92,7 @@ def test_report_to_json_masks_script_key_and_chunks():
 
     assert payload["script_key_used"] == "abcdef... (len=12)"
     assert payload["blob_count"] == 2
+    assert payload["payload_iterations"] == 2
     assert len(payload["chunks"]) == 2
     first_chunk = payload["chunks"][0]
     assert first_chunk["used_key_masked"] == "abcdef... (len=12)"

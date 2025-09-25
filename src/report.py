@@ -24,6 +24,7 @@ class DeobReport:
     bootstrapper_used: str | None = None
     blob_count: int = 0
     decoded_bytes: int = 0
+    payload_iterations: int = 0
     opcode_stats: Dict[str, int] = field(default_factory=dict)
     unknown_opcodes: List[int] = field(default_factory=list)
     traps_removed: int = 0
@@ -53,6 +54,10 @@ class DeobReport:
             lines.append(f"Bootstrapper: {self.bootstrapper_used}")
         lines.append(
             f"Decoded {self.blob_count} blobs, total {self.decoded_bytes} bytes"
+        )
+        lines.append(
+            "Payload iterations: "
+            + (str(self.payload_iterations) if self.payload_iterations else "0")
         )
         lines.append("Opcode counts:")
         for op, count in sorted(self.opcode_stats.items()):
@@ -88,6 +93,8 @@ class DeobReport:
 
         data = asdict(self)
         data["script_key_used"] = self.masked_script_key()
+        iterations = self.payload_iterations if self.payload_iterations > 0 else 0
+        data["payload_iterations"] = iterations
 
         chunk_payload: List[Dict[str, object]] = []
         for entry in self.chunks:

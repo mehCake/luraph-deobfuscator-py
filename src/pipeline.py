@@ -565,6 +565,11 @@ def _pass_payload_decode(ctx: Context) -> None:
     metadata = payload_decode_run(ctx)
     report = ctx.report
     if report is not None and isinstance(metadata, dict):
+        iterations = metadata.get("payload_iterations")
+        if isinstance(iterations, int) and iterations > 0:
+            report.payload_iterations = iterations
+        elif report.payload_iterations <= 0:
+            report.payload_iterations = 1
         chunk_entries = _collect_chunk_entries(report, metadata)
         report.chunks = chunk_entries if chunk_entries else []
     ctx.record_metadata("payload_decode", metadata)

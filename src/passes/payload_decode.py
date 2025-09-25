@@ -88,7 +88,7 @@ def _detect_jump_table(constants: Iterable[Any]) -> Optional[Dict[str, Any]]:
 def _payload_iteration_limit(ctx: "Context") -> int:
     """Return the maximum number of iterative payload decodes to attempt."""
 
-    default_limit = 3
+    default_limit = 5
     options = getattr(ctx, "options", None)
     if isinstance(options, dict):
         raw_limit = options.get("payload_decode_max_iterations")

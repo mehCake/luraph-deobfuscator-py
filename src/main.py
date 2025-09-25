@@ -18,6 +18,7 @@ from .utils_pkg.ir import IRModule
 from version_detector import VersionInfo
 
 LOG_FILE = Path("deobfuscator.log")
+DEFAULT_PAYLOAD_ITERATIONS = 5
 
 
 class _ColourFormatter(logging.Formatter):
@@ -339,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=1, help="process inputs in parallel using N workers")
 
     args = parser.parse_args(argv)
+    default_pipeline_iterations = parser.get_default("max_iterations")
 
     raw_inputs: List[str] = list(args.inputs)
     if args.input_path:
@@ -472,7 +474,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()
                 ctx.options.setdefault("confirm_detected_version", confirm_default)
-                ctx.options.setdefault("payload_decode_max_iterations", iterations)
+                payload_iterations = iterations
+                if args.max_iterations == default_pipeline_iterations:
+                    payload_iterations = max(DEFAULT_PAYLOAD_ITERATIONS, payload_iterations)
+                ctx.options.setdefault("payload_decode_max_iterations", payload_iterations)
                 if bootstrapper_path:
                     ctx.options.setdefault("bootstrapper", bootstrapper_path)
                 if args.step_limit is not None:
