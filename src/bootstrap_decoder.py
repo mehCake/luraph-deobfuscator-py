@@ -146,7 +146,14 @@ class BootstrapDecoder:
         self._decoder_candidates: List[DecoderCandidate] = []
         path_obj = Path(bootstrap_path)
         stem = path_obj.stem or path_obj.name
-        self._input_name = self._sanitise_name(stem)
+        input_name: Optional[str] = None
+        ctx_input = getattr(ctx, "input_path", None)
+        if ctx_input:
+            try:
+                input_name = Path(ctx_input).stem
+            except TypeError:
+                input_name = Path(str(ctx_input)).stem
+        self._input_name = self._sanitise_name(input_name or stem)
         self._trace_lines: List[str] = []
         self._trace_lock = threading.Lock()
         self._primary_blob_written = False
