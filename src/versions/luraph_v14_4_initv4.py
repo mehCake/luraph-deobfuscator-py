@@ -187,48 +187,91 @@ class InitV4Decoder:
 
         self._bootstrap_decoder_result = result
         self._bootstrap_decoder_success = bool(result.success)
-        self._bootstrap_needs_emulation = bool(result.needs_emulation)
+        metadata = result.metadata_dict if isinstance(result.metadata_dict, dict) else {}
+        self._bootstrap_decoder_metadata = dict(metadata)
         self._bootstrap_decoder_errors = list(result.errors)
+
+        needs_emulation = bool(
+            result.needs_emulation or metadata.get("needs_emulation")
+        )
+        if isinstance(metadata, dict):
+            metadata.setdefault("needs_emulation", needs_emulation)
+        self._bootstrap_needs_emulation = needs_emulation
+        try:
+            setattr(self.ctx, "bootstrapper_needs_emulation", needs_emulation)
+        except Exception:  # pragma: no cover - safety
+            LOG.debug("Failed to set ctx.bootstrapper_needs_emulation", exc_info=True)
 
         if result.raw_matches:
             self._raw_matches = {"bootstrap_decoder": result.raw_matches}
 
-        metadata = result.bootstrapper_metadata or {}
-        if isinstance(metadata, dict):
-            self._bootstrap_decoder_metadata = dict(metadata)
-            blobs = metadata.get("blobs")
-            if isinstance(blobs, list):
-                self._bootstrap_decoder_blobs = [
-                    dict(entry) for entry in blobs if isinstance(entry, dict)
-                ]
-            self._ingest_bootstrap_metadata(metadata)
-            if result.raw_matches and self._debug_bootstrap:
-                raw_section = metadata.setdefault("raw_matches", {})
-                if isinstance(raw_section, Mapping):
-                    raw_section = dict(raw_section)
-                else:
-                    raw_section = {}
-                raw_section.setdefault("bootstrap_decoder", result.raw_matches)
-                metadata["raw_matches"] = raw_section
+        decoded_paths = result.decoded_blob_paths or {}
+        if decoded_paths:
+            self._bootstrap_decoder_blobs = [
+                {"label": label, "path": path}
+                for label, path in decoded_paths.items()
+                if path
+            ]
 
-        if not result.success:
-            if not self.alphabet:
-                self.alphabet = DEFAULT_ALPHABET
-            warning = "bootstrap_decoder_incomplete"
-            self._bootstrap_warnings.append(warning)
-            if result.errors:
-                _bootstrap_log(
-                    logging.WARNING,
-                    "Bootstrap decoder failed: %s",
-                    "; ".join(str(err) for err in result.errors if err),
-                )
-        else:
-            decoded_count = len(result.decoded_blobs)
+        alphabet = metadata.get("alphabet") if isinstance(metadata, Mapping) else None
+        opcode_map = metadata.get("opcode_map") if isinstance(metadata, Mapping) else None
+        constants = metadata.get("constants") if isinstance(metadata, Mapping) else None
+
+        if alphabet:
+            self.alphabet = str(alphabet)
+        elif not result.success:
+            self.alphabet = self.alphabet or DEFAULT_ALPHABET
+
+        if opcode_map:
+            normalised: Dict[int, str] = {}
+            for key, value in opcode_map.items():
+                try:
+                    opcode = int(key)
+                except (TypeError, ValueError):
+                    continue
+                name = str(value).strip().upper()
+                if name:
+                    normalised[opcode] = name
+            if normalised:
+                self.opcode_map.update(normalised)
+
+        if constants and isinstance(constants, Mapping):
+            for key, value in constants.items():
+                try:
+                    numeric = int(value)
+                except (TypeError, ValueError):
+                    continue
+                self.constants[str(key)] = numeric
+
+        if result.success:
             _bootstrap_log(
                 logging.INFO,
                 "Bootstrap decoder recovered %d blob(s).",
-                decoded_count,
+                len(result.decoded_blobs),
             )
+        else:
+            warning = "bootstrap_decoder_incomplete"
+            self._bootstrap_warnings.append(warning)
+            if not self.alphabet:
+                self.alphabet = DEFAULT_ALPHABET
+            detail = metadata.get("extraction_notes") if isinstance(metadata, Mapping) else None
+            if result.errors or detail:
+                notes = [str(err) for err in result.errors if err]
+                if isinstance(detail, Iterable):
+                    notes.extend(str(note) for note in detail)
+                if notes:
+                    _bootstrap_log(
+                        logging.WARNING,
+                        "Bootstrap decoder incomplete: %s",
+                        "; ".join(notes),
+                    )
+
+        try:
+            setattr(self.ctx, "bootstrapper_metadata", metadata)
+        except Exception:  # pragma: no cover - defensive
+            LOG.debug("Failed to set ctx.bootstrapper_metadata", exc_info=True)
+
+        self._ingest_bootstrap_metadata(metadata)
 
     # ------------------------------------------------------------------
     def _ingest_bootstrap_metadata(self, metadata: Mapping[str, Any]) -> None:

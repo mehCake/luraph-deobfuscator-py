@@ -115,6 +115,12 @@ class BootstrapperExtractionResult:
     raw_matches: Dict[str, Any]
     errors: List[str] = field(default_factory=list)
     trace_log_path: Optional[str] = None
+    metadata_dict: Dict[str, Any] = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Provide compatibility with earlier call-sites that expected a
+        # ``metadata_dict`` attribute.
+        self.metadata_dict = self.bootstrapper_metadata
 
 
 class BootstrapDecoder:
