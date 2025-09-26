@@ -54,12 +54,42 @@ def _is_lua_available() -> bool:
     return LuaRuntime is not None
 
 
+def _get_global(table: Any, name: str) -> Any:
+    try:
+        value = table[name]
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    try:
+        return table[name.encode("utf-8")]
+    except Exception:
+        return None
+
+
+def _get_field(table: Any, key: str) -> Any:
+    try:
+        value = table[key]
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    try:
+        return table[key.encode("utf-8")]
+    except Exception:
+        return None
+
+
 def _lua_type(runtime: "LuaRuntime"):
-    return runtime.eval("return function(value) return type(value) end")
+    """Return a small helper that proxies ``type`` within the sandbox."""
+
+    return runtime.eval("function(value) return type(value) end")
 
 
 def _lua_tostring(runtime: "LuaRuntime"):
-    return runtime.eval("return function(value) return tostring(value) end")
+    """Return a helper that mirrors ``tostring`` in the sandbox."""
+
+    return runtime.eval("function(value) return tostring(value) end")
 
 
 class SandboxViolation(RuntimeError):
@@ -82,18 +112,32 @@ def make_safe_env(runtime: "LuaRuntime", *, log_buffer: Optional[List[str]] = No
     log_lines: List[str] = log_buffer if log_buffer is not None else []
 
     def _copy_module(name: str, allowed: Iterable[str]) -> Optional[Any]:
-        source = base_globals.get(name)
+        source = _get_global(base_globals, name)
         if source is None:
             return None
         table = runtime.table_from({})
+        added = False
         for attr in allowed:
+            value = _get_field(source, attr)
+            if value is not None:
+                table[attr] = value
+                added = True
+        if added:
+            env[name] = table
             try:
-                table[attr] = source[attr]
+                env[name.encode("utf-8")] = table
             except Exception:
-                continue
-        env[name] = table
-        modules[name] = table
-        modules[f"__orig_{name}"] = source
+                pass
+            modules[name] = table
+            modules[f"__orig_{name}"] = source
+        else:
+            env[name] = source
+            try:
+                env[name.encode("utf-8")] = source
+            except Exception:
+                pass
+            modules[name] = source
+            modules[f"__orig_{name}"] = source
         return table
 
     string_table = _copy_module(
@@ -141,6 +185,34 @@ def make_safe_env(runtime: "LuaRuntime", *, log_buffer: Optional[List[str]] = No
     )
     _copy_module("bit", ("band", "bor", "bxor", "bnot", "lshift", "rshift"))
 
+    if modules.get("bit32") is None:
+        bit32_factory = runtime.eval(
+            "function() return {"
+            "band = function(a, b) return (a & b) & 0xFFFFFFFF end,"
+            "bor = function(a, b) return (a | b) & 0xFFFFFFFF end,"
+            "bxor = function(a, b) return (a ~ b) & 0xFFFFFFFF end,"
+            "bnot = function(a) return (~a) & 0xFFFFFFFF end,"
+            "lshift = function(a, b) return (a << b) & 0xFFFFFFFF end,"
+            "rshift = function(a, b) return (a >> b) & 0xFFFFFFFF end,"
+            "arshift = function(a, b) return (a >> b) end,"
+            "} end"
+        )
+        bit32_fallback = bit32_factory()
+        env["bit32"] = bit32_fallback
+        try:
+            env[b"bit32"] = bit32_fallback
+        except Exception:
+            pass
+        modules["bit32"] = bit32_fallback
+
+    if modules.get("bit") is None and modules.get("bit32") is not None:
+        env["bit"] = modules["bit32"]
+        try:
+            env[b"bit"] = modules["bit32"]
+        except Exception:
+            pass
+        modules["bit"] = modules["bit32"]
+
     for name in (
         "assert",
         "error",
@@ -156,23 +228,36 @@ def make_safe_env(runtime: "LuaRuntime", *, log_buffer: Optional[List[str]] = No
         "math",
         "string",
         "table",
+        "coroutine",
     ):
-        value = base_globals.get(name)
+        value = _get_global(base_globals, name)
         if value is not None:
             env[name] = value
+            try:
+                env[name.encode("utf-8")] = value
+            except Exception:
+                pass
 
     # Ensure commonly used helpers remain available
     for builtin in ("rawset", "rawget", "rawequal", "setmetatable", "getmetatable"):
-        value = base_globals.get(builtin)
+        value = _get_global(base_globals, builtin)
         if value is not None:
             env[builtin] = value
+            try:
+                env[builtin.encode("utf-8")] = value
+            except Exception:
+                pass
             modules[builtin] = value
 
     # Provide limited versions of loadstring/load
     for loader in ("load", "loadstring"):
-        value = base_globals.get(loader)
+        value = _get_global(base_globals, loader)
         if value is not None:
             env[loader] = value
+            try:
+                env[loader.encode("utf-8")] = value
+            except Exception:
+                pass
 
     def _logger(*args: Any) -> None:
         message = " ".join(str(arg) for arg in args)
@@ -191,6 +276,10 @@ def make_safe_env(runtime: "LuaRuntime", *, log_buffer: Optional[List[str]] = No
     env["loadfile"] = _forbidden("loadfile")
 
     env["_G"] = env
+    try:
+        env[b"_G"] = env
+    except Exception:
+        pass
     return env, modules
 
 
@@ -339,13 +428,27 @@ def run_bootstrapper(
 
     if not _is_lua_available():
         raise RuntimeError("lupa is not available; install lupa>=1.8 to enable sandbox execution")
-    runtime = LuaRuntime(unpack_returned_tuples=True, register_eval=False)
+    runtime = LuaRuntime(
+        unpack_returned_tuples=True,
+        register_eval=False,
+        encoding=None,
+    )
     lua_type_func = _lua_type(runtime)
     tostring_func = _lua_tostring(runtime)
     log_lines: List[str] = []
+    if isinstance(bootstrap_src, str):
+        bootstrap_bytes = bootstrap_src.encode("utf-8", "ignore")
+    else:
+        bootstrap_bytes = bootstrap_src
+
     env, modules = make_safe_env(runtime, log_buffer=log_lines)
-    rawset = modules.get("rawset") or runtime.globals().get("rawset")
-    setmetatable = modules.get("setmetatable") or runtime.globals().get("setmetatable")
+    globals_table = runtime.globals()
+
+    def _lookup_global(name: str) -> Any:
+        return _get_global(globals_table, name)
+
+    rawset = modules.get("rawset") or _lookup_global("rawset")
+    setmetatable = modules.get("setmetatable") or _lookup_global("setmetatable")
     string_table = modules.get("string")
     table_table = modules.get("table")
     orig_string = modules.get("__orig_string")
@@ -381,14 +484,8 @@ def run_bootstrapper(
         table_mappings[ident] = mapping
 
     if string_table is not None and orig_string is not None:
-        try:
-            orig_char = orig_string["char"]
-        except Exception:
-            orig_char = None
-        try:
-            orig_find = orig_string["find"]
-        except Exception:
-            orig_find = None
+        orig_char = _get_field(orig_string, "char")
+        orig_find = _get_field(orig_string, "find")
 
         def _wrap_char(*args: Any) -> Any:
             result = orig_char(*args) if orig_char else None
@@ -409,10 +506,7 @@ def run_bootstrapper(
             string_table["find"] = _wrap_find
 
     if table_table is not None and orig_table is not None:
-        try:
-            orig_insert = orig_table["insert"]
-        except Exception:
-            orig_insert = None
+        orig_insert = _get_field(orig_table, "insert")
 
         def _wrap_insert(tbl: Any, *args: Any) -> Any:
             value = args[-1] if args else None
@@ -448,7 +542,7 @@ def run_bootstrapper(
         setmetatable(env, mt)
 
     finalize_func = runtime.eval(
-        "return function(root)\n"
+        "function(root)\n"
         "  local results = { alphabets = {}, tables = {} }\n"
         "  local seen = setmetatable({}, { __mode = 'k' })\n"
         "  local function is_printable(s)\n"
@@ -502,9 +596,10 @@ def run_bootstrapper(
     env["SCRIPT_KEY"] = script_key or ""
 
     loader = runtime.eval(
-        "return function(src, env) local chunk, err = load(src, 'sandbox', 't', env) if not chunk then error(err) end return chunk end"
+        "function(src, env) local chunk, err = load(src, 'sandbox', 't', env) if not chunk then error(err) end return chunk end"
     )
-    chunk = loader(bootstrap_src, env)
+
+    chunk = loader(bootstrap_bytes, env)
 
     result_holder: Dict[str, Any] = {}
 
