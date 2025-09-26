@@ -4,3 +4,4 @@ sympy==1.13.2
 mypy==1.10.0
 pytest==8.2.2
 lupa>=1.8.0  # optional; required for sandboxed Lua fallback
+base91== 1.0.1
