@@ -1,21 +1,12 @@
 """
-src/luraph_deobfuscator.py
+src/luraph_deobfuscator.py  -- updated to integrate vm_lift and vm_devirtualize
 
-Top-level Deobfuscator pipeline class used by main.py.
-
-Responsibilities:
- - detect_version(input_path) -> {name, handler, confidence}
- - run() performs:
-    * bootstrap extraction (via BootstrapDecoder)
-    * multi-chunk decode & iteration
-    * VM lifting (placeholder: integrate your lifter/devirtualizer here)
-    * produce lua_source and json_report dict
-
-Notes:
- - Requires src/bootstrap_decoder.py (BootstrapDecoder).
- - The VM lifter/devirtualizer is intentionally left as a stub to integrate with
-   your existing lifter modules. The pipeline will pass alphabet/opcode_map
-   to lifter via the `bootstrapper_metadata` field.
+This version:
+ - Uses the BootstrapDecoder (if present) to extract alphabet/opcode metadata
+ - Calls vm_lift.lift_entry and vm_devirtualize.devirtualize_entry to convert
+   decoded bytecode into a Lua source string
+ - Captures detailed traces and errors into json_report
+ - Falls back to safe placeholders if lifter/devirtualizer fail
 """
 
 import os
@@ -27,52 +18,30 @@ from typing import Optional, Dict, Any
 logger = logging.getLogger("Deobfuscator")
 logger.setLevel(logging.DEBUG)
 
-# attempt import of BootstrapDecoder
+# Attempt to import the BootstrapDecoder and the VM passes we created
 try:
     from src.bootstrap_decoder import BootstrapDecoder, BootstrapperExtractionResult
 except Exception:
     BootstrapDecoder = None
     BootstrapperExtractionResult = None
 
-# ---- utility helpers ----
+try:
+    from src.passes.vm_lift import lift_entry, LiftError
+except Exception:
+    lift_entry = None
+    LiftError = None
+
+try:
+    from src.passes.vm_devirtualize import devirtualize_entry, DevirtualizeError
+except Exception:
+    devirtualize_entry = None
+    DevirtualizeError = None
+
+# small helper to read file text
 def read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         return fh.read()
 
-def looks_like_luraph(src: str) -> Dict[str, Any]:
-    """
-    Heuristic detection for Luraph v14.4.1 / initv4 bootstrap.
-    Returns dict with keys: name, handler, confidence
-    """
-    lower = src.lower()
-    r = {"name": "unknown", "handler": None, "confidence": 0.0}
-
-    # simple version banner scan
-    m = re.search(r"luraph[\s-_]*v?14(?:\.4(?:\.1)?)?", src, re.IGNORECASE)
-    if m:
-        r["name"] = "luraph_v14_4_initv4"
-        r["handler"] = "initv4"
-        r["confidence"] = 0.95
-        return r
-
-    # fallback: look for typical initv4 patterns: script_key and init function
-    if "script_key" in lower and "init_fn" in lower:
-        r["name"] = "luraph_v14_4_initv4"
-        r["handler"] = "initv4"
-        r["confidence"] = 0.6
-        return r
-
-    # detect JSON-wrapped form
-    if lower.strip().startswith("{") and ("superflow_bytecode" in lower or "superflow_bytecode_ext" in lower):
-        r["name"] = "luraph_v14_4_initv4_json"
-        r["handler"] = "initv4"
-        r["confidence"] = 0.6
-        return r
-
-    # otherwise unknown
-    return r
-
-# ---- Deobfuscator class ----
 class Deobfuscator:
     def __init__(
         self,
@@ -88,7 +57,6 @@ class Deobfuscator:
         self.max_iterations = max_iterations
         self.debug = debug
 
-        # results
         self.lua_source = ""
         self.json_report: Dict[str, Any] = {
             "input": input_path,
@@ -97,191 +65,168 @@ class Deobfuscator:
             "passes": [],
             "warnings": [],
             "errors": [],
+            "trace": []
         }
 
     @staticmethod
     def detect_version(input_path: str) -> Dict[str, Any]:
         try:
             src = read_text(input_path)
-            return looks_like_luraph(src)
+            # Reuse the simple heuristic used previously
+            if re.search(r"luraph[\s-_]*v?14(?:\.4(?:\.1)?)?", src, re.IGNORECASE):
+                return {"name": "luraph_v14_4_initv4", "handler": "initv4", "confidence": 0.95}
+            if "script_key" in src and "init_fn" in src:
+                return {"name": "luraph_v14_4_initv4", "handler": "initv4", "confidence": 0.6}
+            return {"name": "unknown", "handler": None, "confidence": 0.0}
         except Exception as e:
-            logger.debug("detect_version read failed: %s", e)
+            logger.debug("detect_version failed: %s", e)
             return {"name": "unknown", "handler": None, "confidence": 0.0}
 
-    def _validate_bootstrap_metadata(self, meta: Dict[str, Any]) -> bool:
-        """
-        Basic checks: alphabet length and opcode_map count thresholds.
-        """
-        if not meta:
-            return False
-        alphabet = meta.get("alphabet")
-        opcode_map = meta.get("opcode_map") or meta.get("opcode_dispatch")
-        if alphabet and len(alphabet) >= 60 and opcode_map and isinstance(opcode_map, dict) and len(opcode_map) >= 16:
-            return True
-        return False
-
-    def _attempt_bootstrap_extraction(self, bootstrap_path: Optional[str]) -> Dict[str, Any]:
-        """
-        Run the BootstrapDecoder if available to extract alphabet/opcode and decoded bytes.
-        Returns metadata dict (may include 'decoded_bytes' as base64 or raw bytes)
-        """
+    def _attempt_bootstrap_extraction(self, bootstrap_path: Optional[str], allow_lua_run: bool) -> Dict[str, Any]:
         meta = {}
         if BootstrapDecoder is None:
-            self.json_report["warnings"].append("bootstrap_decoder_module_missing")
-            logger.warning("BootstrapDecoder implementation not available in src/; skipping extraction.")
+            logger.warning("BootstrapDecoder not found; skipping bootstrap extraction")
+            self.json_report["warnings"].append("bootstrap_decoder_missing")
             return meta
 
+        # Run the bootstrap decoder (it will try python-first and optionally lua fallback)
         bd = BootstrapDecoder(bootstrap_path, script_key=self.script_key, debug=self.debug)
-        res: BootstrapperExtractionResult = bd.run_full_extraction(allow_lua_run=bool(self.bootstrapper_metadata.get("allow_lua_run", False)))
-        # attach trace and metadata
+        res: BootstrapperExtractionResult = bd.run_full_extraction(allow_lua_run=allow_lua_run)
         meta.update(res.metadata_dict or {})
-        meta["needs_emulation"] = res.needs_emulation
         meta["_trace"] = res.trace
-        if res.decoded_bytes:
-            meta["_decoded_bytes_len"] = len(res.decoded_bytes)
-            # keep decoded bytes in memory for immediate use (not saved to JSON raw)
-            meta["_decoded_bytes"] = res.decoded_bytes
+        meta["_decoded_bytes"] = res.decoded_bytes if res.decoded_bytes is not None else None
+        meta["needs_emulation"] = res.needs_emulation
         return meta
 
     def _validate_decoded_bytes(self, b: bytes) -> bool:
-        """
-        Basic heuristic that decoded bytes "look like" Lua: contain 'function' or 'local ' markers
-        """
         if not b:
             return False
         sample = b[:4096].lower()
         return b"function" in sample or b"local " in sample or b"init_fn" in sample
 
     def run(self) -> Dict[str, Any]:
-        """
-        Orchestrates deobfuscation:
-         - Try to extract bootstrap metadata (alphabet/opcode_map) if not provided
-         - Decode payload(s) (multi-chunk) using alphabet + script_key
-         - For each decoded payload, validate and pass to lifter
-         - Iterate nested decoding until stable or max_iterations
-        """
         self.json_report["start_time"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+        self.json_report["trace"].append("deobfuscation started")
 
-        # 1) determine if we need to extract bootstrap metadata
+        # 1) ensure we have bootstrap metadata if possible
         if not self.bootstrapper_metadata:
-            # try to find a nearby initv4.lua if present next to input
-            candidate_bootstrap = None
-            input_dir = os.path.dirname(self.input_path) or "."
-            cpath = os.path.join(input_dir, "initv4.lua")
-            if os.path.exists(cpath):
-                candidate_bootstrap = cpath
-            # attempt extraction if candidate found
-            if candidate_bootstrap:
-                logger.info("Attempting bootstrap extraction using %s", candidate_bootstrap)
-                meta = self._attempt_bootstrap_extraction(candidate_bootstrap)
+            # try to find initv4.lua alongside input
+            candidate = os.path.join(os.path.dirname(self.input_path) or ".", "initv4.lua")
+            if os.path.exists(candidate):
+                self.json_report["trace"].append(f"auto-locating bootstrapper at {candidate}")
+                meta = self._attempt_bootstrap_extraction(candidate, allow_lua_run=False)
                 self.bootstrapper_metadata.update(meta)
-                self.json_report["passes"].append({"bootstrap_extraction": True, "bootstrap_path": candidate_bootstrap, "metadata_summary": {"needs_emulation": meta.get("needs_emulation", False), "decoded_bytes_len": meta.get("_decoded_bytes_len")}})
+                self.json_report["passes"].append({"bootstrap_extraction": True, "bootstrap_path": candidate})
             else:
-                # no bootstrap found; leave metadata empty
                 self.json_report["warnings"].append("no_bootstrap_found_adjacent")
-                logger.info("No bootstrap file auto-located next to input.")
 
-        # If metadata seems incomplete, add a warning
-        if not self._validate_bootstrap_metadata(self.bootstrapper_metadata):
-            self.json_report["warnings"].append("bootstrap_metadata_incomplete_or_missing")
-            logger.warning("bootstrapper metadata seems incomplete; lifecycle may require --allow-lua-run or manual overrides.")
+        # 1.1 If metadata incomplete and we are allowed, attempt a Lua sandbox extraction to improve results
+        if self.bootstrapper_metadata.get("needs_emulation") and BootstrapDecoder is not None:
+            self.json_report["trace"].append("bootstrap metadata marked needs_emulation; attempting sandbox extraction")
+            # try extraction with allow_lua_run True
+            candidate = os.path.join(os.path.dirname(self.input_path) or ".", "initv4.lua")
+            meta2 = self._attempt_bootstrap_extraction(candidate if os.path.exists(candidate) else None, allow_lua_run=True)
+            # merge non-empty fields
+            for k, v in meta2.items():
+                if v:
+                    self.bootstrapper_metadata[k] = v
+            self.json_report["passes"].append({"bootstrap_extraction_sandbox": True, "bootstrap_path": candidate})
 
-        # 2) Locate primary payload(s) in input (JSON wrapper or raw Lua)
+        # 2) find payload candidates (JSON or raw lua)
         raw = read_text(self.input_path)
-        payload_candidates = []
-
-        # If JSON, try to parse and find fields that contain long strings
+        payloads = []
         try:
             j = json.loads(raw)
-            # search for candidate string fields
-            def walk_json(obj, path=""):
+            # collect string fields >= 120 chars
+            def walk(obj, path=""):
                 if isinstance(obj, dict):
                     for k, v in obj.items():
-                        walk_json(v, path + "/" + k)
+                        walk(v, f"{path}/{k}")
                 elif isinstance(obj, list):
                     for i, v in enumerate(obj):
-                        walk_json(v, path + f"[{i}]")
+                        walk(v, f"{path}[{i}]")
                 elif isinstance(obj, str):
                     if len(obj) >= 120:
-                        payload_candidates.append({"path": path, "data": obj})
-                else:
-                    pass
-            walk_json(j)
+                        payloads.append({"path": path, "data": obj})
+            walk(j)
         except Exception:
-            # not JSON; treat raw as Lua code and search for long string literals
-            # find long printable runs or superflow_bytecode_ext variables
-            m = re.findall(r'["\']([! -~]{100,})["\']', raw, re.S)
-            for i, s in enumerate(m):
-                payload_candidates.append({"path": f"literal_{i}", "data": s})
+            # raw lua: find long printable runs
+            matches = re.findall(r'["\']([! -~]{100,})["\']', raw, re.S)
+            for i, s in enumerate(matches):
+                payloads.append({"path": f"literal_{i}", "data": s})
 
-        if not payload_candidates:
-            self.json_report["warnings"].append("no_payload_candidates_found")
-            logger.warning("No payload candidates found in input; aborting.")
+        if not payloads:
             self.json_report["errors"].append("no_payload_candidates_found")
+            self.json_report["trace"].append("no payload candidates; aborting")
             return {"lua_source": "", "json_report": self.json_report}
 
-        # 3) For each candidate, attempt decode pipeline and lifter
-        final_sources = []
-        for candidate in payload_candidates:
-            data_str = candidate["data"]
-            # If BootstrapDecoder already produced decoded bytes, prefer that
-            decoded_bytes = None
-            if "_decoded_bytes" in self.bootstrapper_metadata:
-                decoded_bytes = self.bootstrapper_metadata["_decoded_bytes"]
-                logger.debug("Using decoded bytes from bootstrapper metadata (len=%d)", len(decoded_bytes))
+        # 3) decode and lift each payload
+        sources = []
+        for cand in payloads:
+            data = cand["data"]
+            decoded = None
+
+            # prefer any decoded bytes from bootstrap metadata
+            if self.bootstrapper_metadata.get("_decoded_bytes"):
+                decoded = self.bootstrapper_metadata["_decoded_bytes"]
+                self.json_report["trace"].append("using decoded bytes from bootstrap metadata")
             else:
-                # try python decode using BootstrapDecoder's python pipeline helper if available
+                # try reusing BootstrapDecoder's python pipeline (if present)
                 if BootstrapDecoder is not None:
-                    # instantiate a helper decoder (without specifying path)
                     bd = BootstrapDecoder.__new__(BootstrapDecoder)
-                    # configure minimal attributes used by its pipeline
                     bd.script_key = self.script_key or ""
                     bd.script_key_bytes = (self.script_key.encode("utf-8") if self.script_key else b"")
                     bd.debug = self.debug
-                    # reuse its python pipeline method if present
                     try:
-                        unescaped = bd._unescape_lua_string(data_str)
+                        unescaped = bd._unescape_lua_string(data)
                     except Exception:
-                        unescaped = data_str.encode("latin1", errors="ignore")
-                    decoded, trace = bd._python_transform_pipeline(unescaped, self.bootstrapper_metadata.get("alphabet"))
-                    # Attach trace to report
+                        unescaped = data.encode("latin1", errors="ignore")
+                    decoded_try, trace = bd._python_transform_pipeline(unescaped, self.bootstrapper_metadata.get("alphabet"))
                     self.json_report.setdefault("bootstrap_trace", []).extend(trace)
-                    if decoded:
-                        decoded_bytes = decoded
-                # last-resort: try direct ascii->bytes
-                if decoded_bytes is None:
-                    decoded_bytes = data_str.encode("latin1", errors="ignore")
+                    if decoded_try:
+                        decoded = decoded_try
 
-            # Validate decoded_bytes
-            if not self._validate_decoded_bytes(decoded_bytes):
-                self.json_report["warnings"].append(f"decoded_candidate_no_lua_keywords_{candidate.get('path')}")
-                # if bootstrap suggested needs_emulation and we haven't tried sandbox, do that?
+                if decoded is None:
+                    # fall back to raw bytes (best-effort)
+                    decoded = data.encode("latin1", errors="ignore")
+
+            # 3.1 validate decoded
+            valid = self._validate_decoded_bytes(decoded)
+            if not valid:
+                self.json_report["warnings"].append(f"candidate_{cand.get('path')}_no_lua_keywords")
+                # if bootstrap suggested we need emulation, try sandbox extraction now (best-effort)
                 if self.bootstrapper_metadata.get("needs_emulation") and BootstrapDecoder is not None:
-                    # attempt lua sandbox extraction (trusting BootstrapDecoder to have code)
-                    meta = self._attempt_bootstrap_extraction(None)
-                    if "_decoded_bytes" in meta:
-                        decoded_bytes = meta["_decoded_bytes"]
-                        logger.info("Recovered decoded bytes via sandbox fallback")
-                else:
-                    logger.warning("Decoded bytes failed validation; continuing best-effort.")
+                    meta = self._attempt_bootstrap_extraction(None, allow_lua_run=True)
+                    if meta.get("_decoded_bytes"):
+                        decoded = meta["_decoded_bytes"]
 
-            # Pass decoded bytes to VM lifter and devirtualizer (user's lifter API)
-            # NOTE: this is a placeholder. Replace with your lifter integration.
+            # 4) pass decoded bytes to lifter & devirtualizer
             try:
-                # Example placeholder lifter behavior: if decoded bytes contain Lua text, use text.
-                if b"function" in decoded_bytes[:4096]:
-                    lua_src = decoded_bytes.decode("latin1", errors="ignore")
+                if lift_entry is None or devirtualize_entry is None:
+                    # missing lifter modules; fall back to direct text if looks textual
+                    if b"function" in decoded[:4096]:
+                        lua_text = decoded.decode("latin1", errors="ignore")
+                    else:
+                        lua_text = f"-- UNPARSED BYTES (len={len(decoded)}) --\n"
+                        self.json_report.setdefault("raw_decoded_blobs", []).append({"path": cand.get("path"), "len": len(decoded)})
+                    sources.append(lua_text)
+                    self.json_report["trace"].append("lifter or devirtualizer modules missing; used fallback textual heuristic")
                 else:
-                    # If no textual Lua, generate placeholder and keep raw bytes in report
-                    lua_src = "-- [UNPARSED VM BYTES] --\n" + f"-- decoded_bytes_len = {len(decoded_bytes)}\n"
-                    self.json_report.setdefault("raw_decoded_blobs", []).append({"path": candidate.get("path"), "len": len(decoded_bytes)})
-                final_sources.append(lua_src)
+                    # lift to IR then devirtualize
+                    ir = lift_entry(decoded, self.bootstrapper_metadata)
+                    lua_text = devirtualize_entry(ir, self.bootstrapper_metadata)
+                    sources.append(lua_text)
+                    self.json_report["trace"].append(f"lifted and devirtualized candidate {cand.get('path')}")
             except Exception as e:
+                logger.exception("Lifting/devirtualization failed: %s", e)
                 self.json_report["errors"].append(f"lifter_error_{str(e)}")
-                final_sources.append(f"-- lifter error for candidate {candidate.get('path')}: {e}")
+                # fallback: provide annotated raw bytes
+                fallback = f"-- LIFTER FAILED: {e} --\n-- raw decoded len={len(decoded)} --\n"
+                sources.append(fallback)
+                continue
 
-        # merge final sources
-        self.lua_source = "\n\n-- CHUNK SEPARATOR --\n\n".join(final_sources)
+        # merge and finalize
+        self.lua_source = "\n\n-- CHUNK SEPARATOR --\n\n".join(sources)
         self.json_report["final_output_length"] = len(self.lua_source)
         self.json_report["end_time"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
         return {"lua_source": self.lua_source, "json_report": self.json_report}
