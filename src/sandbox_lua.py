@@ -653,12 +653,13 @@ def run_bootstrapper(
     for key in sorted(opcode_map.keys())[:10]:
         opcode_sample.append({"id": key, "name": opcode_map[key]})
 
-    alphabet_preview = None
+    alphabet_preview: Optional[str] = None
     alphabet_len = len(alphabet) if isinstance(alphabet, str) else 0
-    if alphabet_len:
-        alphabet_preview = alphabet[:64]
+    if alphabet_len and isinstance(alphabet, str):
+        preview = alphabet[:64]
         if alphabet_len > 64:
-            alphabet_preview += "..."
+            preview += "..."
+        alphabet_preview = preview
 
     rank = opcode_stats.get("rank", -1)
     if rank >= 2 and alphabet_len >= 80:

@@ -163,20 +163,10 @@ class LuaDeobfuscator:
                     setattr(self, "manual_alphabet", self._manual_alphabet)
             except Exception:  # pragma: no cover - defensive
                 pass
-            try:
-                if not getattr(ctx, "manual_alphabet", None):
-                    setattr(ctx, "manual_alphabet", self._manual_alphabet)
-            except Exception:  # pragma: no cover - defensive
-                pass
         if self._manual_opcode_map:
             try:
                 if not getattr(self, "manual_opcode_map", None):
                     setattr(self, "manual_opcode_map", dict(self._manual_opcode_map))
-            except Exception:  # pragma: no cover - defensive
-                pass
-            try:
-                if not getattr(ctx, "manual_opcode_map", None):
-                    setattr(ctx, "manual_opcode_map", dict(self._manual_opcode_map))
             except Exception:  # pragma: no cover - defensive
                 pass
 
@@ -931,6 +921,19 @@ class LuaDeobfuscator:
             debug_bootstrap=self._debug_bootstrap,
             bootstrap_debug_log=self._bootstrap_debug_log,
         )
+        if self._manual_alphabet:
+            try:
+                if not getattr(ctx, "manual_alphabet", None):
+                    setattr(ctx, "manual_alphabet", self._manual_alphabet)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if self._manual_opcode_map:
+            manual_opcodes = dict(self._manual_opcode_map)
+            try:
+                if not getattr(ctx, "manual_opcode_map", None):
+                    setattr(ctx, "manual_opcode_map", manual_opcodes)
+            except Exception:  # pragma: no cover - defensive
+                pass
         try:
             decoder = InitV4Decoder(ctx)
         except Exception as exc:  # pragma: no cover - defensive
