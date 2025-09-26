@@ -72,6 +72,8 @@ class LuaDeobfuscator:
         bootstrapper: str | os.PathLike[str] | Path | None = None,
         debug_bootstrap: bool = False,
         allow_lua_run: bool = False,
+        manual_alphabet: str | None = None,
+        manual_opcode_map: Mapping[int, str] | None = None,
     ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
@@ -88,6 +90,18 @@ class LuaDeobfuscator:
         self._last_handler: VersionHandler | None = None
         self._debug_bootstrap = bool(debug_bootstrap)
         self._allow_lua_run = bool(allow_lua_run)
+        self._manual_alphabet = manual_alphabet.strip() if manual_alphabet else None
+        self._manual_opcode_map: Dict[int, str] = {}
+        if manual_opcode_map:
+            for key, value in manual_opcode_map.items():
+                try:
+                    opcode = int(key)
+                except (TypeError, ValueError):
+                    continue
+                name = str(value).strip()
+                if not name:
+                    continue
+                self._manual_opcode_map[opcode] = name.upper()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._bootstrap_debug_log = Path("logs") / f"bootstrap_extract_debug_{timestamp}.log"
         self._bootstrap_meta: Dict[str, Any] = {}
@@ -143,6 +157,19 @@ class LuaDeobfuscator:
         if self._bootstrapper_path is not None:
             metadata["bootstrapper_path"] = str(self._bootstrapper_path)
 
+        if self._manual_alphabet:
+            try:
+                if not getattr(self, "manual_alphabet", None):
+                    setattr(self, "manual_alphabet", self._manual_alphabet)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if self._manual_opcode_map:
+            try:
+                if not getattr(self, "manual_opcode_map", None):
+                    setattr(self, "manual_opcode_map", dict(self._manual_opcode_map))
+            except Exception:  # pragma: no cover - defensive
+                pass
+
         force_flag = bool(force)
 
         def feature_enabled(flag: str) -> bool:
@@ -183,7 +210,24 @@ class LuaDeobfuscator:
                 setattr(handler_instance, "allow_lua_run", bool(allow_lua_run))
             except Exception:  # pragma: no cover - defensive
                 pass
-            if self._bootstrapper_path is not None:
+            if self._manual_alphabet or self._manual_opcode_map:
+                manual_hook = getattr(
+                    handler_instance, "apply_manual_bootstrap_overrides", None
+                )
+                if callable(manual_hook):
+                    try:
+                        manual_hook(
+                            alphabet=self._manual_alphabet,
+                            opcode_map=dict(self._manual_opcode_map)
+                            if self._manual_opcode_map
+                            else None,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+            if (
+                self._bootstrapper_path is not None
+                and not (self._manual_alphabet or self._manual_opcode_map)
+            ):
                 setter = getattr(handler_instance, "set_bootstrapper", None)
                 if callable(setter):
                     try:
@@ -877,6 +921,19 @@ class LuaDeobfuscator:
             debug_bootstrap=self._debug_bootstrap,
             bootstrap_debug_log=self._bootstrap_debug_log,
         )
+        if self._manual_alphabet:
+            try:
+                if not getattr(ctx, "manual_alphabet", None):
+                    setattr(ctx, "manual_alphabet", self._manual_alphabet)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if self._manual_opcode_map:
+            manual_opcodes = dict(self._manual_opcode_map)
+            try:
+                if not getattr(ctx, "manual_opcode_map", None):
+                    setattr(ctx, "manual_opcode_map", manual_opcodes)
+            except Exception:  # pragma: no cover - defensive
+                pass
         try:
             decoder = InitV4Decoder(ctx)
         except Exception as exc:  # pragma: no cover - defensive

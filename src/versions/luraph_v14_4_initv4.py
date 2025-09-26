@@ -29,6 +29,9 @@ DEFAULT_ALPHABET = (
 )
 
 
+_SANITISE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
 def decode_blob(blob_str: str, alphabet: Optional[str], key_bytes: bytes) -> bytes:
     """Decode an initv4 payload chunk using *alphabet* and *key_bytes*.
 
@@ -116,6 +119,9 @@ class InitV4Decoder:
         self._bootstrap_decoder_success = False
         self._bootstrap_needs_emulation = False
         self._bootstrap_warnings: List[str] = []
+        self._manual_override = False
+        self._manual_override_alphabet = False
+        self._manual_override_opcode_map = False
         self._debug_bootstrap = bool(getattr(ctx, "debug_bootstrap", False))
         raw_log = getattr(ctx, "bootstrap_debug_log", None)
         try:
@@ -132,6 +138,29 @@ class InitV4Decoder:
         self._default_opcodes: Dict[int, str] = dict(
             default_opcodes or self._DEFAULT_OPCODE_TABLE
         )
+
+        manual_alphabet = getattr(ctx, "manual_alphabet", None)
+        if isinstance(manual_alphabet, str) and manual_alphabet.strip():
+            self.alphabet = manual_alphabet.strip()
+            self._manual_override = True
+            self._manual_override_alphabet = True
+
+        manual_opcode_map = getattr(ctx, "manual_opcode_map", None)
+        if isinstance(manual_opcode_map, Mapping):
+            cleaned_map: Dict[int, str] = {}
+            for key, name in manual_opcode_map.items():
+                try:
+                    opcode = int(key)
+                except (TypeError, ValueError):
+                    continue
+                cleaned = str(name).strip().upper()
+                if cleaned:
+                    cleaned_map[opcode] = cleaned
+            if cleaned_map:
+                self.opcode_map.update(cleaned_map)
+                self._has_custom_opcodes = True
+                self._manual_override = True
+                self._manual_override_opcode_map = True
 
         candidate = getattr(ctx, "bootstrapper_path", None)
         path_for_decoder: Optional[str] = None
@@ -154,22 +183,66 @@ class InitV4Decoder:
             path_for_decoder = str(candidate)
             self._bootstrap_source = path_for_decoder
 
-        if path_for_decoder and self._script_key_bytes:
+        if (
+            not self._manual_override
+            and path_for_decoder
+            and self._script_key_bytes
+        ):
             self._run_bootstrap_decoder(path_for_decoder)
-        elif path_for_decoder and not self._script_key_bytes:
+        elif path_for_decoder and not self._script_key_bytes and not self._manual_override:
             _bootstrap_log(
                 logging.WARNING,
                 "Script key missing; bootstrap decoder cannot run.",
             )
             self._bootstrap_warnings.append("script_key_missing")
 
-        if self._bootstrap is not None:
+        sandbox_metadata: Optional[Dict[str, Any]] = None
+        if (
+            not self._manual_override
+            and self._bootstrap_needs_emulation
+            and getattr(self.ctx, "allow_lua_run", False)
+        ):
+            bootstrap_text: Optional[str] = None
+            if self._bootstrap is not None:
+                bootstrap_text = self._bootstrap.text
+            if not bootstrap_text and self._bootstrap_path is not None:
+                try:
+                    bootstrap_text = self._bootstrap_path.read_text(
+                        encoding="utf-8",
+                        errors="ignore",
+                    )
+                except Exception:  # pragma: no cover - best effort
+                    LOG.debug("Failed to read bootstrap path for sandbox", exc_info=True)
+            if not bootstrap_text and self._bootstrap_source:
+                try:
+                    bootstrap_text = Path(self._bootstrap_source).read_text(
+                        encoding="utf-8",
+                        errors="ignore",
+                    )
+                except Exception:  # pragma: no cover - best effort
+                    LOG.debug("Failed to load bootstrap source for sandbox", exc_info=True)
+
+            if bootstrap_text:
+                sandbox_metadata = self._run_lua_sandbox(bootstrap_text)
+
+        if self._bootstrap is not None and not self._manual_override:
             text = self._bootstrap.text or ""
             if text and not self.alphabet:
                 match = re.search(r'alphabet\s*=\s*"([^"]+)"', text)
                 if match and _is_probably_alphabet(match.group(1)):
                     self.alphabet = match.group(1)
             self._prepare_from_bootstrap(self._bootstrap)
+
+        if sandbox_metadata:
+            merged_meta: Dict[str, Any] = {}
+            if isinstance(self.bootstrap_metadata, Mapping):
+                merged_meta.update(self.bootstrap_metadata)
+            merged_meta.update(sandbox_metadata)
+            self.bootstrap_metadata = merged_meta
+            try:
+                setattr(self.ctx, "bootstrapper_metadata", dict(merged_meta))
+            except Exception:  # pragma: no cover - defensive
+                LOG.debug("Failed to propagate sandbox metadata to ctx", exc_info=True)
 
         self._finalise_bootstrap_metadata()
 
@@ -272,6 +345,178 @@ class InitV4Decoder:
             LOG.debug("Failed to set ctx.bootstrapper_metadata", exc_info=True)
 
         self._ingest_bootstrap_metadata(metadata)
+
+    # ------------------------------------------------------------------
+    def _sandbox_artifact_info(self) -> Tuple[Path, str]:
+        logs_dir = getattr(self.ctx, "logs_dir", None)
+        base: Path
+        if logs_dir:
+            try:
+                base = Path(logs_dir)
+            except TypeError:
+                base = Path("out") / "logs"
+        else:
+            base = Path("out") / "logs"
+
+        source = getattr(self.ctx, "input_path", None)
+        stem = "bootstrap"
+        if isinstance(source, Path):
+            stem = source.stem or source.name
+        elif isinstance(source, str):
+            try:
+                candidate = Path(source)
+            except Exception:
+                stem = source
+            else:
+                stem = candidate.stem or candidate.name
+
+        safe = _SANITISE_RE.sub("_", stem)[:60]
+        return base, safe or "bootstrap"
+
+    # ------------------------------------------------------------------
+    def _run_lua_sandbox(self, bootstrap_text: str) -> Optional[Dict[str, Any]]:
+        if not bootstrap_text or not getattr(self.ctx, "allow_lua_run", False):
+            return None
+
+        try:  # local import to avoid mandatory dependency
+            from .. import sandbox_lua
+        except Exception as exc:  # pragma: no cover - optional dependency missing
+            _bootstrap_log(
+                logging.WARNING,
+                "Lua sandbox unavailable: %s",
+                exc,
+            )
+            self._bootstrap_warnings.append("lua_sandbox_unavailable")
+            LOG.debug("Lua sandbox import failure", exc_info=True)
+            return None
+
+        try:
+            result = sandbox_lua.run_bootstrapper(
+                bootstrap_text,
+                self.script_key or "",
+            )
+        except Exception as exc:
+            _bootstrap_log(logging.WARNING, "Lua sandbox execution failed: %s", exc)
+            self._bootstrap_warnings.append("lua_sandbox_failed")
+            LOG.debug("Lua sandbox execution failed", exc_info=True)
+            return None
+
+        if not isinstance(result, Mapping):
+            return None
+
+        alphabet = result.get("alphabet")
+        opcode_map_raw = result.get("opcode_map")
+        constants_raw = result.get("constants")
+        sandbox_log = result.get("log") or ""
+        report_raw = result.get("report")
+        report: Dict[str, Any] = {}
+        if isinstance(report_raw, Mapping):
+            report = dict(report_raw)
+
+        normalised_opcodes: Dict[int, str] = {}
+        if isinstance(opcode_map_raw, Mapping):
+            for key, value in opcode_map_raw.items():
+                try:
+                    opcode = int(key)
+                except (TypeError, ValueError):
+                    continue
+                name = str(value).strip().upper()
+                if name:
+                    normalised_opcodes[opcode] = name
+
+        normalised_constants: Dict[str, int] = {}
+        if isinstance(constants_raw, Mapping):
+            for key, value in constants_raw.items():
+                try:
+                    numeric = int(value)
+                except (TypeError, ValueError):
+                    continue
+                normalised_constants[str(key)] = numeric
+
+        logs_dir, safe_name = self._sandbox_artifact_info()
+        log_path = logs_dir / f"bootstrap_decode_trace_{safe_name}.log"
+        metadata_path = logs_dir / f"bootstrapper_metadata_{safe_name}.json"
+
+        try:
+            logs_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:  # pragma: no cover - best effort
+            LOG.debug("Failed to create sandbox log directory", exc_info=True)
+
+        try:
+            log_path.write_text(str(sandbox_log), encoding="utf-8")
+        except Exception:  # pragma: no cover - best effort
+            LOG.debug("Failed to write sandbox trace log", exc_info=True)
+
+        reported_alphabet_len = report.get("alphabet_len")
+        if not isinstance(reported_alphabet_len, int):
+            reported_alphabet_len = len(alphabet) if isinstance(alphabet, str) else 0
+        reported_opcode_count = report.get("opcode_map_count")
+        if not isinstance(reported_opcode_count, int):
+            reported_opcode_count = len(normalised_opcodes)
+
+        metadata_payload: Dict[str, Any] = {
+            "alphabet": alphabet,
+            "alphabet_len": reported_alphabet_len,
+            "opcode_map": normalised_opcodes,
+            "opcode_map_count": reported_opcode_count,
+            "constants": normalised_constants,
+            "constants_count": len(normalised_constants),
+            "extraction_method": "lua_sandbox",
+            "extraction_log": str(log_path),
+            "needs_emulation": False,
+            "script_key_len": len(self.script_key or ""),
+        }
+        if "alphabet_preview" in report:
+            metadata_payload["alphabet_preview"] = report.get("alphabet_preview")
+        if "opcode_sample" in report:
+            metadata_payload["opcode_map_sample"] = report.get("opcode_sample")
+        if "extraction_confidence" in report:
+            metadata_payload["extraction_confidence"] = report.get("extraction_confidence")
+        if "function_name_source" in report:
+            metadata_payload["function_name_source"] = report.get("function_name_source")
+        if sandbox_log:
+            metadata_payload["sandbox_log"] = str(sandbox_log)
+
+        if self._bootstrap_path is not None:
+            metadata_payload.setdefault("path", str(self._bootstrap_path))
+        elif self._bootstrap_source:
+            metadata_payload.setdefault("source", self._bootstrap_source)
+
+        try:
+            metadata_path.write_text(
+                json.dumps(metadata_payload, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            metadata_payload["metadata_path"] = str(metadata_path)
+        except Exception:  # pragma: no cover - best effort
+            LOG.debug("Failed to write sandbox metadata", exc_info=True)
+
+        if isinstance(alphabet, str) and alphabet.strip():
+            self.alphabet = alphabet
+
+        if normalised_opcodes:
+            if not self.opcode_map:
+                self.opcode_map = {}
+            self.opcode_map.update(normalised_opcodes)
+            self._has_custom_opcodes = True
+
+        if normalised_constants:
+            for key, value in normalised_constants.items():
+                self.constants[key] = value
+
+        self._bootstrap_needs_emulation = False
+        self._bootstrap_warnings.append("lua_sandbox")
+
+        _bootstrap_log(
+            logging.INFO,
+            "Lua sandbox recovered alphabet length %d and %d opcode entries.",
+            metadata_payload.get("alphabet_len", 0),
+            metadata_payload.get("opcode_map_count", 0),
+        )
+
+        self._ingest_bootstrap_metadata(metadata_payload)
+
+        return metadata_payload
 
     # ------------------------------------------------------------------
     def _ingest_bootstrap_metadata(self, metadata: Mapping[str, Any]) -> None:
@@ -433,21 +678,37 @@ class InitV4Decoder:
             decoder_summary["blobs"] = [dict(entry) for entry in self._bootstrap_decoder_blobs]
 
         dispatch_map = {f"0x{opcode:02X}": name for opcode, name in sorted(opcode_map.items())}
+        alphabet_source = "bootstrapper" if alphabet else "default"
+        if self._manual_override_alphabet and alphabet:
+            alphabet_source = "manual_override"
+        opcode_source = "bootstrapper" if opcode_map else "default"
+        if self._manual_override_opcode_map and opcode_map:
+            opcode_source = "manual_override"
         metadata: Dict[str, object] = {
             "alphabet": {
                 "value": alphabet,
                 "length": len(alphabet) if alphabet else 0,
                 "sample": alphabet[:64] if alphabet else "",
-                "source": "bootstrapper" if alphabet else "default",
+                "source": alphabet_source,
             },
             "opcode_dispatch": {
                 "count": len(opcode_map),
                 "mapping": dispatch_map,
+                "source": opcode_source,
             },
             "constants": constants,
             "decoder": decoder_summary,
             "needs_emulation": self._bootstrap_needs_emulation,
         }
+        metadata["alphabet_len"] = len(alphabet) if alphabet else 0
+        metadata["alphabet_preview"] = alphabet[:64] if alphabet else ""
+        metadata["opcode_map_count"] = len(opcode_map)
+        if self._manual_override:
+            metadata["extraction_method"] = "manual_override"
+            metadata["manual_override"] = {
+                "alphabet": self._manual_override_alphabet,
+                "opcode_map": self._manual_override_opcode_map,
+            }
         if self._bootstrap_path is not None:
             metadata["path"] = str(self._bootstrap_path)
         elif self._bootstrap_source:
@@ -477,6 +738,8 @@ class InitV4Decoder:
             {"opcode": f"0x{opcode:02X}", "mnemonic": name}
             for opcode, name in list(sorted(opcode_map.items()))[:10]
         ]
+        if opcode_preview:
+            metadata["opcode_map_sample"] = opcode_preview
         dump_payload = {
             "path": str(self._bootstrap_path) if self._bootstrap_path else None,
             "warnings": warnings,

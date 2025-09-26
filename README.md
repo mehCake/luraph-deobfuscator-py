@@ -71,6 +71,8 @@ Frequently used flags:
 | `--bootstrapper PATH` | Load an initv4 stub to recover its alphabet/opcode table automatically |
 | `--debug-bootstrap` | Dump detailed bootstrapper extraction logs and raw regex matches |
 | `--allow-lua-run` | Permit the sandboxed Lua fallback when Python decoding fails |
+| `--alphabet STRING` | Force a manual initv4 alphabet and skip bootstrap extraction |
+| `--opcode-map-json PATH` | Provide a JSON opcode dispatch map instead of extracting it |
 | `--yes` | Auto-confirm detected versions and bootstrapper prompts |
 | `--force` | Continue even if required data (such as `--script-key`) is missing |
 | `--verbose` | Enable colourised console logging alongside `deobfuscator.log` |
@@ -113,6 +115,9 @@ CLI exposes two options that mirror this workflow:
 - `--bootstrapper` – point at the accompanying `initv4.lua` (or a directory
   containing it) so the deobfuscator can harvest the custom alphabet and opcode
   dispatch table automatically.
+- `--alphabet` / `--opcode-map-json` – supply trusted overrides for the
+  bootstrap alphabet or opcode table.  When either flag is used the tool skips
+  bootstrap extraction entirely and relies on the provided data.
 
 When both arguments are present the CLI favours the script key on the command
 line but still uses the bootstrapper metadata to remap opcodes.  If the key is

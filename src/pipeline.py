@@ -205,6 +205,8 @@ class Context:
     force: bool = False
     debug_bootstrap: bool = False
     allow_lua_run: bool = False
+    manual_alphabet: Optional[str] = None
+    manual_opcode_map: Optional[Dict[int, str]] = None
     temp_paths: Dict[str, Path] = field(default_factory=dict)
     vm: VMPayload = field(default_factory=VMPayload)
     vm_metadata: Dict[str, Any] = field(default_factory=dict)
@@ -230,6 +232,9 @@ class Context:
                 script_key=self.script_key,
                 bootstrapper=self.bootstrapper_path,
                 debug_bootstrap=debug_flag,
+                allow_lua_run=self.allow_lua_run,
+                manual_alphabet=self.manual_alphabet,
+                manual_opcode_map=self.manual_opcode_map,
             )
         if self.script_key and not self.report.script_key_used:
             self.report.script_key_used = self.script_key

@@ -335,6 +335,47 @@ class BootstrapDecoder:
         metadata["fallback_attempted"] = bool(metadata.get("fallback_attempted"))
         metadata["fallback_executed"] = bool(metadata.get("fallback_executed"))
 
+        # Provide a stable opcode sample preview for downstream consumers.
+        opcode_preview: List[Dict[str, str]] = []
+        if metadata.get("opcode_map"):
+            preview_items: List[Tuple[int, str]] = []
+            for raw_opcode, raw_name in metadata["opcode_map"].items():
+                try:
+                    opcode_value = int(raw_opcode)
+                except (TypeError, ValueError):
+                    continue
+                name = str(raw_name).strip()
+                if not name:
+                    continue
+                preview_items.append((opcode_value, name.upper()))
+            preview_items.sort(key=lambda item: item[0])
+            for opcode_value, name in preview_items[:10]:
+                opcode_preview.append(
+                    {"opcode": f"0x{opcode_value:02X}", "mnemonic": name}
+                )
+            if preview_items:
+                metadata["opcode_map_count"] = len(preview_items)
+        if opcode_preview:
+            metadata["opcode_map_sample"] = opcode_preview
+
+        # Heuristic extraction confidence mirrors the Lua sandbox reporter so
+        # the CLI output remains consistent when the sandbox path executes.
+        alphabet_len = int(metadata.get("alphabet_len") or 0)
+        opcode_count = int(metadata.get("opcode_map_count") or 0)
+        if opcode_count >= 32 and alphabet_len >= 80:
+            confidence = "high"
+        elif opcode_count >= 16 and alphabet_len >= 80:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        metadata["extraction_confidence"] = confidence
+
+        # Names recovered from decoded Lua are sourced directly from the
+        # payload comments/strings, so default to "read" when we have any.
+        metadata["function_name_source"] = (
+            "read" if metadata.get("opcode_map") else "inferred"
+        )
+
         success = decoded_any and bool(metadata["alphabet"]) and bool(metadata["opcode_map"])
         if success:
             LOG.info(

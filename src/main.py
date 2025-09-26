@@ -10,7 +10,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline, utils
 from .deobfuscator import LuaDeobfuscator
@@ -295,6 +295,16 @@ def _summarise_bootstrap_metadata(
                 sample_items.append({str(key): str(value)})
     summary["opcode_map_sample"] = sample_items
 
+    confidence = meta.get("extraction_confidence")
+    if not confidence and isinstance(fallback, Mapping):
+        confidence = fallback.get("extraction_confidence")
+    summary["extraction_confidence"] = str(confidence) if confidence else "unknown"
+
+    name_source = meta.get("function_name_source")
+    if not name_source and isinstance(fallback, Mapping):
+        name_source = fallback.get("function_name_source")
+    summary["function_name_source"] = str(name_source) if name_source else "unknown"
+
     constants = meta.get("constants")
     if isinstance(constants, Mapping):
         summary["constants"] = {str(k): v for k, v in constants.items()}
@@ -303,6 +313,13 @@ def _summarise_bootstrap_metadata(
     if not summary["constants"] and isinstance(fallback.get("constants"), Mapping):
         summary["constants"] = {
             str(k): v for k, v in fallback["constants"].items()
+        }
+
+    manual_override = meta.get("manual_override")
+    if isinstance(manual_override, Mapping):
+        summary["manual_override"] = {
+            "alphabet": bool(manual_override.get("alphabet")),
+            "opcode_map": bool(manual_override.get("opcode_map")),
         }
 
     raw_matches_count = meta.get("raw_matches_count")
@@ -627,6 +644,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Allow sandboxed Lua fallback during bootstrap decoding (see security notes)",
     )
+    parser.add_argument(
+        "--alphabet",
+        dest="manual_alphabet",
+        help="Provide an explicit initv4 alphabet (skips bootstrap extraction)",
+    )
+    parser.add_argument(
+        "--opcode-map-json",
+        dest="opcode_map_json",
+        help="Load an opcode dispatch map from JSON (skips bootstrap extraction)",
+    )
     parser.add_argument("--vm-trace", action="store_true", help="capture VM trace logs during execution")
     parser.add_argument("--trace", dest="vm_trace", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--detect-only", action="store_true", help="only detect version information")
@@ -685,6 +712,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=1, help="process inputs in parallel using N workers")
 
     args = parser.parse_args(argv)
+    manual_alphabet = args.manual_alphabet.strip() if args.manual_alphabet else None
+    manual_opcode_map: Optional[Dict[int, str]] = None
+    if manual_alphabet:
+        logging.getLogger(__name__).info(
+            "Using manual alphabet override (%d characters)", len(manual_alphabet)
+        )
+    if args.opcode_map_json:
+        opcode_path = Path(args.opcode_map_json)
+        log = logging.getLogger(__name__)
+        if not opcode_path.exists():
+            log.error("opcode map JSON %s not found", opcode_path)
+            return 2
+        try:
+            payload = json.loads(opcode_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("failed to read opcode map JSON %s: %s", opcode_path, exc)
+            return 2
+        if not isinstance(payload, Mapping):
+            log.error("opcode map JSON must be an object mapping opcodes to names")
+            return 2
+        manual_opcode_map = {}
+        for key, value in payload.items():
+            if isinstance(key, str):
+                try:
+                    opcode = int(key, 0)
+                except ValueError:
+                    log.error("invalid opcode key %r in opcode map", key)
+                    return 2
+            elif isinstance(key, int):
+                opcode = key
+            else:
+                log.error("unsupported opcode key type %r", type(key).__name__)
+                return 2
+            name = str(value).strip()
+            if not name:
+                log.error("opcode %r is missing a mnemonic in opcode map", key)
+                return 2
+            manual_opcode_map[opcode] = name.upper()
+        if not manual_opcode_map:
+            log.error("opcode map JSON %s did not contain any entries", opcode_path)
+            return 2
+        log.info("Loaded %d opcode overrides from %s", len(manual_opcode_map), opcode_path)
     default_pipeline_iterations = parser.get_default("max_iterations")
 
     raw_inputs: List[str] = list(args.inputs)
@@ -774,6 +843,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrapper=bootstrapper_path,
             debug_bootstrap=args.debug_bootstrap,
             allow_lua_run=args.allow_lua_run,
+            manual_alphabet=manual_alphabet,
+            manual_opcode_map=manual_opcode_map,
         )
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
@@ -809,6 +880,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     force=args.force,
                     debug_bootstrap=args.debug_bootstrap,
                     allow_lua_run=args.allow_lua_run,
+                    manual_alphabet=manual_alphabet,
+                    manual_opcode_map=manual_opcode_map,
                 )
                 ctx.options.update(
                     {
@@ -821,6 +894,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "script_key": args.script_key,
                         "debug_bootstrap": args.debug_bootstrap,
                         "allow_lua_run": args.allow_lua_run,
+                        "manual_alphabet": manual_alphabet,
+                        "manual_opcode_map": manual_opcode_map,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()

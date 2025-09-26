@@ -197,6 +197,7 @@ def _decode_attempts(
     script_key: str,
     *,
     alphabet: Optional[str] = None,
+    alphabet_source: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, object]]:
     """Try multiple decode strategies and pick the most plausible result."""
 
@@ -233,7 +234,8 @@ def _decode_attempts(
     if allow_base91:
         alphabet_candidates: List[Tuple[str, Optional[str]]] = []
         if alphabet:
-            alphabet_candidates.append(("bootstrapper", alphabet))
+            label = alphabet_source or "bootstrapper"
+            alphabet_candidates.append((label, alphabet))
         alphabet_candidates.append(("default", None))
 
         seen_alphabets: Set[str] = set()
@@ -355,10 +357,16 @@ def decode_blob_with_metadata(
     script_key: str,
     *,
     alphabet: Optional[str] = None,
+    alphabet_source: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, object]]:
     """Decode *encoded_blob* and return both data and decode metadata."""
 
-    return _decode_attempts(encoded_blob, script_key, alphabet=alphabet)
+    return _decode_attempts(
+        encoded_blob,
+        script_key,
+        alphabet=alphabet,
+        alphabet_source=alphabet_source,
+    )
 
 
 def _extract_script_key(text: str) -> Tuple[Optional[str], Dict[str, str]]:
@@ -475,9 +483,38 @@ class LuraphV1441(VersionHandler):
         self._bootstrapper: InitV4Bootstrap | None = None
         self._bootstrap_meta: Dict[str, object] = {}
         self._alphabet_override: Optional[str] = None
+        self._alphabet_override_source: Optional[str] = None
         self._opcode_override: Dict[int, OpSpec] | None = None
         self._debug_bootstrap: bool = False
         self._bootstrap_debug_log: Optional[Path] = None
+
+    def apply_manual_bootstrap_overrides(
+        self,
+        *,
+        alphabet: Optional[str] = None,
+        opcode_map: Optional[Mapping[int, str]] = None,
+    ) -> None:
+        if alphabet:
+            cleaned = alphabet.strip()
+            if cleaned:
+                self._alphabet_override = cleaned
+                self._alphabet_override_source = "manual_override"
+        if opcode_map:
+            table: Dict[int, OpSpec] = {}
+            for key, name in opcode_map.items():
+                try:
+                    opcode = int(key)
+                except (TypeError, ValueError):
+                    continue
+                cleaned = str(name).strip().upper()
+                if not cleaned:
+                    continue
+                spec = _CANONICAL_OPCODE_SPECS.get(cleaned)
+                if spec is None:
+                    spec = OpSpec(cleaned, ())
+                table[opcode] = spec
+            if table:
+                self._opcode_override = dict(sorted(table.items()))
 
     def matches(self, text: str) -> bool:
         return (
@@ -511,6 +548,12 @@ class LuraphV1441(VersionHandler):
         if decoder.alphabet:
             alphabet = decoder.alphabet
         self._alphabet_override = alphabet
+        if alphabet:
+            self._alphabet_override_source = (
+                "manual_override"
+                if getattr(decoder, "_manual_override_alphabet", False)
+                else "bootstrapper"
+            )
 
         override_table: Dict[int, OpSpec] = dict(table)
         if decoder.has_custom_opcodes() and decoder.opcode_map:
@@ -624,6 +667,7 @@ class LuraphV1441(VersionHandler):
                     chunk,
                     script_key,
                     alphabet=alphabet,
+                    alphabet_source=self._alphabet_override_source,
                 )
                 decoded_parts.append(part)
                 chunk_decoded_bytes.append(len(part))
@@ -704,6 +748,7 @@ class LuraphV1441(VersionHandler):
                 payload.text,
                 script_key,
                 alphabet=alphabet,
+                alphabet_source=self._alphabet_override_source,
             )
         metadata["decoded_bytes"] = len(raw)
         metadata.update({key: value for key, value in decode_meta.items() if key != "decode_attempts"})
