@@ -452,6 +452,65 @@ def _locate_payload_chunks(text: str, *, start: int) -> List[Tuple[str, int, int
 
 _BASE_OPCODE_TABLE: Dict[int, OpSpec] = dict(LuraphV142JSON().opcode_table())
 
+_DEFAULT_OPCODE_TABLE_V1441: Dict[int, str] = {
+    0x00: "BXOR",
+    0x01: "CLOSURE",
+    0x02: "UNM",
+    0x03: "SETGLOBAL",
+    0x04: "LT",
+    0x05: "TESTSET",
+    0x06: "NEWTABLE",
+    0x07: "SETTABLE",
+    0x08: "GETTABLE",
+    0x09: "SELF",
+    0x0A: "SETLIST",
+    0x0B: "GETUPVAL",
+    0x0C: "SETUPVAL",
+    0x0D: "GETGLOBAL",
+    0x0E: "LOADBOOL",
+    0x0F: "CAPTURE",
+    0x10: "NEWCLOSURE",
+    0x11: "LOADK",
+    0x12: "VARARG",
+    0x13: "CALL",
+    0x14: "TAILCALL",
+    0x15: "RETURN",
+    0x16: "ADD",
+    0x17: "SUB",
+    0x18: "MUL",
+    0x19: "DIV",
+    0x1A: "MOD",
+    0x1B: "POW",
+    0x1C: "LOADNIL",
+    0x1D: "BAND",
+    0x1E: "BOR",
+    0x1F: "MOVE",
+    0x20: "BNOT",
+    0x21: "SHL",
+    0x22: "SHR",
+    0x23: "EQ",
+    0x24: "LOADN",
+    0x25: "LE",
+    0x26: "TEST",
+    0x27: "PUSHK",
+    0x28: "JMP",
+    0x29: "FORPREP",
+    0x2A: "FORLOOP",
+    0x2B: "CLOSE",
+}
+
+_CANONICAL_OPCODE_SPECS: Dict[str, OpSpec] = {
+    spec.mnemonic.upper(): spec for spec in _BASE_OPCODE_TABLE.values()
+}
+
+for opcode, mnemonic in _DEFAULT_OPCODE_TABLE_V1441.items():
+    key = mnemonic.upper()
+    spec = _CANONICAL_OPCODE_SPECS.get(key)
+    if spec is None:
+        spec = OpSpec(key, ())
+        _CANONICAL_OPCODE_SPECS[key] = spec
+    _BASE_OPCODE_TABLE[opcode] = spec
+
 _ADDITIONAL_SPECS: Tuple[OpSpec, ...] = (
     OpSpec("NOT", ("a", "b")),
     OpSpec("LEN", ("a", "b")),
@@ -459,7 +518,6 @@ _ADDITIONAL_SPECS: Tuple[OpSpec, ...] = (
     OpSpec("TFORLOOP", ("a", "offset", "c")),
 )
 
-_CANONICAL_OPCODE_SPECS: Dict[str, OpSpec] = {}
 _existing = {spec.mnemonic.upper() for spec in _BASE_OPCODE_TABLE.values()}
 _next_opcode = max(_BASE_OPCODE_TABLE.keys(), default=0) + 1
 for extra in _ADDITIONAL_SPECS:
