@@ -345,7 +345,17 @@ def looks_like_vm_bytecode(
         for byte in data[:probe_len]:
             if isinstance(byte, int) and byte in opcode_map:
                 hits += 1
-        return hits / probe_len >= 0.5
+        hit_ratio = hits / probe_len
+        if hit_ratio >= 0.08:
+            return True
+        # Fall back to checking byte entropy when the opcode hit ratio is low.
+        # Chunked initv4 payloads frequently interleave opcode bytes with
+        # operands, resulting in far fewer than 50% direct opcode matches even
+        # for valid VM bytecode streams.  Retaining the printable heuristic
+        # avoids misclassifying these payloads as non-bytecode.
+        non_printable = sum(1 for byte in data[:probe_len] if byte < 32 or byte > 126)
+        threshold = int(0.3 * probe_len)
+        return non_printable >= threshold
 
     non_printable = sum(1 for byte in data[:probe_len] if byte < 32 or byte > 126)
     threshold = int(0.3 * probe_len)
