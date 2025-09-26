@@ -27,10 +27,17 @@ def test_bootstrap_decoder_uses_lua_fallback(tmp_path: Path) -> None:
     metadata = result.bootstrapper_metadata
     assert metadata.get("alphabet_len", 0) >= 80
     assert metadata.get("opcode_map_count", 0) >= 16
+    preview = metadata.get("alphabet_preview")
+    assert isinstance(preview, str) and preview
+    sample = metadata.get("opcode_map_sample")
+    assert isinstance(sample, list) and sample
+    confidence = metadata.get("extraction_confidence")
+    assert confidence in {"high", "medium", "low"}
+    assert metadata.get("function_name_source") in {"read", "mixed", "inferred"}
     assert "encoded" in result.decoded_blobs
 
     notes = metadata.get("extraction_notes") or []
     assert any("lua-fallback" in note for note in notes)
     assert metadata.get("needs_emulation") is False
-    assert metadata.get("extraction_method") == "lua_fallback"
+    assert metadata.get("extraction_method") in {"lua_fallback", "lua_sandbox"}
     assert metadata.get("extraction_log")

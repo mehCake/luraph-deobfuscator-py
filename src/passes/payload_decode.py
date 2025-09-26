@@ -307,7 +307,13 @@ def _iterative_initv4_decode(
         bootstrap_debug_log=getattr(ctx, "deobfuscator", None)
         and getattr(ctx.deobfuscator, "_bootstrap_debug_log", None),
         bootstrapper_metadata=base_meta,
+        manual_alphabet=getattr(ctx, "manual_alphabet", None),
+        manual_opcode_map=getattr(ctx, "manual_opcode_map", None),
+        allow_lua_run=getattr(ctx, "allow_lua_run", False),
     )
+
+    context_manual_alphabet = bool(getattr(ctx, "manual_alphabet", None))
+    context_manual_opcode_map = bool(getattr(ctx, "manual_opcode_map", None))
 
     try:
         decoder = InitV4Decoder(ctx_proxy)
@@ -356,6 +362,16 @@ def _iterative_initv4_decode(
             stripped = _strip_json_quotes_and_escapes(blob)
             encoded_length = len(stripped)
             decoded_bytes = b""
+            manual_alphabet_override = bool(
+                getattr(decoder, "_manual_override_alphabet", False)
+            )
+            manual_opcode_override = bool(
+                getattr(decoder, "_manual_override_opcode_map", False)
+            )
+            if context_manual_alphabet and not manual_alphabet_override:
+                manual_alphabet_override = True
+            if context_manual_opcode_map and not manual_opcode_override:
+                manual_opcode_override = True
 
             try:
                 alphabet = getattr(decoder, "alphabet", None) or INITV4_DEFAULT_ALPHABET
@@ -428,6 +444,8 @@ def _iterative_initv4_decode(
                 }
             )
             alphabet_source = "bootstrapper" if decoder.alphabet else "default"
+            if manual_alphabet_override and decoder.alphabet:
+                alphabet_source = "manual_override"
             chunk_record["alphabet_source"] = alphabet_source
             aggregate_meta.setdefault("chunk_alphabet_sources", []).append(alphabet_source)
             chunk_record["suspicious"] = suspicious
@@ -478,6 +496,8 @@ def _iterative_initv4_decode(
                             opcode_source = table_meta.get("source")
                             if opcode_source:
                                 vm_summary["opcode_table_source"] = opcode_source
+                        if manual_opcode_override and opcode_map:
+                            vm_summary.setdefault("opcode_table_source", "manual_override")
                         aggregate_meta.setdefault("vm_lift_summaries", []).append(dict(vm_summary))
                 else:
                     chunk_record["vm_lift_skipped"] = True

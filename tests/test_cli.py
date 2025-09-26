@@ -5,7 +5,9 @@ import sys
 from pathlib import Path
 
 from src import main as cli_main
+from src.versions.initv4 import InitV4Bootstrap
 from src.versions.luraph_v14_4_1 import (
+    _BASE_OPCODE_TABLE,
     _apply_script_key_transform,
     _encode_base91,
     decode_blob,
@@ -360,7 +362,23 @@ def test_cli_v1441_bootstrapper_only(tmp_path):
     metadata_path = artifacts.get("metadata_path")
     assert decoded_path and (tmp_path / Path(decoded_path)).exists()
     assert metadata_path and (tmp_path / Path(metadata_path)).exists()
-    assert root_bootstrap.get("extraction_method") in {"python_reimpl", "lua_fallback"}
+    assert root_bootstrap.get("extraction_method") in {
+        "python_reimpl",
+        "lua_fallback",
+        "lua_sandbox",
+    }
+    assert root_bootstrap.get("function_name_source") in {
+        "read",
+        "mixed",
+        "inferred",
+        "unknown",
+    }
+    assert root_bootstrap.get("extraction_confidence") in {
+        "high",
+        "medium",
+        "low",
+        "unknown",
+    }
     assert root_bootstrap.get("extraction_log")
 
 
@@ -396,15 +414,76 @@ def test_cli_v1441_script_key_and_bootstrapper(tmp_path):
     artifacts = root_bootstrap.get("artifact_paths") or {}
     assert artifacts.get("decoded_blob_path")
     assert root_bootstrap.get("alphabet_preview")
+    assert root_bootstrap.get("function_name_source") in {
+        "read",
+        "mixed",
+        "inferred",
+        "unknown",
+    }
+    assert root_bootstrap.get("extraction_confidence") in {
+        "high",
+        "medium",
+        "low",
+        "unknown",
+    }
     method = root_bootstrap.get("extraction_method")
     needs_emulation = root_bootstrap.get("needs_emulation")
     if not needs_emulation:
-        assert method in {"python_reimpl", "lua_fallback"}
+        assert method in {"python_reimpl", "lua_fallback", "lua_sandbox", "manual_override"}
     else:
-        assert method in {"python_reimpl", "lua_fallback", "unknown"}
+        assert method in {"python_reimpl", "lua_fallback", "lua_sandbox", "manual_override", "unknown"}
         instructions = root_bootstrap.get("instructions") or []
         assert instructions and any("--allow-lua-run" in msg for msg in instructions)
     assert root_bootstrap.get("extraction_log")
+
+
+def test_cli_manual_bootstrap_overrides(tmp_path):
+    source = _prepare_complex_json(tmp_path)
+    stub_dir = _prepare_bootstrapper(tmp_path)
+
+    bootstrap = InitV4Bootstrap.load(stub_dir)
+    alphabet, _, table, _ = bootstrap.extract_metadata(_BASE_OPCODE_TABLE)
+    assert alphabet, "expected bootstrapper alphabet"
+    manual_alphabet = alphabet
+    manual_map = {opcode: spec.mnemonic for opcode, spec in table.items()}
+    assert manual_map, "expected opcode mappings from bootstrapper"
+
+    opcode_path = tmp_path / "manual_opcodes.json"
+    opcode_payload = {str(opcode): name for opcode, name in manual_map.items()}
+    opcode_path.write_text(json.dumps(opcode_payload, sort_keys=True), encoding="utf-8")
+
+    _run_cli(
+        source,
+        tmp_path,
+        "--script-key",
+        SCRIPT_KEY,
+        "--alphabet",
+        manual_alphabet,
+        "--opcode-map-json",
+        str(opcode_path),
+        "--format",
+        "json",
+    )
+
+    output = source.with_name(f"{source.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+
+    payload_meta = (
+        data.get("passes", {})
+        .get("payload_decode", {})
+        .get("handler_payload_meta", {})
+    )
+    assert payload_meta.get("alphabet_source") == "manual_override"
+
+    root_bootstrap = data.get("bootstrapper_metadata") or {}
+    assert root_bootstrap.get("extraction_method") == "manual_override"
+    assert root_bootstrap.get("alphabet_len") == len(manual_alphabet)
+    assert root_bootstrap.get("opcode_map_count") == len(manual_map)
+    manual_info = root_bootstrap.get("manual_override") or {}
+    assert manual_info.get("alphabet") is True
+    assert manual_info.get("opcode_map") is True
+    instructions = root_bootstrap.get("instructions") or []
+    assert all("--allow-lua-run" not in msg for msg in instructions)
 
 
 def test_debug_bootstrap_logging(tmp_path):
