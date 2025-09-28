@@ -15,6 +15,47 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequ
 from ..utils_pkg.ir import IRBasicBlock, IRInstruction, IRModule
 from ..versions import OpSpec
 
+DEFAULT_OPCODE_TABLE: Dict[int, str] = {
+    0x00: "MOVE",
+    0x01: "LOADK",
+    0x02: "LOADBOOL",
+    0x03: "LOADNIL",
+    0x04: "GETUPVAL",
+    0x05: "GETGLOBAL",
+    0x06: "GETTABLE",
+    0x07: "SETGLOBAL",
+    0x08: "SETUPVAL",
+    0x09: "SETTABLE",
+    0x0A: "NEWTABLE",
+    0x0B: "SELF",
+    0x0C: "ADD",
+    0x0D: "SUB",
+    0x0E: "MUL",
+    0x0F: "DIV",
+    0x10: "MOD",
+    0x11: "POW",
+    0x12: "UNM",
+    0x13: "NOT",
+    0x14: "LEN",
+    0x15: "CONCAT",
+    0x16: "JMP",
+    0x17: "EQ",
+    0x18: "LT",
+    0x19: "LE",
+    0x1A: "TEST",
+    0x1B: "TESTSET",
+    0x1C: "CALL",
+    0x1D: "TAILCALL",
+    0x1E: "RETURN",
+    0x1F: "FORLOOP",
+    0x20: "FORPREP",
+    0x21: "TFORLOOP",
+    0x22: "SETLIST",
+    0x23: "CLOSE",
+    0x24: "CLOSURE",
+    0x25: "VARARG",
+}
+
 LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -268,12 +309,25 @@ class VMLifter:
 
 
 def lift_entry(decoded_bytes: bytes, bootstrapper_metadata: Mapping[str, object]) -> IRModule:
-    opcode_map = bootstrapper_metadata.get("opcode_map") or bootstrapper_metadata.get("opcode_dispatch")
-    if not isinstance(opcode_map, Mapping):
-        raise VMLiftError("Missing opcode map in bootstrap metadata")
+    bytecode = decoded_bytes
+    const_pool: Optional[Sequence[object]] = None
+    opcode_map: Mapping[object, object] | None = None
 
-    specs = {int(key, 0) if isinstance(key, str) else int(key): OpSpec(str(value), ()) for key, value in opcode_map.items()}
-    return VMLifter().lift(decoded_bytes, specs)
+    if isinstance(bootstrapper_metadata, Mapping):
+        opcode_map = bootstrapper_metadata.get("opcode_map") or bootstrapper_metadata.get("opcode_dispatch")
+        const_pool = bootstrapper_metadata.get("vm_constants")  # type: ignore[assignment]
+        if isinstance(const_pool, Mapping):
+            const_pool = list(const_pool.values())  # type: ignore[assignment]
+        if (not bytecode or len(bytecode) % 4) and "_vm_bytecode_bytes" in bootstrapper_metadata:
+            fallback = bootstrapper_metadata.get("_vm_bytecode_bytes")
+            bytecode = _flatten_bytecode(fallback)
+
+    if not bytecode:
+        raise VMLiftError("no bytecode available for lifting")
+
+    specs = _opcode_specs(opcode_map)
+    lifter = VMLifter()
+    return lifter.lift(bytecode, specs, const_pool)
 
 
 def _flatten_bytecode(payload: object) -> bytes:
@@ -296,7 +350,7 @@ def _flatten_bytecode(payload: object) -> bytes:
 
 
 def _opcode_specs(mapping: Mapping[object, object] | None) -> Dict[int, OpSpec]:
-    specs: Dict[int, OpSpec] = {}
+    specs: Dict[int, OpSpec] = {opcode: OpSpec(name, ()) for opcode, name in DEFAULT_OPCODE_TABLE.items()}
     if not isinstance(mapping, Mapping):
         return specs
     for key, value in mapping.items():
