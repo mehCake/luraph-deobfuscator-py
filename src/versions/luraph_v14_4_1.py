@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Sequence
 
 from . import OpSpec, VersionHandler, register_handler
 from .luraph_v14_4_initv4 import decode_blob, decode_blob_with_metadata
@@ -105,9 +105,48 @@ class InitV4_2Handler(VersionHandler):
 register_handler(InitV4_2Handler)
 HANDLER = InitV4_2Handler()
 
+def looks_like_vm_bytecode(blob: Sequence[int] | bytes, opcode_probe: Mapping[int, Any] | None = None) -> bool:
+    """Heuristic check for decoded VM bytecode buffers."""
+
+    if not blob:
+        return False
+
+    data = bytes(blob)
+    if len(data) < 16 or len(data) % 4:
+        return False
+
+    opcodes = []
+    printable = 0
+    for index in range(0, len(data), 4):
+        chunk = data[index : index + 4]
+        if len(chunk) < 4:
+            break
+        opcodes.append(chunk[0])
+        printable += sum(1 for b in chunk if 32 <= b < 127)
+
+    unique_opcodes = {op for op in opcodes}
+    if len(unique_opcodes) < 4:
+        return False
+
+    if printable > len(data) // 2:
+        return False
+
+    if opcode_probe:
+        try:
+            probe_keys = {int(key, 0) if isinstance(key, str) else int(key) for key in opcode_probe.keys()}
+        except Exception:
+            probe_keys = set()
+        if probe_keys:
+            overlap = len(unique_opcodes & probe_keys)
+            if overlap < max(3, len(probe_keys) // 8):
+                return False
+
+    return True
+
 __all__ = [
     "InitV4_2Handler",
     "HANDLER",
     "decode_blob",
     "decode_blob_with_metadata",
+    "looks_like_vm_bytecode",
 ]

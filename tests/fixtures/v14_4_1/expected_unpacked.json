@@ -1,0 +1,21 @@
+{
+  "array": [
+    4,
+    0,
+    {
+      "array": [2, 2, 2]
+    },
+    {
+      "array": [
+        {"array": [null, null, 4, 0, null, 1, 0, 0]},
+        {"array": [null, null, 0, 0, null, 2, 1, null]},
+        {"array": [null, null, 28, 0, null, 2, 2, 1]},
+        {"array": [null, null, 30, 0, null, 0, 0, 0]}
+      ]
+    },
+    {"array": ["print", "hi"]},
+    {"array": []},
+    18,
+    {"array": ["print", "hi"]}
+  ]
+}

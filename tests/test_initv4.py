@@ -8,7 +8,7 @@ from pathlib import Path
 from src.versions.luraph_v14_4_1 import InitV4_2Handler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_KEY = "ppcg208ty9nze5wcoldxh"
+SCRIPT_KEY = "zkzhqwk4b58pjnudvikpf"
 
 
 def test_initv4_cli_round_trip(tmp_path):
