@@ -148,6 +148,38 @@ Installing `lupa>=1.8.0` (LuaJIT must be available on the system) enables this
 fallback path; without it the extractor logs that emulation is required and
 keeps the partially decoded blob under `out/logs/` for manual analysis.
 
+### User-run Lua environment (debug hook toolkit)
+
+Researchers that prefer to experiment outside of the Python pipeline can use
+the tooling under `tools/` (or the mirrored `tools/user_env/` directory) to
+capture and analyse initv4 payloads with their own LuaJIT binary:
+
+1. `devirtualize_v2.lua` injects the `script_key`, attaches a `debug.sethook`
+   handler, runs `initv4.lua`, and dumps the captured `unpackedData` table to
+   `unpacked_dump.lua`/`unpacked_dump.json`.  Once recovered it automatically
+   invokes `lifter.lua` to render a pseudo-IR listing (`lift_ir.lua`) together
+   with a short diagnostic report (`lift_report.txt`).
+2. `lifter.lua` exposes a Lua-based opcode scaffolding where opcode numbers can
+   be mapped to mnemonics incrementally.  The default implementation prints the
+   instruction stream using the canonical Lua 5.1 opcode table.
+3. `reformat_v2.lua` performs block-aware indentation and string merging on
+   decoded Lua text so that the lifted scripts remain readable.
+
+Minimal example (Windows PowerShell shown, adjust for your shell):
+
+```powershell
+cd path\to\luraph-deobfuscator-py
+luajit tools/devirtualize_v2.lua ppcg208ty9nze5wcoldxh
+luajit tools/reformat_v2.lua decoded_output.lua > readable.lua
+```
+
+The versions under `tools/user_env/` remain available for backwards
+compatibility; both sets of scripts share the same behaviour so researchers can
+copy whichever layout they prefer next to `initv4.lua` and `Obfuscated.json`.
+
+See `examples/mini_vm/` for a toy payload and its `expected.lua` output that the
+integration tests use to keep the toolkit exercised.
+
 All bootstrapper transforms now ship with a pure-Python basE91 decoder, so the
 `base91` dependency is optional.  When the library is installed it is used for
 speed; otherwise the bundled implementation transparently takes over.  Missing
@@ -198,6 +230,22 @@ code.
   proceeding.  Pass `--yes` for unattended workflows or CI pipelines.
 
 The CLI emits `<input>_deob.lua` together with `<input>_deob.json` by default.
+
+### User-run Lua environment (Windows / LuaJIT)
+If you want to run the bootstrap locally and get **readable Lua outputs** without touching the Python tooling, see the helper scripts under `tools/user_env/`:
+
+- `tools/user_env/devirtualize.lua`
+- `tools/user_env/reformat.lua`
+- `tools/user_env/run_all.ps1`
+- `tools/user_env/README_user_env.md`
+
+Example PowerShell usage from the repository root:
+
+```powershell
+./tools/user_env/run_all.ps1 -ScriptKey "ppcg208ty9nze5wcoldxh"
+```
+
+This writes `readable.lua` (or chunked `chunkN_readable.lua`) next to your input files.
 The Lua file contains the cleaned, formatted script; the JSON sidecar captures
 detected version data, confirmation status, decoded chunk statistics, VM
 metadata (opcode counts, traps removed, jump tables), warnings, and errors.  Use
