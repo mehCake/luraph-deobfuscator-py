@@ -63,8 +63,13 @@ class BootstrapDecoder:
     """
 
     # Regex patterns
-    _ALPHABET_RE = re.compile(r'(?P<name>\w{0,32})\s*=\s*["\'](?P<val>[^"\']{80,200})["\']')
-    _BLOB_RE = re.compile(r'(?P<name>superflow_bytecode_ext\w*|payload)\s*=\s*["\'](?P<val>(?:\\\d{1,3}|\\x[0-9A-Fa-f]{2}|[^"\']){100,})["\']', re.S)
+    _ALPHABET_RE = re.compile(r'(?P<name>\w{0,32})\s*=\s*["\'](?P<val>[^"\']{85,200})["\']')
+    _BLOB_RE = re.compile(
+        r"(?P<name>superflow_bytecode_ext(?:\d+)?|payload)\s*=\s*['\"]"
+        r"(?P<val>(?:\\\\\d{1,3}|\\\\x[0-9A-Fa-f]{2}|[^'\"]){100,})"
+        r"['\"]",
+        re.S,
+    )
     _GENERIC_LONG_STRING_RE = re.compile(r'["\'](?P<val>[! -~]{160,})["\']', re.S)  # printable run
     _OPCODE_TABLE_RE = re.compile(r'\[\s*0x([0-9A-Fa-f]+)\s*\]\s*=\s*(?:["\']?([A-Za-z0-9_]+)["\']?|function)', re.S)
 
@@ -82,7 +87,7 @@ class BootstrapDecoder:
 
     # ===== lua string unescape helper =====
     def _unescape_lua_string(self, s: str) -> bytes:
-        """
+        r"""
         Convert a Lua string literal body (with escapes like \xHH or \ddd) into raw bytes.
         Handles \xHH hex, \ddd octal, and common C-like escapes.
         """
@@ -149,6 +154,13 @@ class BootstrapDecoder:
             if len(val) >= 160:
                 blobs.append(("long_printable", val))
                 self._debug_log(f"Found long printable blob len={len(val)}")
+                if 85 <= len(val) <= 200 and len(set(val)) >= 60:
+                    alphabets.append(val)
+                    self._debug_log(
+                        "Treating long printable string as alphabet candidate len=%d unique=%d",
+                        len(val),
+                        len(set(val)),
+                    )
 
         # try opcode table textual matches
         opcodes = {}
@@ -162,21 +174,76 @@ class BootstrapDecoder:
         return blobs, alphabets
 
     # ===== heuristics-based python decode =====
-    def _try_base91_decode(self, encoded: bytes) -> Optional[bytes]:
-        """
-        Attempt basE91 decode if library available. If not, try a fallback to base91-python implementation.
-        """
+    _STANDARD_BASE91_ALPHABET = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        "!#$%&()*+,./:;<=>?@[]^_`{|}~\""
+    )
+
+    def _fallback_base91_decode(self, encoded: bytes, alphabet: Optional[str] = None) -> Optional[bytes]:
+        """Decode ``encoded`` using the provided alphabet or the standard basE91 set."""
+
+        if alphabet and len(alphabet) >= 85 and len(set(alphabet)) == len(alphabet):
+            chosen = alphabet
+        else:
+            chosen = self._STANDARD_BASE91_ALPHABET
+        table = {ch: idx for idx, ch in enumerate(chosen)}
+        value = -1
+        buffer = 0
+        bits = 0
+        out = bytearray()
+
+        try:
+            text = encoded.decode("latin1", errors="ignore")
+        except Exception:
+            return None
+
+        for ch in text:
+            if ch.isspace():
+                continue
+            if ch not in table:
+                return None
+            cval = table[ch]
+            if value < 0:
+                value = cval
+                continue
+            value += cval * 91
+            buffer |= value << bits
+            if value & 0x1FFF > 88:
+                bits += 13
+            else:
+                bits += 14
+            while bits >= 8:
+                out.append(buffer & 0xFF)
+                buffer >>= 8
+                bits -= 8
+            value = -1
+
+        if value >= 0:
+            buffer |= value << bits
+            out.append(buffer & 0xFF)
+
+        return bytes(out)
+
+    def _try_base91_decode(self, encoded: bytes, alphabet: Optional[str] = None) -> Optional[bytes]:
+        """Attempt basE91 decoding using ``base91`` when available or the fallback."""
+
         s = encoded.decode("latin1", errors="ignore")
         if base91:
             try:
                 return base91.decode(s)
             except Exception as e:
                 self._debug_log(f"base91.decode failed: {e}")
-                return None
-        else:
-            # Lightweight fallback: attempt to decode using a small implementation if available
-            self._debug_log("base91 library not available; skipping base91 decode.")
-            return None
+        fallback = self._fallback_base91_decode(encoded, alphabet)
+        if fallback is not None:
+            return fallback
+        return None
+
+    def _validate_decoded_blob(self, decoded: bytes) -> bool:
+        sample = (decoded or b"")[:1024].lower()
+        if not sample:
+            return False
+        tokens = (b"function", b"local", b"\x1blua")
+        return any(token in sample for token in tokens)
 
     def _python_transform_pipeline(self, blob_bytes: bytes, alphabet: Optional[str]) -> Tuple[Optional[bytes], List[str]]:
         """
@@ -189,61 +256,70 @@ class BootstrapDecoder:
         trace = []
         decoded = None
 
-        # Step 1: treat blob as ascii encoded base91 (if alphabet present, we prefer base91 lib)
+        # Step 1: attempt basE91 decode when an alphabet or printable data is available
         if alphabet:
-            # If alphabet is provided but base91 lib is missing, we can't do custom base-n easily here
-            if base91:
-                trace.append("attempt base91 via base91 lib")
-                candidate = self._try_base91_decode(blob_bytes)
-                if candidate:
-                    decoded = candidate
-                    trace.append("base91 succeeded")
-            else:
-                trace.append("alphabet present but base91 lib missing; skipping base91 step")
-        else:
-            # try raw base91 decode if looks like printable
-            if all(32 <= b < 127 for b in blob_bytes[:200]) and base91:
-                trace.append("attempt base91 (no alphabet given) via base91 lib")
-                candidate = self._try_base91_decode(blob_bytes)
-                if candidate:
-                    decoded = candidate
-                    trace.append("base91 succeeded (no alphabet)")
+            trace.append("attempt basE91 decode using provided alphabet")
+            candidate = self._try_base91_decode(blob_bytes, alphabet)
+            if candidate:
+                decoded = candidate
+                trace.append("base91 succeeded")
+        elif all(32 <= b < 127 for b in blob_bytes[:200]):
+            trace.append("attempt base91 (no alphabet given)")
+            candidate = self._try_base91_decode(blob_bytes)
+            if candidate:
+                decoded = candidate
+                trace.append("base91 succeeded (no alphabet)")
 
         # If base91 decode not done, assume blob_bytes are raw numeric escape decoded bytes
         if decoded is None:
             trace.append("treating blob as already binary")
             decoded = blob_bytes
 
-        # Step 2: key XOR (if script_key set)
-        if self.script_key_bytes:
-            try:
-                k = self.script_key_bytes
-                out = bytearray(len(decoded))
-                for i, b in enumerate(decoded):
-                    out[i] = b ^ k[i % len(k)]
-                decoded = bytes(out)
-                trace.append("applied key XOR")
-            except Exception as e:
-                trace.append(f"key XOR failed: {e}")
+        def xor_with_key(buf: bytes, label: str) -> bytes:
+            k = self.script_key_bytes
+            out = bytearray(len(buf))
+            for i, b in enumerate(buf):
+                out[i] = b ^ k[i % len(k)]
+            trace.append(f"applied key XOR ({label})")
+            return bytes(out)
 
-        # Step 3: index-mix heuristic
-        try:
-            out = bytearray(len(decoded))
-            for i, b in enumerate(decoded):
+        def index_mix(buf: bytes) -> bytes:
+            out = bytearray(len(buf))
+            for i, b in enumerate(buf):
                 out[i] = b ^ (i & 0xFF)
-            decoded = bytes(out)
             trace.append("applied index XOR (i & 0xFF)")
-        except Exception as e:
-            trace.append(f"index mix failed: {e}")
+            return bytes(out)
 
-        # Quick validation: do we see 'function' or 'local ' in the first kilobyte?
-        sample = decoded[:2048].lower()
-        if b"function" in sample or b"init_fn" in sample or b"local " in sample:
-            trace.append("validation OK: found lua-like keywords in decoded bytes")
-            return decoded, trace
-        else:
-            trace.append("validation failed: no lua-like keywords found in decoded data")
-            return None, trace
+        sequences = []
+        if self.script_key_bytes:
+            sequences.append(("key-index-key", ("xor_pre", "index", "xor_post")))
+            sequences.append(("index-key", ("index", "xor_post")))
+            sequences.append(("key-index", ("xor_pre", "index")))
+            sequences.append(("key-only", ("xor_pre",)))
+        sequences.append(("index-only", ("index",)))
+        sequences.append(("identity", ()))
+
+        for label, steps in sequences:
+            candidate = decoded
+            try:
+                for step in steps:
+                    if step.startswith("xor"):
+                        if not self.script_key_bytes:
+                            raise ValueError("no script key available for XOR step")
+                        candidate = xor_with_key(candidate, step)
+                    elif step == "index":
+                        candidate = index_mix(candidate)
+            except Exception as exc:
+                trace.append(f"{label} transform failed: {exc}")
+                continue
+
+            if self._validate_decoded_blob(candidate):
+                trace.append(f"validation OK after {label} transforms")
+                return candidate, trace
+            trace.append(f"{label} transform failed validation")
+
+        trace.append("validation failed: no lua-like keywords found in decoded data")
+        return None, trace
 
     # ===== Lua sandbox fallback (lupa) =====
     def _lua_sandbox_decode(self, bootstrap_src: str, blob_literal: str, timeout_s: int = 5) -> Tuple[Optional[bytes], Dict[str, Any], List[str]]:
@@ -525,6 +601,8 @@ class BootstrapDecoder:
                     fh.write(src)
                 res.trace.append(f"wrote raw bootstrap source to {raw_out}")
                 res.success = False
+                res.needs_emulation = True
+                res.metadata_dict["needs_emulation"] = True
             return res
 
         except Exception as e:

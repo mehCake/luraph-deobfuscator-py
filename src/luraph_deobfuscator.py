@@ -13,7 +13,7 @@ import os
 import re
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("Deobfuscator")
 logger.setLevel(logging.DEBUG)
@@ -104,6 +104,78 @@ class Deobfuscator:
         sample = b[:4096].lower()
         return b"function" in sample or b"local " in sample or b"init_fn" in sample
 
+    def _extract_payload_candidates(self, text: str, allow_literal_search: bool = False) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            if not allow_literal_search:
+                return payloads
+            matches = re.findall(r'["\']([! -~]{100,})["\']', text, re.S)
+            for idx, match in enumerate(matches):
+                payloads.append({"path": f"literal_{idx}", "data": match})
+            return payloads
+
+        def walk(obj, path: str = ""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    walk(value, f"{path}/{key}")
+            elif isinstance(obj, list):
+                for index, value in enumerate(obj):
+                    walk(value, f"{path}[{index}]")
+            elif isinstance(obj, str) and len(obj) >= 120:
+                payloads.append({"path": path or "root", "data": obj})
+
+        walk(parsed)
+        return payloads
+
+    def _decode_payload_candidate(self, cand: Dict[str, Any]) -> str:
+        data = cand.get("data", "") or ""
+        decoded = None
+
+        if self.bootstrapper_metadata.get("_decoded_bytes"):
+            decoded = self.bootstrapper_metadata["_decoded_bytes"]
+            self.json_report["trace"].append("using decoded bytes from bootstrap metadata")
+        else:
+            if BootstrapDecoder is not None:
+                bd = BootstrapDecoder.__new__(BootstrapDecoder)
+                bd.script_key = self.script_key or ""
+                bd.script_key_bytes = (self.script_key.encode("utf-8") if self.script_key else b"")
+                bd.debug = self.debug
+                try:
+                    unescaped = bd._unescape_lua_string(data)
+                except Exception:
+                    unescaped = data.encode("latin1", errors="ignore")
+                decoded_try, trace = bd._python_transform_pipeline(unescaped, self.bootstrapper_metadata.get("alphabet"))
+                self.json_report.setdefault("bootstrap_trace", []).extend(trace)
+                if decoded_try:
+                    decoded = decoded_try
+
+            if decoded is None:
+                decoded = data.encode("latin1", errors="ignore")
+
+        if not self._validate_decoded_bytes(decoded):
+            self.json_report["warnings"].append(f"candidate_{cand.get('path')}_no_lua_keywords")
+            if self.bootstrapper_metadata.get("needs_emulation") and BootstrapDecoder is not None:
+                meta = self._attempt_bootstrap_extraction(None, allow_lua_run=True)
+                if meta.get("_decoded_bytes"):
+                    decoded = meta["_decoded_bytes"]
+
+        try:
+            if lift_entry is None or devirtualize_entry is None:
+                if b"function" in decoded[:4096]:
+                    return decoded.decode("latin1", errors="ignore")
+                self.json_report.setdefault("raw_decoded_blobs", []).append({"path": cand.get("path"), "len": len(decoded)})
+                return f"-- UNPARSED BYTES (len={len(decoded)}) --\n"
+
+            ir = lift_entry(decoded, self.bootstrapper_metadata)
+            lua_text = devirtualize_entry(ir, self.bootstrapper_metadata)
+            return lua_text
+        except Exception as exc:
+            logger.exception("Lifting/devirtualization failed: %s", exc)
+            self.json_report["errors"].append(f"lifter_error_{str(exc)}")
+            return f"-- LIFTER FAILED: {exc} --\n-- raw decoded len={len(decoded)} --\n"
+
     def run(self) -> Dict[str, Any]:
         self.json_report["start_time"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
         self.json_report["trace"].append("deobfuscation started")
@@ -132,101 +204,55 @@ class Deobfuscator:
                     self.bootstrapper_metadata[k] = v
             self.json_report["passes"].append({"bootstrap_extraction_sandbox": True, "bootstrap_path": candidate})
 
-        # 2) find payload candidates (JSON or raw lua)
+        # 2) extract payloads from input
         raw = read_text(self.input_path)
-        payloads = []
-        try:
-            j = json.loads(raw)
-            # collect string fields >= 120 chars
-            def walk(obj, path=""):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        walk(v, f"{path}/{k}")
-                elif isinstance(obj, list):
-                    for i, v in enumerate(obj):
-                        walk(v, f"{path}[{i}]")
-                elif isinstance(obj, str):
-                    if len(obj) >= 120:
-                        payloads.append({"path": path, "data": obj})
-            walk(j)
-        except Exception:
-            # raw lua: find long printable runs
-            matches = re.findall(r'["\']([! -~]{100,})["\']', raw, re.S)
-            for i, s in enumerate(matches):
-                payloads.append({"path": f"literal_{i}", "data": s})
-
-        if not payloads:
+        pending = self._extract_payload_candidates(raw, allow_literal_search=True)
+        if not pending:
             self.json_report["errors"].append("no_payload_candidates_found")
             self.json_report["trace"].append("no payload candidates; aborting")
             return {"lua_source": "", "json_report": self.json_report}
 
-        # 3) decode and lift each payload
-        sources = []
-        for cand in payloads:
-            data = cand["data"]
-            decoded = None
+        seen_hashes = set()
+        final_sources: List[str] = []
+        iterations_metadata: List[Dict[str, Any]] = []
 
-            # prefer any decoded bytes from bootstrap metadata
-            if self.bootstrapper_metadata.get("_decoded_bytes"):
-                decoded = self.bootstrapper_metadata["_decoded_bytes"]
-                self.json_report["trace"].append("using decoded bytes from bootstrap metadata")
-            else:
-                # try reusing BootstrapDecoder's python pipeline (if present)
-                if BootstrapDecoder is not None:
-                    bd = BootstrapDecoder.__new__(BootstrapDecoder)
-                    bd.script_key = self.script_key or ""
-                    bd.script_key_bytes = (self.script_key.encode("utf-8") if self.script_key else b"")
-                    bd.debug = self.debug
-                    try:
-                        unescaped = bd._unescape_lua_string(data)
-                    except Exception:
-                        unescaped = data.encode("latin1", errors="ignore")
-                    decoded_try, trace = bd._python_transform_pipeline(unescaped, self.bootstrapper_metadata.get("alphabet"))
-                    self.json_report.setdefault("bootstrap_trace", []).extend(trace)
-                    if decoded_try:
-                        decoded = decoded_try
+        for iteration in range(1, self.max_iterations + 1):
+            if not pending:
+                break
+            self.json_report["trace"].append(f"iteration {iteration}: processing {len(pending)} payload(s)")
+            iterations_metadata.append({"iteration": iteration, "payloads": len(pending)})
+            next_pending: List[Dict[str, Any]] = []
+            iteration_outputs: List[str] = []
 
-                if decoded is None:
-                    # fall back to raw bytes (best-effort)
-                    decoded = data.encode("latin1", errors="ignore")
+            for cand in pending:
+                payload_data = cand.get("data")
+                if isinstance(payload_data, str):
+                    key_hash = hash(payload_data)
+                    if key_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(key_hash)
 
-            # 3.1 validate decoded
-            valid = self._validate_decoded_bytes(decoded)
-            if not valid:
-                self.json_report["warnings"].append(f"candidate_{cand.get('path')}_no_lua_keywords")
-                # if bootstrap suggested we need emulation, try sandbox extraction now (best-effort)
-                if self.bootstrapper_metadata.get("needs_emulation") and BootstrapDecoder is not None:
-                    meta = self._attempt_bootstrap_extraction(None, allow_lua_run=True)
-                    if meta.get("_decoded_bytes"):
-                        decoded = meta["_decoded_bytes"]
+                lua_text = self._decode_payload_candidate(cand)
+                iteration_outputs.append(lua_text)
 
-            # 4) pass decoded bytes to lifter & devirtualizer
-            try:
-                if lift_entry is None or devirtualize_entry is None:
-                    # missing lifter modules; fall back to direct text if looks textual
-                    if b"function" in decoded[:4096]:
-                        lua_text = decoded.decode("latin1", errors="ignore")
-                    else:
-                        lua_text = f"-- UNPARSED BYTES (len={len(decoded)}) --\n"
-                        self.json_report.setdefault("raw_decoded_blobs", []).append({"path": cand.get("path"), "len": len(decoded)})
-                    sources.append(lua_text)
-                    self.json_report["trace"].append("lifter or devirtualizer modules missing; used fallback textual heuristic")
-                else:
-                    # lift to IR then devirtualize
-                    ir = lift_entry(decoded, self.bootstrapper_metadata)
-                    lua_text = devirtualize_entry(ir, self.bootstrapper_metadata)
-                    sources.append(lua_text)
-                    self.json_report["trace"].append(f"lifted and devirtualized candidate {cand.get('path')}")
-            except Exception as e:
-                logger.exception("Lifting/devirtualization failed: %s", e)
-                self.json_report["errors"].append(f"lifter_error_{str(e)}")
-                # fallback: provide annotated raw bytes
-                fallback = f"-- LIFTER FAILED: {e} --\n-- raw decoded len={len(decoded)} --\n"
-                sources.append(fallback)
-                continue
+                for extra in self._extract_payload_candidates(lua_text, allow_literal_search=False):
+                    extra_data = extra.get("data")
+                    if isinstance(extra_data, str):
+                        extra_hash = hash(extra_data)
+                        if extra_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(extra_hash)
+                    next_pending.append(extra)
 
-        # merge and finalize
-        self.lua_source = "\n\n-- CHUNK SEPARATOR --\n\n".join(sources)
+            final_sources = iteration_outputs
+            pending = next_pending
+            if not pending:
+                break
+
+        self.json_report["iterations"] = iterations_metadata
+        self.json_report["iterations_run"] = len(iterations_metadata)
+
+        self.lua_source = "\n\n-- CHUNK SEPARATOR --\n\n".join(final_sources)
         self.json_report["final_output_length"] = len(self.lua_source)
         self.json_report["end_time"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
         return {"lua_source": self.lua_source, "json_report": self.json_report}

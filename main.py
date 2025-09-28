@@ -149,7 +149,9 @@ def main():
         logging.info("Detected version: %s (confidence %.2f)", det.get("name"), det.get("confidence", 0.0))
 
         # If version suggests v14.4.1 / initv4, require a script key
-        needs_key = det.get("handler") == "initv4" or "14.4" in det.get("name", "")
+        handler_name = det.get("handler")
+        version_name = det.get("name", "")
+        needs_key = handler_name == "initv4" or version_name == "luraph_v14_4_1"
         if needs_key and not args.script_key and not args.force:
             msg = f"Detected Luraph initv4 (v14.4.x) which requires --script-key. Abort?"
             if not prompt_confirm("No --script-key provided. Abort run? (Y to abort)", auto_yes=args.yes):

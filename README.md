@@ -148,6 +148,12 @@ Installing `lupa>=1.8.0` (LuaJIT must be available on the system) enables this
 fallback path; without it the extractor logs that emulation is required and
 keeps the partially decoded blob under `out/logs/` for manual analysis.
 
+All bootstrapper transforms now ship with a pure-Python basE91 decoder, so the
+`base91` dependency is optional.  When the library is installed it is used for
+speed; otherwise the bundled implementation transparently takes over.  Missing
+`lupa` simply disables the Lua fallback while the Python pipeline continues to
+run.
+
 Debugging bootstrapper extraction works best with `--debug-bootstrap`, which
 prints the recovered alphabet length, opcode previews, and extraction notes to
 the console and writes a full trace to `out/logs/bootstrap_extract_debug_*.log`.
