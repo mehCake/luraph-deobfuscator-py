@@ -64,7 +64,12 @@ class BootstrapDecoder:
 
     # Regex patterns
     _ALPHABET_RE = re.compile(r'(?P<name>\w{0,32})\s*=\s*["\'](?P<val>[^"\']{80,200})["\']')
-    _BLOB_RE = re.compile(r'(?P<name>superflow_bytecode_ext\w*|payload)\s*=\s*["\'](?P<val>(?:\\\d{1,3}|\\x[0-9A-Fa-f]{2}|[^"\']){100,})["\']', re.S)
+    _BLOB_RE = re.compile(
+        r"(?P<name>superflow_bytecode_ext\w*|payload)\s*=\s*['\"]"
+        r"(?P<val>(?:\\\\\d{1,3}|\\\\x[0-9A-Fa-f]{2}|[^'\"]){100,})"
+        r"['\"]",
+        re.S,
+    )
     _GENERIC_LONG_STRING_RE = re.compile(r'["\'](?P<val>[! -~]{160,})["\']', re.S)  # printable run
     _OPCODE_TABLE_RE = re.compile(r'\[\s*0x([0-9A-Fa-f]+)\s*\]\s*=\s*(?:["\']?([A-Za-z0-9_]+)["\']?|function)', re.S)
 
@@ -82,7 +87,7 @@ class BootstrapDecoder:
 
     # ===== lua string unescape helper =====
     def _unescape_lua_string(self, s: str) -> bytes:
-        """
+        r"""
         Convert a Lua string literal body (with escapes like \xHH or \ddd) into raw bytes.
         Handles \xHH hex, \ddd octal, and common C-like escapes.
         """

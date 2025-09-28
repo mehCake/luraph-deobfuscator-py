@@ -1,80 +1,276 @@
-"""
-src/passes/vm_lift.py
+"""VM bytecode lifting helpers.
 
-Luraph VM lifter: convert decoded bytecode into an intermediate representation (IR).
-This integrates with the pipeline in luraph_deobfuscator.py.
-
-Responsibilities:
- - Parse raw decoded VM bytecode into instructions
- - Use opcode_map (from bootstrap_metadata) to label instructions
- - Build IR structures (VMFunction, VMInstruction)
- - Provide IR to downstream devirtualizer (vm_devirtualize)
+The project originally shipped a placeholder module without the ``VMLifter``
+class that the tests rely on.  This implementation provides a minimal yet
+practical lifter capable of translating decoded initv4 bytecode into the IR
+structures defined in :mod:`src.utils_pkg.ir`.
 """
+
+from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-logger = logging.getLogger("passes.vm_lift")
-logger.setLevel(logging.DEBUG)
+from ..utils_pkg.ir import IRBasicBlock, IRInstruction, IRModule
+from ..versions import OpSpec
 
+LOG = logging.getLogger(__name__)
+
+
+@dataclass
 class VMInstruction:
-    def __init__(self, opcode: int, operands: List[int], pc: int, mnemonic: str):
-        self.opcode = opcode
-        self.operands = operands
-        self.pc = pc
-        self.mnemonic = mnemonic
+    opcode: int
+    operands: List[int]
+    pc: int
+    mnemonic: str
 
-    def __repr__(self):
-        return f"<IR pc={self.pc:04X} op={self.opcode:02X} {self.mnemonic} {self.operands}>"
 
+@dataclass
 class VMFunction:
-    def __init__(self):
-        self.instructions: List[VMInstruction] = []
-        self.constants: List[Any] = []
-        self.upvalues: List[Any] = []
-        self.max_stack = 0
+    instructions: List[VMInstruction] = field(default_factory=list)
 
-class LiftError(Exception):
-    pass
 
-def parse_bytecode_into_ir(bytecode: bytes, opcode_map: Dict[int, str], instr_size: int = 4) -> VMFunction:
-    """
-    Parse bytecode into IR. Assumes each instruction is `instr_size` bytes.
-    Default = 4 (common for Lua-like VMs). Adapt this to Luraph’s actual format.
-    """
-    ir = VMFunction()
+@dataclass(frozen=True)
+class _DecodedInstruction:
+    pc: int
+    opcode: int
+    operands: Tuple[int, ...]
+    spec: Optional[OpSpec]
 
-    if len(bytecode) % instr_size != 0:
-        logger.warning("Bytecode len=%d not divisible by instr_size=%d", len(bytecode), instr_size)
 
-    count = len(bytecode) // instr_size
-    for i in range(count):
-        pc = i * instr_size
-        chunk = bytecode[pc:pc + instr_size]
-        if len(chunk) < instr_size:
-            break
+def _friendly_opcode_name(spec: Optional[OpSpec]) -> str:
+    if spec is None:
+        return "UNKNOWN_OP"
+    name = spec.mnemonic.upper()
+    overrides = {
+        "LOADK": "LoadK",
+        "LOADKX": "LoadKx",
+        "LOADBOOL": "LoadBool",
+        "LOADNIL": "LoadNil",
+        "JMP": "Jump",
+        "RETURN": "Return",
+        "CALL": "Call",
+        "TAILCALL": "TailCall",
+        "CLOSURE": "Closure",
+    }
+    if name in overrides:
+        return overrides[name]
 
-        opcode = chunk[0]
-        operands = list(chunk[1:])
-        mnemonic = opcode_map.get(opcode, f"OP_{opcode:02X}")
-        instr = VMInstruction(opcode, operands, pc, mnemonic)
-        ir.instructions.append(instr)
+    parts = name.split("_")
+    result: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if len(part) == 1:
+            result.append(part.upper())
+        elif part.isupper():
+            result.append(part[:-1].capitalize() + part[-1])
+        else:
+            result.append(part.capitalize())
+    return "".join(result) if result else name.title()
 
-        logger.debug("Lifted %s", instr)
 
-    return ir
+class VMLiftError(Exception):
+    """Raised when bytecode cannot be converted into IR."""
 
-def lift_entry(decoded_bytes: bytes, bootstrapper_metadata: Dict[str, Any]) -> VMFunction:
-    """
-    Entrypoint: lift decoded VM bytecode into IR.
-    """
+
+class VMLifter:
+    """Translate decoded VM bytecode into :class:`IRModule` objects."""
+
+    instr_size: int = 4
+
+    def lift(
+        self,
+        bytecode: bytes,
+        opcode_table: Mapping[int, OpSpec],
+        consts: Optional[Sequence[object]] = None,
+    ) -> IRModule:
+        const_pool = list(consts) if consts is not None else []
+        decoded = list(self._decode_stream(bytecode, opcode_table))
+        if not decoded:
+            raise VMLiftError("no bytecode to lift")
+
+        block_map, order, register_types, warnings = self._build_blocks(decoded, const_pool)
+        entry_label = order[0]
+        module = IRModule(
+            blocks=block_map,
+            order=order,
+            entry=entry_label,
+            register_types=register_types,
+            constants=const_pool,
+            warnings=warnings,
+        )
+        module.bytecode_size = len(bytecode)
+
+        for label in module.order:
+            block = module.blocks[label]
+            module.instructions.extend(block.instructions)
+
+        return module
+
+    # ------------------------------------------------------------------
+    def _decode_stream(
+        self, bytecode: bytes, opcode_table: Mapping[int, OpSpec]
+    ) -> Iterable[_DecodedInstruction]:
+        size = self.instr_size
+        if len(bytecode) % size:
+            LOG.warning(
+                "Bytecode length %%d is not a multiple of instruction size %%d", len(bytecode), size
+            )
+        for pc in range(0, len(bytecode), size):
+            chunk = bytecode[pc : pc + size]
+            if len(chunk) < size:
+                break
+            opcode = chunk[0]
+            operands = tuple(chunk[1:])
+            spec = opcode_table.get(opcode)
+            yield _DecodedInstruction(pc, opcode, operands, spec)
+
+    # ------------------------------------------------------------------
+    def _build_blocks(
+        self, decoded: List[_DecodedInstruction], const_pool: Sequence[object]
+    ) -> Tuple[Dict[str, IRBasicBlock], List[str], Dict[int, str], List[str]]:
+        block_starts = {decoded[0].pc}
+        last_pc = decoded[-1].pc
+
+        for inst in decoded:
+            next_pc = inst.pc + self.instr_size
+            mnemonic = inst.spec.mnemonic.upper() if inst.spec else ""
+            if mnemonic == "JMP":
+                offset = self._signed_byte(inst.operands[0] if inst.operands else 0)
+                target_pc = next_pc + offset * self.instr_size
+                block_starts.add(target_pc)
+                block_starts.add(next_pc)
+            elif mnemonic == "RETURN":
+                block_starts.add(next_pc)
+
+        block_starts = {pc for pc in block_starts if 0 <= pc <= last_pc}
+        ordered_pcs = sorted(block_starts)
+        label_for_pc: Dict[int, str] = {}
+        blocks: Dict[str, IRBasicBlock] = {}
+        for index, pc in enumerate(ordered_pcs):
+            label = f"block_{index}"
+            blocks[label] = IRBasicBlock(label=label, start_pc=pc)
+            label_for_pc[pc] = label
+
+        register_types: Dict[int, str] = {}
+        warnings: List[str] = []
+        successors: MutableMapping[str, List[str]] = {}
+
+        for inst in decoded:
+            label = self._label_for_pc(inst.pc, ordered_pcs, label_for_pc)
+            block = blocks[label]
+            ir_inst, reg_type, warning = self._translate(inst, const_pool, label_for_pc)
+            block.instructions.append(ir_inst)
+            if reg_type is not None:
+                register, kind = reg_type
+                register_types.setdefault(register, kind)
+            if warning:
+                warnings.append(warning)
+
+            next_pc = inst.pc + self.instr_size
+            next_label = label_for_pc.get(next_pc)
+            mnemonic = inst.spec.mnemonic.upper() if inst.spec else ""
+            if mnemonic == "JMP":
+                offset = self._signed_byte(inst.operands[0] if inst.operands else 0)
+                target_pc = next_pc + offset * self.instr_size
+                target_label = label_for_pc.get(target_pc)
+                if target_label:
+                    successors.setdefault(label, []).append(target_label)
+            elif mnemonic == "RETURN":
+                continue
+            elif next_label:
+                successors.setdefault(label, []).append(next_label)
+
+        for label, succs in successors.items():
+            unique: List[str] = []
+            for entry in succs:
+                if entry not in unique:
+                    unique.append(entry)
+            blocks[label].successors = unique
+
+        order = [label_for_pc[pc] for pc in ordered_pcs]
+        return blocks, order, register_types, warnings
+
+    # ------------------------------------------------------------------
+    def _label_for_pc(
+        self, pc: int, ordered_pcs: Sequence[int], mapping: Mapping[int, str]
+    ) -> str:
+        if pc in mapping:
+            return mapping[pc]
+        previous = max(value for value in ordered_pcs if value <= pc)
+        return mapping[previous]
+
+    # ------------------------------------------------------------------
+    def _translate(
+        self,
+        inst: _DecodedInstruction,
+        const_pool: Sequence[object],
+        pc_to_label: Mapping[int, str],
+    ) -> Tuple[IRInstruction, Optional[Tuple[int, str]], Optional[str]]:
+        spec = inst.spec
+        name = _friendly_opcode_name(spec)
+        args: Dict[str, object] = {"operands": list(inst.operands)}
+        dest: Optional[int] = None
+        sources: List[int] = []
+        register_type: Optional[Tuple[int, str]] = None
+        warning: Optional[str] = None
+
+        if spec is None:
+            warning = f"Unknown opcode 0x{inst.opcode:02X} at pc 0x{inst.pc:04X}"
+            args["warning"] = warning
+        else:
+            mnemonic = spec.mnemonic.upper()
+            if mnemonic == "LOADK":
+                dest = inst.operands[0] if inst.operands else 0
+                const_index = inst.operands[1] if len(inst.operands) > 1 else 0
+                args.update({"register": dest, "const_index": const_index})
+                if 0 <= const_index < len(const_pool):
+                    const_value = const_pool[const_index]
+                    args["const_value"] = const_value
+                    if isinstance(const_value, str):
+                        register_type = (dest, "string")
+                    elif isinstance(const_value, (int, float)):
+                        register_type = (dest, "number")
+            elif mnemonic == "RETURN":
+                args["register"] = inst.operands[0] if inst.operands else 0
+            elif mnemonic == "JMP":
+                offset = self._signed_byte(inst.operands[0] if inst.operands else 0)
+                target_pc = inst.pc + self.instr_size + offset * self.instr_size
+                target_label = pc_to_label.get(target_pc)
+                if target_label:
+                    args["target"] = target_label
+            elif mnemonic == "CONCAT":
+                dest = inst.operands[0] if inst.operands else 0
+                op_a = inst.operands[1] if len(inst.operands) > 1 else 0
+                op_b = inst.operands[2] if len(inst.operands) > 2 else 0
+                name = "BinOp"
+                args.update({"op": "CONCAT", "dest": dest})
+                sources = [op_a, op_b]
+                register_type = (dest, "string")
+            elif mnemonic in {"ADD", "SUB", "MUL", "DIV", "MOD", "POW"}:
+                dest = inst.operands[0] if inst.operands else 0
+                name = "BinOp"
+                args.update({"op": mnemonic, "dest": dest})
+                sources = list(inst.operands[1:3])
+
+        ir_inst = IRInstruction(pc=inst.pc, opcode=name, args=args, dest=dest, sources=sources)
+        return ir_inst, register_type, warning
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _signed_byte(value: int) -> int:
+        return value - 0x100 if value >= 0x80 else value
+
+
+def lift_entry(decoded_bytes: bytes, bootstrapper_metadata: Mapping[str, object]) -> IRModule:
     opcode_map = bootstrapper_metadata.get("opcode_map") or bootstrapper_metadata.get("opcode_dispatch")
-    if not opcode_map:
-        raise LiftError("Missing opcode_map in bootstrap metadata")
+    if not isinstance(opcode_map, Mapping):
+        raise VMLiftError("Missing opcode map in bootstrap metadata")
 
-    try:
-        ir = parse_bytecode_into_ir(decoded_bytes, opcode_map)
-        return ir
-    except Exception as e:
-        logger.exception("VM lifting failed: %s", e)
-        raise LiftError(f"VM lifting failed: {e}")
+    specs = {int(key, 0) if isinstance(key, str) else int(key): OpSpec(str(value), ()) for key, value in opcode_map.items()}
+    return VMLifter().lift(decoded_bytes, specs)
+
+
+__all__ = ["VMLifter", "VMLiftError", "lift_entry", "VMInstruction", "VMFunction"]
