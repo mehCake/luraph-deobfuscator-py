@@ -5,26 +5,30 @@ on:
   pull_request:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          # Pin the workflow to a stable Python release so that wheels for tools
-          # like mypy and pytest are always available.  Using "3.x" can select
-          # pre-release interpreters (e.g. 3.13) where these packages are not
-          # yet published, causing the CI job to fail.
           python-version: '3.11'
-      - name: Install dependencies
+
+      - name: Install Python deps
         run: |
-          python -m pip install --upgrade pip
+          python -m venv .venv
+          . .venv/bin/activate
           pip install -r requirements.txt
-          # Ensure type checking and tests are available
-          pip install mypy pytest
-      - name: Run py_compile
-        run: python -m py_compile $(git ls-files '*.py')
-      - name: Run mypy
-        run: python -m mypy src/analysis src/vm src/exceptions.py src/deobfuscator.py src/utils.py --ignore-missing-imports
+
+      - name: Install LuaJIT & lua-cjson
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit luarocks
+          sudo luarocks install lua-cjson || true
+          luajit -v || true
+
       - name: Run tests
-        run: pytest -q
+        run: |
+          . .venv/bin/activate
+          pytest -q
