@@ -82,9 +82,10 @@ class BootstrapDecoder:
 
     # ===== lua string unescape helper =====
     def _unescape_lua_string(self, s: str) -> bytes:
-        """
-        Convert a Lua string literal body (with escapes like \xHH or \ddd) into raw bytes.
-        Handles \xHH hex, \ddd octal, and common C-like escapes.
+        r"""
+        Convert a Lua string literal body (with escapes like ``\xHH`` or ``\ddd``)
+        into raw bytes.  Handles ``\xHH`` hex, ``\ddd`` octal, and common C-like
+        escapes.
         """
         out = bytearray()
         i = 0
