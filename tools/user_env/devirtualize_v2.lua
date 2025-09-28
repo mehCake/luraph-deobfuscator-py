@@ -16,7 +16,7 @@
 -- then allows execution to continue. Once captured, the lifter scaffold is
 -- invoked to write human-readable IR artefacts next to the bootstrap files.
 
-local script_key = arg[1] or os.getenv("SCRIPT_KEY") or "zkzhqwk4b58pjnudvikpf"
+local script_key = arg[1] or os.getenv("SCRIPT_KEY") or "ppcg208ty9nze5wcoldxh"
 local bootstrap_path = "initv4.lua"
 local payload_path = "Obfuscated.json"
 local dump_lua_path = "unpacked_dump.lua"

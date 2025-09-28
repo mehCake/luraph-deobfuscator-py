@@ -203,7 +203,7 @@ Minimal example (Windows PowerShell shown, adjust for your shell):
 
 ```powershell
 cd path\to\luraph-deobfuscator-py
-    luajit tools/devirtualize_v2.lua zkzhqwk4b58pjnudvikpf
+    luajit tools/devirtualize_v2.lua ppcg208ty9nze5wcoldxh
 luajit tools/reformat_v2.lua decoded_output.lua > readable.lua
 ```
 
@@ -276,7 +276,7 @@ If you want to run the bootstrap locally and get **readable Lua outputs** withou
 Example PowerShell usage from the repository root:
 
 ```powershell
-./tools/user_env/run_all.ps1 -ScriptKey "zkzhqwk4b58pjnudvikpf"
+./tools/user_env/run_all.ps1 -ScriptKey "ppcg208ty9nze5wcoldxh"
 ```
 
 This writes `readable.lua` (or chunked `chunkN_readable.lua`) next to your input files.

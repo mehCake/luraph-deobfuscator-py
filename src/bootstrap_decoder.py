@@ -58,6 +58,20 @@ class BootstrapperExtractionResult:
     needs_emulation: bool = False
     error: Optional[str] = None
     trace: List[str] = field(default_factory=list)
+    decoded_blobs: List[str] = field(default_factory=list)
+
+    @property
+    def bootstrapper_metadata(self) -> Dict[str, Any]:  # pragma: no cover - trivial
+        return self.metadata_dict
+
+
+@dataclass
+class PythonDecodeResult:
+    """Return value for :meth:`BootstrapDecoder.python_reimpl_decode`."""
+
+    success: bool
+    decoded: Optional[bytes]
+    notes: List[str] = field(default_factory=list)
 
 
 class BootstrapDecoder:
@@ -76,12 +90,17 @@ class BootstrapDecoder:
         r"['\"]",
         re.S,
     )
+    _LONG_BRACKET_RE = re.compile(
+        r"(?P<name>\w{1,64})\s*=\s*\[\[(?P<val>[\s\S]{100,}?)\]\]",
+        re.S,
+    )
     _GENERIC_LONG_STRING_RE = re.compile(r'["\'](?P<val>[! -~]{160,})["\']', re.S)  # printable run
     _OPCODE_TABLE_RE = re.compile(r'\[\s*0x([0-9A-Fa-f]+)\s*\]\s*=\s*(?:["\']?([A-Za-z0-9_]+)["\']?|function)', re.S)
 
     def __init__(
         self,
-        bootstrap_path: str,
+        ctx_or_path,
+        bootstrap_path: Optional[str] = None,
         script_key: Optional[str] = None,
         debug: bool = False,
         *,
@@ -89,10 +108,27 @@ class BootstrapDecoder:
         emit_binary: bool = False,
         output_prefix: str = "bootstrap_blob",
     ):
-        self.bootstrap_path = bootstrap_path
+        if bootstrap_path is None and isinstance(ctx_or_path, (str, bytes, os.PathLike)):
+            ctx = None
+            bootstrap_path = os.fspath(ctx_or_path)
+        else:
+            ctx = ctx_or_path
+        if bootstrap_path is None:
+            raise TypeError("bootstrap_path is required for BootstrapDecoder")
+
+        self.ctx = ctx
+        self.bootstrap_path = os.fspath(bootstrap_path)
+
+        if script_key is None and ctx is not None and hasattr(ctx, "script_key"):
+            script_key = getattr(ctx, "script_key")
         self.script_key = script_key or ""
-        self.script_key_bytes = (script_key.encode("utf-8") if script_key else b"")
-        self.debug = debug
+        self.script_key_bytes = (
+            self.script_key.encode("utf-8") if self.script_key else b""
+        )
+
+        ctx_debug = bool(getattr(ctx, "debug_bootstrap", False)) if ctx is not None else False
+        self.debug = bool(debug or ctx_debug)
+
         self.out_dir = ensure_out(out_dir) if out_dir else _DEFAULT_OUT_DIR
         if _LOGS_ENV:
             self.logs_dir = ensure_out(_LOGS_ENV)
@@ -100,11 +136,64 @@ class BootstrapDecoder:
             self.logs_dir = ensure_out(self.out_dir, "logs")
         self.emit_binary = bool(emit_binary)
         self.output_prefix = output_prefix or "bootstrap_blob"
+        self._default_allow_lua_run = bool(getattr(ctx, "allow_lua_run", False)) if ctx is not None else False
+        self._candidate_alphabets: List[str] = []
 
     # ===== file helpers =====
     def _read_bootstrap(self) -> str:
         with open(self.bootstrap_path, "r", encoding="utf-8", errors="ignore") as fh:
             return fh.read()
+
+    def _summarise_metadata(
+        self,
+        metadata: Dict[str, Any],
+        method_label: str,
+        result: BootstrapperExtractionResult,
+    ) -> None:
+        alphabet = metadata.get("alphabet")
+        if isinstance(alphabet, str) and alphabet:
+            metadata["alphabet_len"] = len(alphabet)
+            metadata["alphabet_preview"] = alphabet[: min(80, len(alphabet))]
+
+        opcode_map = metadata.get("opcode_map")
+        if isinstance(opcode_map, dict) and opcode_map:
+            flat_map: Dict[int, str] = {}
+            array_values = opcode_map.get("array") if isinstance(opcode_map, dict) else None
+            if isinstance(array_values, list):
+                for idx, name in enumerate(array_values):
+                    if name:
+                        flat_map[idx] = str(name)
+            nested_map = opcode_map.get("map") if isinstance(opcode_map, dict) else None
+            if isinstance(nested_map, dict):
+                for raw_key, raw_value in nested_map.items():
+                    try:
+                        key_int = int(raw_key, 0) if isinstance(raw_key, str) else int(raw_key)
+                    except Exception:
+                        continue
+                    flat_map[key_int] = str(raw_value)
+            if flat_map:
+                opcode_map = {int(k): str(v) for k, v in flat_map.items()}
+                metadata["opcode_map"] = opcode_map
+            metadata["opcode_map_count"] = len(opcode_map)
+            sample = []
+            for index, (opcode, name) in enumerate(sorted(opcode_map.items())[:8]):
+                try:
+                    op_int = int(opcode)
+                except Exception:
+                    op_int = index
+                sample.append({f"0x{op_int:02X}": str(name)})
+            metadata["opcode_map_sample"] = sample
+
+        metadata.setdefault("extraction_confidence", "medium")
+        notes = metadata.setdefault("extraction_notes", [])
+        note = "lua-fallback" if "lua" in method_label else method_label
+        if note not in notes:
+            notes.append(note)
+
+        metadata["needs_emulation"] = False
+        metadata.setdefault("function_name_source", "mixed")
+        metadata.setdefault("extraction_method", method_label)
+        metadata.setdefault("extraction_log", "\n".join(result.trace[-10:]) if result.trace else "")
 
     # ===== lua string unescape helper =====
     def _unescape_lua_string(self, s: str) -> bytes:
@@ -116,6 +205,9 @@ class BootstrapDecoder:
                 return decoded
         except Exception as exc:
             self._debug_log(f"parse_escaped_lua_string failed: {exc}")
+
+        if "\\" not in s and ("\n" in s or "\r" in s):
+            return s.encode("latin1", errors="ignore")
 
         # Fallback to conservative escape handling to avoid regressions.
         out = bytearray()
@@ -174,7 +266,10 @@ class BootstrapDecoder:
         prefix = getattr(self, "output_prefix", "bootstrap_blob")
 
         candidate = decoded_bytes or raw_bytes or b""
-        xored = lph_try_xor(candidate, self.script_key_bytes)
+        if len(candidate) > 200000:
+            xored = candidate
+        else:
+            xored = lph_try_xor(candidate, self.script_key_bytes)
         if self._has_lua_markers(xored):
             preferred = xored
         elif self._has_lua_markers(candidate):
@@ -226,6 +321,13 @@ class BootstrapDecoder:
             if len(set(val)) >= 60:
                 alphabets.append(val)
                 self._debug_log(f"Found alphabet candidate {name} len={len(val)} unique={len(set(val))}")
+
+        # long bracket strings (e.g. Lua [[ ... ]]) often hold payloads
+        for m in self._LONG_BRACKET_RE.finditer(bootstrap_src):
+            name = m.group("name")
+            val = m.group("val")
+            blobs.append((name, val))
+            self._debug_log(f"Found long-bracket blob {name} len={len(val)}")
 
         # generic printable long strings
         for m in self._GENERIC_LONG_STRING_RE.finditer(bootstrap_src):
@@ -335,14 +437,30 @@ class BootstrapDecoder:
         trace = []
         decoded = None
 
+        # Step 0: if provided alphabet looks like a direct substitution table,
+        # remap each byte through the inverse lookup before attempting base91.
+        if alphabet and len(alphabet) >= 128 and len(set(alphabet)) == len(alphabet):
+            table = {ord(ch): idx for idx, ch in enumerate(alphabet)}
+            try:
+                remapped = bytes(table[b] for b in blob_bytes)
+            except KeyError:
+                remapped = None
+            if remapped is not None:
+                decoded = remapped
+                trace.append("applied direct alphabet remap")
+
         # Step 1: attempt basE91 decode when an alphabet or printable data is available
-        if alphabet:
+        if decoded is None and blob_bytes.startswith(b"local "):
+            decoded = blob_bytes
+            trace.append("detected lua chunk literal; treating as decoded")
+
+        if alphabet and decoded is None and b"\n" not in blob_bytes[:256]:
             trace.append("attempt basE91 decode using provided alphabet")
             candidate = self._try_base91_decode(blob_bytes, alphabet)
             if candidate:
                 decoded = candidate
                 trace.append("base91 succeeded")
-        elif all(32 <= b < 127 for b in blob_bytes[:200]):
+        elif decoded is None and all(32 <= b < 127 for b in blob_bytes[:200]):
             trace.append("attempt base91 (no alphabet given)")
             candidate = self._try_base91_decode(blob_bytes)
             if candidate:
@@ -396,6 +514,37 @@ class BootstrapDecoder:
 
         trace.append("validation failed: no lua-like keywords found in decoded data")
         return None, trace
+
+    def python_reimpl_decode(
+        self,
+        blob: bytes | str,
+        alphabet: Optional[str] = None,
+    ) -> PythonDecodeResult:
+        """Expose the pure-Python pipeline for unit tests and tooling."""
+
+        notes: List[str] = []
+        if isinstance(blob, str):
+            blob_bytes = blob.encode("latin1", errors="ignore")
+            notes.append("input converted from str via latin1")
+        else:
+            blob_bytes = bytes(blob)
+
+        if alphabet is None:
+            for candidate in getattr(self, "_candidate_alphabets", []) or []:
+                if isinstance(candidate, str) and candidate:
+                    alphabet = candidate
+                    notes.append(f"using candidate alphabet len={len(candidate)}")
+                    break
+
+        decoded, trace = self._python_transform_pipeline(blob_bytes, alphabet)
+        notes.extend(trace)
+
+        if decoded is not None:
+            notes.append("python pipeline success")
+        else:
+            notes.append("python pipeline failure")
+
+        return PythonDecodeResult(success=decoded is not None, decoded=decoded, notes=notes)
 
     def _convert_lua_table(
         self,
@@ -569,7 +718,7 @@ class BootstrapDecoder:
             def target():
                 try:
                     # run chunk; the chunk will run inside LuaRuntime default env but our capture hooks are registered globally
-                    chunk()
+                    result_holder["value"] = chunk()
                     result_holder["ok"] = True
                 except Exception as e:
                     result_holder["err"] = str(e)
@@ -676,11 +825,33 @@ class BootstrapDecoder:
                 if rebuild.instructions:
                     metadata["vm_instructions"] = rebuild.instructions
 
+        returned_value = result_holder.get("value")
+        decoded_bytes = None
+        if returned_value is not None:
+            if isinstance(returned_value, (bytes, bytearray)):
+                decoded_bytes = bytes(returned_value)
+                trace.append(
+                    f"lua-capture: chunk returned bytes len={len(decoded_bytes)}"
+                )
+            elif isinstance(returned_value, str):
+                decoded_bytes = returned_value.encode("latin1", errors="ignore")
+                trace.append(
+                    f"lua-capture: chunk returned string len={len(decoded_bytes)}"
+                )
+            else:
+                try:
+                    converted = self._convert_lua_table(returned_value)
+                except Exception as exc:  # pragma: no cover - defensive
+                    trace.append(f"lua-capture: failed to convert returned table ({exc})")
+                else:
+                    if isinstance(converted, dict):
+                        metadata.update(converted)
+                        trace.append("lua-capture: chunk returned metadata table")
+
         # If the bootstrap exposed a direct decode function, try to call it on blob literal
         # Some bootstrappers return or write the decoded payload to a global; we attempt to inspect typical names
         # Common patterns: init_fn(...), decode_blob(...), or assignment to `payload`
         possible_names = ["init_fn", "decode_blob", "decode", "run"]
-        decoded_bytes = None
         for name in possible_names:
             try:
                 f = lua.globals().get(name)
@@ -713,7 +884,7 @@ class BootstrapDecoder:
         return decoded_bytes, metadata, trace
 
     # ===== public API =====
-    def run_full_extraction(self, allow_lua_run: bool = False, timeout_s: int = 5) -> BootstrapperExtractionResult:
+    def run_full_extraction(self, allow_lua_run: Optional[bool] = None, timeout_s: int = 5) -> BootstrapperExtractionResult:
         """
         Orchestrate full extraction. Returns BootstrapperExtractionResult.
         Steps:
@@ -723,10 +894,14 @@ class BootstrapDecoder:
          - if python decode fails and allow_lua_run True: attempt lua sandbox fallback
          - write artifacts and return metadata/result
         """
+        if allow_lua_run is None:
+            allow_lua_run = self._default_allow_lua_run
+
         res = BootstrapperExtractionResult(success=False, metadata_dict={})
         try:
             src = self._read_bootstrap()
             blobs, alph_cands = self.find_blobs_and_alphabets(src)
+            self._candidate_alphabets = list(alph_cands)
             res.trace.append(f"found {len(blobs)} blobs and {len(alph_cands)} alphabet candidates")
 
             # pick an alphabet candidate if present (prefer explicit alphabets)
@@ -745,6 +920,30 @@ class BootstrapDecoder:
                 if m:
                     blobs.append(("generic", m.group("val")))
                     res.trace.append("no explicit blob; used generic long printable run")
+
+            if not blobs and allow_lua_run:
+                res.trace.append("no blobs found; attempting lua sandbox fallback")
+                decoded2, meta2, lua_trace = self._lua_sandbox_decode(src, "", timeout_s=timeout_s)
+                res.trace.extend(lua_trace)
+                if decoded2 or (meta2 and any(meta2.get(key) for key in ("alphabet", "opcode_map", "unpackedData"))):
+                    res.success = True
+                    if decoded2:
+                        res.decoded_bytes = decoded2
+                    res.metadata_dict.update(meta2 or {})
+                    res.metadata_dict["extraction_method"] = "lua_sandbox"
+                    res.metadata_dict["confidence"] = 0.9
+                    artifact_paths = res.metadata_dict.setdefault("artifact_paths", {})
+                    artifact_paths["bootstrap_blob_b64"] = self._artifact_b64_path()
+                    if decoded2:
+                        res.trace.append(
+                            f"wrote lua-decoded blob to {self._artifact_b64_path()} (base64)"
+                        )
+                    res.decoded_blobs.append("lua_fallback")
+                    self._summarise_metadata(res.metadata_dict, "lua_sandbox", res)
+                    return res
+                res.trace.append("lua sandbox fallback did not return decoded bytes")
+                res.needs_emulation = True
+                res.metadata_dict["needs_emulation"] = True
 
             # iterate blobs
             for name, rawlit in blobs:
@@ -775,6 +974,8 @@ class BootstrapDecoder:
                     res.trace.append(
                         f"wrote decoded blob to {self._artifact_b64_path()} (base64)"
                     )
+                    res.decoded_blobs.append(name)
+                    self._summarise_metadata(res.metadata_dict, "python", res)
                     return res  # success, done
 
                 # python decode failed: attempt Lua fallback (if allowed)
@@ -782,18 +983,23 @@ class BootstrapDecoder:
                     res.trace.append("python decode failed; attempting lua sandbox fallback")
                     decoded2, meta2, lua_trace = self._lua_sandbox_decode(src, rawlit, timeout_s=timeout_s)
                     res.trace.extend(lua_trace)
-                    if decoded2:
+                    if decoded2 or (meta2 and any(meta2.get(key) for key in ("alphabet", "opcode_map", "unpackedData"))):
                         res.success = True
-                        res.decoded_bytes = decoded2
+                        if decoded2:
+                            res.decoded_bytes = decoded2
                         res.metadata_dict.update(meta2 or {})
                         res.metadata_dict["extraction_method"] = "lua_sandbox"
                         res.metadata_dict["confidence"] = 0.95
-                        self._emit_blob_artifacts(name, blob_bytes, decoded2)
+                        if decoded2:
+                            self._emit_blob_artifacts(name, blob_bytes, decoded2)
                         artifact_paths = res.metadata_dict.setdefault("artifact_paths", {})
                         artifact_paths["bootstrap_blob_b64"] = self._artifact_b64_path()
-                        res.trace.append(
-                            f"wrote lua-decoded blob to {self._artifact_b64_path()} (base64)"
-                        )
+                        if decoded2:
+                            res.trace.append(
+                                f"wrote lua-decoded blob to {self._artifact_b64_path()} (base64)"
+                            )
+                        res.decoded_blobs.append(name)
+                        self._summarise_metadata(res.metadata_dict, "lua_sandbox", res)
                         return res
                     else:
                         res.trace.append("lua sandbox fallback did not return decoded bytes")

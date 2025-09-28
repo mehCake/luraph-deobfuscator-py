@@ -8,7 +8,7 @@ without relying on Python helpers.
 
 ```bash
 lua lua_env/decode_chunk.lua Obfuscated.json 1 Deobfuscated_chunk1.lua \
-    zkzhqwk4b58pjnudvikpf initv4.lua
+    ppcg208ty9nze5wcoldxh initv4.lua
 ```
 
 The script performs the following steps:

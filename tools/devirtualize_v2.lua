@@ -7,7 +7,7 @@
 --     B) debug.sethook interception of the interpreter call frame
 --     C) Global/getgenv() scan for a table with the expected vm shape
 
-local SCRIPT_KEY = arg[1] or os.getenv("SCRIPT_KEY") or "zkzhqwk4b58pjnudvikpf"
+local SCRIPT_KEY = arg[1] or os.getenv("SCRIPT_KEY") or "ppcg208ty9nze5wcoldxh"
 _G.script_key = SCRIPT_KEY
 if type(getgenv) == "function" then getgenv().script_key = SCRIPT_KEY end
 

@@ -21,7 +21,7 @@ def test_devirtualize_fixture_roundtrip(tmp_path: Path) -> None:
         shutil.copy(repo / "tools" / tool, tmp_path / tool)
 
     result = subprocess.run(
-        ["luajit", "devirtualize_v2.lua", "zkzhqwk4b58pjnudvikpf"],
+        ["luajit", "devirtualize_v2.lua", "ppcg208ty9nze5wcoldxh"],
         cwd=tmp_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

@@ -49,7 +49,7 @@ def test_parse_initv4_payload_extracts_bytes() -> None:
 
 
 def test_try_xor_repeats_key() -> None:
-    key = b"zkzhqwk4b58pjnudvikpf"
+    key = b"ppcg208ty9nze5wcoldxh"
     data = bytes(range(16))
     result = try_xor(data, key)
     assert result != data
