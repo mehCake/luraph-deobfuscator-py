@@ -36,6 +36,22 @@ cd luraph-deobfuscator-py
 pip install -r requirements.txt  # installs networkx, sympy, and test tools
 ```
 
+### Reproducible environments
+
+- The `requirements.txt` file now pins the Python packages required for
+  bootstrap decoding (`lupa`, `construct`, `pycryptodome`, `base91`) alongside
+  developer tooling such as `pytest`, `black`, and `ruff`.
+- A ready-to-build container image lives under `docker/Dockerfile`; it installs
+  LuaJIT, `lua-cjson`, Stylua, and the Python toolchain. Build it with:
+
+  ```bash
+  docker build -t luraph-deobfuscator -f docker/Dockerfile .
+  ```
+
+- For opt-in Lua execution the helper in `src/sandbox.py` uses `lupa` to load
+  `initv4.lua` inside a restricted interpreter and capture the `unpackedData`
+  table without leaving Python.
+
 ## Usage
 
 The modern CLI drives the pass-based pipeline and emits a timing summary for

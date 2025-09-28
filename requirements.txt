@@ -1,7 +1,15 @@
-# Dependencies for analysis helpers
+# Core analysis and tooling dependencies
 networkx==3.2.1
 sympy==1.13.2
 mypy==1.10.0
-pytest==8.2.2
-lupa>=1.8.0  # optional; required for sandboxed Lua fallback
-base91== 1.0.1
+
+# Runtime / decoding helpers
+lupa==1.13
+pycryptodome==3.19.0
+base91==0.1.2
+construct==2.11.67
+
+# Developer ergonomics
+pytest==7.4.0
+black==24.3.0
+ruff==0.20.0
