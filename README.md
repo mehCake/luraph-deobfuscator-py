@@ -33,8 +33,26 @@ Clone the repository and install the required dependencies:
 ```bash
 git clone https://github.com/example/luraph-deobfuscator-py.git
 cd luraph-deobfuscator-py
-pip install -r requirements.txt  # installs networkx, sympy, and test tools
+pip install -r requirements.txt
 ```
+
+## Local Lua environment
+
+We vendor a Python↔Lua bridge so you (and CI/Codex) can run Lua from the repo:
+
+- Python deps: `pip install -r requirements.txt`
+- Linux/macOS Lua setup: `bash scripts/setup_lua.sh`
+- Windows setup: `powershell -ExecutionPolicy Bypass -File scripts\\setup_lua.ps1`
+
+Smoke test:
+
+```
+python -c "from lupa import LuaRuntime; print(LuaRuntime().eval('1+1'))"
+luajit -v
+```
+
+The pipeline can now load `initv4.lua` and capture `unpackedData` via `src/sandbox.py`
+(using embedded LuaJIT through lupa).
 
 ### Reproducible environments
 

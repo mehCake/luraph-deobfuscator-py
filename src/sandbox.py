@@ -1,67 +1,57 @@
-"""Sandbox helpers for executing initv4 bootstraps inside LuaJIT via lupa."""
 from __future__ import annotations
+from typing import Optional
 
-from dataclasses import dataclass
-from typing import Any, Optional
+# Lupa embeds LuaJIT into Python; great for controlled captures.
+from lupa import LuaRuntime
 
-try:
-    from lupa import LuaRuntime
-except Exception:  # pragma: no cover - optional dependency
-    LuaRuntime = None  # type: ignore[assignment]
+def _looks_like_vm_data(lua_table) -> bool:
+    try:
+        t4 = lua_table[4]
+        return (t4 is not None
+                and hasattr(t4, "__len__")
+                and len(t4) > 0
+                and isinstance(t4[1], (dict, type(lua_table)))
+                and isinstance(lua_table[5], (dict, type(lua_table))))
+    except Exception:
+        return False
 
-
-@dataclass
-class SandboxResult:
-    unpacked: Optional[Any]
-    error: Optional[Exception] = None
-
-
-def capture_unpacked(lua_path: str, *, script_key: Optional[str] = None) -> SandboxResult:
-    """Execute the given Lua bootstrapper and attempt to capture `unpackedData`.
-
-    The helper creates a fresh LuaRuntime, injects the script key (if provided),
-    runs the bootstrapper, then probes globals for a table that looks like the
-    expected VM metadata. We keep the return structure light so callers can
-    decide how to serialise the result.
+def capture_unpacked(initv4_path: str, script_key: Optional[str] = None):
     """
-
-    if LuaRuntime is None:
-        return SandboxResult(unpacked=None, error=RuntimeError("lupa is not installed"))
-
-    lua = LuaRuntime(unpack_returned_tuples=True)
+    Load initv4.lua, set script_key, and attempt to capture 'unpackedData'
+    (the VM data table). Returns a Lua table proxy (convertible to Python).
+    """
+    lua = LuaRuntime(unpack_returned_tuples=True, register_eval=False)
 
     if script_key:
-        lua.execute("_G.script_key = ...", script_key)
+        lua.execute(f"_G.script_key = {repr(script_key)}")
 
-    with open(lua_path, "r", encoding="utf-8", errors="ignore") as handle:
-        source = handle.read()
+    with open(initv4_path, "r", encoding="utf-8", errors="ignore") as f:
+        code = f.read()
 
+    # Run bootstrap; failures after globals are OK.
     try:
-        lua.execute(source)
-    except Exception as exc:  # pragma: no cover - bootstrap often throws
-        bootstrap_error = exc
-    else:
-        bootstrap_error = None
+        lua.execute(code)
+    except Exception:
+        pass
 
-    globals_table = lua.globals()
-    unpack_fn = globals_table.get("LPH_UnpackData")
-    if callable(unpack_fn):
-        try:
-            unpacked = unpack_fn()
-            return SandboxResult(unpacked=unpacked, error=bootstrap_error)
-        except Exception as exc:  # pragma: no cover - fallback to scan
-            bootstrap_error = exc
+    g = lua.globals()
 
-    for key in globals_table.keys():
-        candidate = globals_table[key]
-        if not hasattr(candidate, "__getitem__"):
-            continue
+    # Preferred path: direct LPH_UnpackData()
+    if g.get("LPH_UnpackData"):
         try:
-            vm_instr = candidate[4]
-            vm_consts = candidate[5]
+            data = g["LPH_UnpackData"]()
+            if _looks_like_vm_data(data):
+                return data
+        except Exception:
+            pass
+
+    # Fallback: scan global table for vm-like data
+    for k in list(g.keys()):
+        try:
+            v = g[k]
+            if _looks_like_vm_data(v):
+                return v
         except Exception:
             continue
-        if isinstance(vm_instr, lua.table) and vm_instr[1] and isinstance(vm_consts, lua.table):
-            return SandboxResult(unpacked=candidate, error=bootstrap_error)
 
-    return SandboxResult(unpacked=None, error=bootstrap_error)
+    return None
