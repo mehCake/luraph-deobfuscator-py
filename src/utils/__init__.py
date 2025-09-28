@@ -2,6 +2,7 @@
 
 from .io_utils import chunk_lines, ensure_out, write_b64_text, write_json, write_text  # noqa: F401
 from .lph_decoder import parse_escaped_lua_string, try_xor  # noqa: F401
+from .luraph_vm import looks_like_vm_bytecode, rebuild_vm_bytecode  # noqa: F401
 
 __all__ = [
     "chunk_lines",
@@ -11,4 +12,6 @@ __all__ = [
     "write_b64_text",
     "write_json",
     "write_text",
+    "rebuild_vm_bytecode",
+    "looks_like_vm_bytecode",
 ]

@@ -27,6 +27,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from src.utils.io_utils import ensure_out, write_b64_text
 from src.utils.lph_decoder import parse_escaped_lua_string, try_xor as lph_try_xor
+from src.utils.luraph_vm import rebuild_vm_bytecode
 
 # Optional imports (fall back if missing)
 try:
@@ -619,8 +620,25 @@ class BootstrapDecoder:
             metadata["opcode_map"] = chosen
             trace.append(f"lua-capture: opcode_map entries={len(chosen)}")
         if captured["unpacked_tables"]:
-            metadata["unpackedData"] = captured["unpacked_tables"][0]
+            vm_table = captured["unpacked_tables"][0]
+            metadata["unpackedData"] = vm_table
             trace.append("lua-capture: captured unpackedData table")
+            try:
+                rebuild = rebuild_vm_bytecode(vm_table, metadata.get("opcode_map"))
+            except Exception as exc:  # pragma: no cover - defensive
+                trace.append(f"lua-capture: vm rebuild failed ({exc})")
+            else:
+                if rebuild.bytecode:
+                    metadata["vm_bytecode"] = [b for b in rebuild.bytecode]
+                    metadata["_vm_bytecode_bytes"] = rebuild.bytecode
+                    metadata["vm_instruction_count"] = len(rebuild.instructions)
+                    trace.append(
+                        f"lua-capture: rebuilt {len(rebuild.instructions)} bytecode instructions"
+                    )
+                if rebuild.constants:
+                    metadata["vm_constants"] = rebuild.constants
+                if rebuild.instructions:
+                    metadata["vm_instructions"] = rebuild.instructions
 
         # If the bootstrap exposed a direct decode function, try to call it on blob literal
         # Some bootstrappers return or write the decoded payload to a global; we attempt to inspect typical names

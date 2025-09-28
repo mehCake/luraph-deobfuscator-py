@@ -206,6 +206,8 @@ def _sanitise_bootstrap_metadata(metadata: Optional[Dict[str, Any]]) -> Optional
     for key, value in metadata.items():
         if key == "_decoded_bytes" and isinstance(value, (bytes, bytearray)):
             clean["bootstrap_blob_b64"] = base64.b64encode(bytes(value)).decode("ascii")
+        elif key == "_vm_bytecode_bytes" and isinstance(value, (bytes, bytearray)):
+            clean["vm_bytecode_b64"] = base64.b64encode(bytes(value)).decode("ascii")
         elif isinstance(value, dict):
             clean[key] = _sanitise_bootstrap_metadata(value) or {}
         elif isinstance(value, list):
