@@ -1,7 +1,6 @@
 lupa==1.13
 pycryptodome==3.19.0
-base91==0.1.2
-construct==2.11.67
+construct==2.10.70
+base91==1.0.1
 pytest==7.4.0
 black==24.3.0
-ruff==0.20.0

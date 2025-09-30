@@ -1,0 +1,120 @@
+{
+  "4": {
+    "opnum": 4,
+    "candidates": [
+      "GETTABLE",
+      "SETTABLE",
+      "EQ",
+      "LT",
+      "LE",
+      "MOVE",
+      "CALL",
+      "RETURN",
+      "GETUPVAL",
+      "OP_4"
+    ],
+    "stats": {
+      "count": 1,
+      "a_int": 1,
+      "b_int": 1,
+      "c_int": 1,
+      "b_const": 0,
+      "c_const": 0,
+      "b_none": 0,
+      "c_none": 0,
+      "sample_pcs": [
+        1
+      ]
+    },
+    "sample_pcs": [
+      1
+    ]
+  },
+  "0": {
+    "opnum": 0,
+    "candidates": [
+      "LOADK",
+      "GETGLOBAL",
+      "SETGLOBAL",
+      "MOVE",
+      "OP_0"
+    ],
+    "stats": {
+      "count": 1,
+      "a_int": 1,
+      "b_int": 1,
+      "c_int": 0,
+      "b_const": 1,
+      "c_const": 0,
+      "b_none": 0,
+      "c_none": 1,
+      "sample_pcs": [
+        2
+      ]
+    },
+    "sample_pcs": [
+      2
+    ]
+  },
+  "28": {
+    "opnum": 28,
+    "candidates": [
+      "LOADK",
+      "GETGLOBAL",
+      "SETGLOBAL",
+      "GETTABLE",
+      "SETTABLE",
+      "EQ",
+      "LT",
+      "LE",
+      "CALL",
+      "OP_28"
+    ],
+    "stats": {
+      "count": 1,
+      "a_int": 1,
+      "b_int": 1,
+      "c_int": 1,
+      "b_const": 1,
+      "c_const": 1,
+      "b_none": 0,
+      "c_none": 0,
+      "sample_pcs": [
+        3
+      ]
+    },
+    "sample_pcs": [
+      3
+    ]
+  },
+  "30": {
+    "opnum": 30,
+    "candidates": [
+      "GETTABLE",
+      "SETTABLE",
+      "EQ",
+      "LT",
+      "LE",
+      "MOVE",
+      "CALL",
+      "RETURN",
+      "OP_30"
+    ],
+    "stats": {
+      "count": 1,
+      "a_int": 1,
+      "b_int": 1,
+      "c_int": 1,
+      "b_const": 0,
+      "c_const": 0,
+      "b_none": 0,
+      "c_none": 0,
+      "sample_pcs": [
+        4
+      ]
+    },
+    "sample_pcs": [
+      4
+    ]
+  }
+}

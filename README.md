@@ -36,6 +36,33 @@ cd luraph-deobfuscator-py
 pip install -r requirements.txt
 ```
 
+## Quickstart
+
+### Windows
+
+The repository bundles a 64-bit LuaJIT runtime under `bin/`, so no additional
+system setup is needed:
+
+```powershell
+pip install -r requirements.txt
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+```
+
+### Linux / macOS
+
+Install LuaJIT and `lua-cjson`, then install the Python dependencies:
+
+```bash
+sudo apt-get install -y luajit luarocks
+sudo luarocks install lua-cjson
+pip install -r requirements.txt
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+```
+
+Run `python tools/check_deps.py` at any time to confirm that both lupa and a
+LuaJIT executable are available. The script automatically prefers the bundled
+`bin/luajit.exe` when present.
+
 ## Local Lua environment
 
 We vendor a Python↔Lua bridge so you (and CI/Codex) can run Lua from the repo:

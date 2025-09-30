@@ -32,6 +32,9 @@ MANIFEST
 *.spec
 *.exe
 *.dll
+!bin/
+!bin/luajit.exe
+!bin/lua51.dll
 *.pyd
 
 # Installer logs
