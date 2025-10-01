@@ -1,0 +1,24 @@
+# Full Report – Required Improvements for Luraph v14.4.x Deobfuscation
+
+The objective is to deobfuscate `Obfuscated.json` into readable Lua using only the bundled `initv4.lua` bootstrapper and the **new script key** `zkzhqwk4b58pjnudvikpf`. The current repository already exposes capture, lifting, and reconstruction scaffolding, but several gaps prevent a clean end-to-end run with the new sample. The sections below itemise the work required to harden each pipeline stage and to produce the mandated artefacts (opcode map, verified alphabet, readable Lua chunks).
+
+## 1. Bootstrap capture must succeed with the new key
+* Update every entry point that hard-codes the previous key so the sandbox and regression tests exercise `zkzhqwk4b58pjnudvikpf`. Today the fixtures and helpers still embed `zkzhqwk4b58pjnudvikpf`, so the wrong payload is requested when running the capture harness.【F:tests/conftest.py†L34-L86】
+* While the sandbox runner already prefers the Python/Lua wrappers in `src/sandbox.py` and `tools/devirtualize_v3.lua`, we must verify that these hooks recognise the new key and emit the expected dumps (`unpacked_dump.json/.lua`) and bootstrap blob for every run.【F:src/sandbox_runner.py†L1-L166】 This includes ensuring `lupa` and LuaJIT fallbacks are bundled/installed and that the debug hook paths still trigger once the key changes.
+
+## 2. Lifter output needs richer metadata for opcode discovery
+* `run_lifter` normalises instructions and emits IR plus basic statistics, but we must augment it with extra operand analysis (e.g., RK usage, constant/string lookups) to drive opcode matching for the new payload.【F:src/lifter_core.py†L1-L124】
+* Extend the lifter report so it records candidate alphabets/constants drawn from `data[5]` and serialises them to `out/alphabet_candidates.txt`, giving later stages the actual alphabet that matches `Obfuscated.json`.
+
+## 3. Opcode verification must emulate real Lua 5.1 semantics
+* The current verifier only recognises LOADK and MOVE heuristically; every other opcode is left as `OP_<n>` with low confidence.【F:src/opcode_verifier.py†L1-L160】 Implement handlers (or integrate the existing `opcode_emulator` module) so arithmetic, table, call, comparison, and loop opcodes are executed against sampled instructions. Each opcode should gather at least three test cases and reach ≥0.8 confidence before being marked verified.
+* Persist richer evidence into `out/tests/opcode_validation/` (stack snapshots, expected vs. actual VM state) so regressions can be investigated quickly when the key or bootstrapper changes.
+
+## 4. Reconstruction should produce meaningful Lua, not comments only
+* The scaffold currently renders real assignments only for LOADK and MOVE, leaving the rest as comments. To obtain readable Lua, extend the emitter to cover the opcodes that become verified once the emulator is improved (e.g., table ops, conditional jumps, CALL/RETURN blocks).【F:src/deob_reconstruct.py†L45-L96】
+* After reconstruction, run a syntax-only LuaJIT parse and capture its status inside `out/summary.json`, then pretty-print or chunk the output into `out/deobfuscated.partNN.lua` as required.
+
+## 5. Alphabet detection and reporting must be wired into the pipeline
+* Although helper code exists to mine alphabets from the bootstrapper, the sandbox runner never emits `alphabet_candidates.txt` nor records the chosen alphabet in the summary.【F:src/sandbox_runner.py†L35-L166】 Integrate the alphabet extraction utilities so the real, tested alphabet for `Obfuscated.json` is captured, scored, and written alongside the opcode artefacts.
+
+Delivering the items above will unblock deobfuscation with script key `zkzhqwk4b58pjnudvikpf`: the bootstrapper will reliably dump `unpackedData`, opcode semantics will be validated across the instruction set, the verified alphabet will be stored for auditing, and the reconstruction stage will emit readable Lua that mirrors the original payload.
