@@ -36,6 +36,33 @@ cd luraph-deobfuscator-py
 pip install -r requirements.txt
 ```
 
+## Quickstart
+
+### Windows
+
+The repository bundles a 64-bit LuaJIT runtime under `bin/`, so no additional
+system setup is needed:
+
+```powershell
+pip install -r requirements.txt
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+```
+
+### Linux / macOS
+
+Install LuaJIT and `lua-cjson`, then install the Python dependencies:
+
+```bash
+sudo apt-get install -y luajit luarocks
+sudo luarocks install lua-cjson
+pip install -r requirements.txt
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+```
+
+Run `python tools/check_deps.py` at any time to confirm that both lupa and a
+LuaJIT executable are available. The script automatically prefers the bundled
+`bin/luajit.exe` when present.
+
 ## Local Lua environment
 
 We vendor a Python↔Lua bridge so you (and CI/Codex) can run Lua from the repo:
@@ -203,7 +230,7 @@ Minimal example (Windows PowerShell shown, adjust for your shell):
 
 ```powershell
 cd path\to\luraph-deobfuscator-py
-    luajit tools/devirtualize_v2.lua zkzhqwk4b58pjnudvikpf
+    luajit tools/devirtualize_v2.lua ug7bdorqbifndbz6yj0o4a
 luajit tools/reformat_v2.lua decoded_output.lua > readable.lua
 ```
 
@@ -276,7 +303,7 @@ If you want to run the bootstrap locally and get **readable Lua outputs** withou
 Example PowerShell usage from the repository root:
 
 ```powershell
-./tools/user_env/run_all.ps1 -ScriptKey "zkzhqwk4b58pjnudvikpf"
+./tools/user_env/run_all.ps1 -ScriptKey "ug7bdorqbifndbz6yj0o4a"
 ```
 
 This writes `readable.lua` (or chunked `chunkN_readable.lua`) next to your input files.

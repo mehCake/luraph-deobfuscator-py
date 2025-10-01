@@ -232,7 +232,7 @@ local function is_vm_data_shape(t)
 end
 
 -- ensure script_key present
-local SCRIPT_KEY = arg[1] or os.getenv("SCRIPT_KEY") or "zkzhqwk4b58pjnudvikpf"
+local SCRIPT_KEY = arg[1] or os.getenv("SCRIPT_KEY") or "ug7bdorqbifndbz6yj0o4a"
 _G.script_key = SCRIPT_KEY
 if type(getgenv) == "function" then getgenv().script_key = SCRIPT_KEY end
 

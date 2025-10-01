@@ -1,7 +1,7 @@
 -- tools/run_init_wrapper.lua
 -- Usage: luajit tools/run_init_wrapper.lua <script_key> [path_to_obfuscated.json]
 
-local script_key = arg[1] or os.getenv("SCRIPT_KEY") or "zkzhqwk4b58pjnudvikpf"
+local script_key = arg[1] or os.getenv("SCRIPT_KEY") or "ug7bdorqbifndbz6yj0o4a"
 local json_path  = arg[2] or "Obfuscated.json"
 
 -- minimal read helper

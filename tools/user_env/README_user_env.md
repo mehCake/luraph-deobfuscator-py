@@ -14,7 +14,7 @@
 ## Quick start (PowerShell)
 ```powershell
 # From the repo root
-./tools/user_env/run_all.ps1 -ScriptKey "zkzhqwk4b58pjnudvikpf"
+./tools/user_env/run_all.ps1 -ScriptKey "ug7bdorqbifndbz6yj0o4a"
 ```
 
 ### Outputs

@@ -1,4 +1,4 @@
-local SCRIPT_KEY = _G.script_key or "zkzhqwk4b58pjnudvikpf"
+local SCRIPT_KEY = _G.script_key or "ug7bdorqbifndbz6yj0o4a"
 
 local unpackedData = {
   4, 0, {2, 2, 2},

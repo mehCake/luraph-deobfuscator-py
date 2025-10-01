@@ -1,0 +1,28 @@
+{
+  "0": {
+    "mnemonic": "MOVE",
+    "confidence": 0.8,
+    "evidence": [
+      "MOVE-like samples=1"
+    ]
+  },
+  "4": {
+    "mnemonic": "LOADK",
+    "confidence": 0.9,
+    "evidence": [
+      "LOADK-like samples=1"
+    ]
+  },
+  "28": {
+    "mnemonic": "OP_28",
+    "confidence": 0.3,
+    "evidence": []
+  },
+  "30": {
+    "mnemonic": "MOVE",
+    "confidence": 0.8,
+    "evidence": [
+      "MOVE-like samples=1"
+    ]
+  }
+}

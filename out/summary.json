@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "unpacked_dump_exists": true,
+  "unpacked_dump_lua_exists": false,
+  "instructions": 4,
+  "unique_opnums": 4,
+  "opcodes_verified": 4,
+  "high_confidence": 3,
+  "chunks": 1,
+  "fallback_fixture": false
+}
