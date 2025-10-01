@@ -31,7 +31,7 @@ sys.path.insert(1, str(TESTS))
 importlib.import_module("src")
 
 
-SCRIPT_KEY = "zkzhqwk4b58pjnudvikpf"
+SCRIPT_KEY = "ug7bdorqbifndbz6yj0o4a"
 
 
 def _copy_fixture_dir(src: Path, dst: Path) -> None:

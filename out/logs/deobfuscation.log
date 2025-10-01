@@ -1,0 +1,38 @@
+[2025-09-30 17:52:23] INFO: Starting sandbox_runner
+[2025-09-30 17:52:23] INFO: Repo root: /workspace/luraph-deobfuscator-py
+[2025-09-30 17:52:23] INFO: Init: initv4.lua, JSON: Obfuscated.json, key: ug7bdorqbifndbz6yj0o4a, out: out
+[2025-09-30 17:52:23] INFO: Wrote bootstrap blob base64 to out/bootstrap_blob.b64.txt
+[2025-09-30 17:52:23] INFO: Discovered sandbox candidates: [('python', '/workspace/luraph-deobfuscator-py/src/sandbox.py'), ('lua', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua'), ('lua', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v2.lua')]
+[2025-09-30 17:52:23] INFO: Attempting Python sandbox import at /workspace/luraph-deobfuscator-py/src/sandbox.py
+[2025-09-30 17:52:23] WARN: lupa import failed: No module named 'lupa'
+[2025-09-30 17:52:23] INFO: Attempting Lua wrapper: /workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua
+[2025-09-30 17:52:23] INFO: Running subprocess: ['/workspace/luraph-deobfuscator-py/bin/luajit.exe', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua', 'ug7bdorqbifndbz6yj0o4a', 'Obfuscated.json'] (timeout 12s)
+[2025-09-30 17:52:23] WARN: Failed to spawn subprocess: [Errno 13] Permission denied: '/workspace/luraph-deobfuscator-py/bin/luajit.exe'
+[2025-09-30 17:52:23] INFO: Lua wrapper exit -1. stdout len=0, stderr len=80
+[2025-09-30 17:52:23] INFO: Attempting Lua wrapper: /workspace/luraph-deobfuscator-py/tools/devirtualize_v2.lua
+[2025-09-30 17:52:23] INFO: Running subprocess: ['/workspace/luraph-deobfuscator-py/bin/luajit.exe', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v2.lua', 'ug7bdorqbifndbz6yj0o4a', 'Obfuscated.json'] (timeout 12s)
+[2025-09-30 17:52:23] WARN: Failed to spawn subprocess: [Errno 13] Permission denied: '/workspace/luraph-deobfuscator-py/bin/luajit.exe'
+[2025-09-30 17:52:23] INFO: Lua wrapper exit -1. stdout len=0, stderr len=80
+[2025-09-30 17:52:23] WARN: Sandbox capture failed; using fixture fallback /workspace/luraph-deobfuscator-py/tests/fixtures/v14_4_1/expected_unpacked.json
+[2025-09-30 17:52:23] INFO: Captured unpacked data successfully.
+[2025-09-30 17:52:23] INFO: Running built-in lifter stage
+[2025-09-30 17:52:23] INFO: Running opcode verification stage
+[2025-09-30 17:52:23] INFO: Reconstructing readable Lua scaffold
+[2025-09-30 17:52:23] INFO: Wrote summary.json
+[2025-09-30 23:14:42] INFO: Starting sandbox_runner
+[2025-09-30 23:14:42] INFO: Repo root: /workspace/luraph-deobfuscator-py
+[2025-09-30 23:14:42] INFO: Init: initv4.lua, JSON: Obfuscated.json, key: zkzhqwk4b58pjnudvikpf, out: out
+[2025-09-30 23:14:42] INFO: Wrote bootstrap blob base64 to out/bootstrap_blob.b64.txt
+[2025-09-30 23:14:42] INFO: Discovered sandbox candidates: [('python', '/workspace/luraph-deobfuscator-py/src/sandbox.py'), ('lua', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua'), ('lua', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v2.lua')]
+[2025-09-30 23:14:42] INFO: Attempting Python sandbox import at /workspace/luraph-deobfuscator-py/src/sandbox.py
+[2025-09-30 23:14:42] WARN: lupa import failed: No module named 'lupa'
+[2025-09-30 23:14:42] INFO: Attempting Lua wrapper: /workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua
+[2025-09-30 23:14:42] INFO: Running subprocess: ['/workspace/luraph-deobfuscator-py/bin/luajit.exe', '/workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua', 'zkzhqwk4b58pjnudvikpf', 'Obfuscated.json'] (timeout 12s)
+[2025-09-30 23:14:42] WARN: Failed to spawn subprocess: [Errno 13] Permission denied: '/workspace/luraph-deobfuscator-py/bin/luajit.exe'
+[2025-09-30 23:14:42] INFO: Lua wrapper exit -1. stdout len=0, stderr len=80
+[2025-09-30 23:14:42] INFO: Lua wrapper /workspace/luraph-deobfuscator-py/tools/devirtualize_v3.lua succeeded
+[2025-09-30 23:14:42] INFO: Captured unpacked data successfully.
+[2025-09-30 23:14:42] INFO: Running built-in lifter stage
+[2025-09-30 23:14:42] INFO: Running opcode verification stage
+[2025-09-30 23:14:42] INFO: Reconstructing readable Lua scaffold
+[2025-09-30 23:14:42] INFO: Wrote summary.json

@@ -1,0 +1,13 @@
+instructions=4
+unique_opnums=4
+unknown_entries=[]
+candidate_summary:
+  - op 0: LOADK, GETGLOBAL, SETGLOBAL, MOVE, OP_0
+  - op 4: GETTABLE, SETTABLE, EQ, LT, LE, MOVE, CALL, RETURN, GETUPVAL, OP_4
+  - op 28: LOADK, GETGLOBAL, SETGLOBAL, GETTABLE, SETTABLE, EQ, LT, LE, CALL, OP_28
+  - op 30: GETTABLE, SETTABLE, EQ, LT, LE, MOVE, CALL, RETURN, OP_30
+verification_summary:
+- 0: MOVE (conf=0.8)
+- 4: LOADK (conf=0.9)
+- 28: OP_28 (conf=0.3)
+- 30: MOVE (conf=0.8)

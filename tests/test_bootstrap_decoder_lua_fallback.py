@@ -35,7 +35,7 @@ def test_bootstrap_decoder_lua_fallback(tmp_path: Path) -> None:
         allow_lua_run=True,
         logs_dir=tmp_path / "logs",
     )
-    decoder = BootstrapDecoder(ctx, str(target), "zkzhqwk4b58pjnudvikpf")
+    decoder = BootstrapDecoder(ctx, str(target), "ug7bdorqbifndbz6yj0o4a")
     result = decoder.run_full_extraction()
 
     assert result.success, result.errors

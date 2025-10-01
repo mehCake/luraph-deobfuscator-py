@@ -19,7 +19,7 @@ def test_bootstrap_decoder_uses_lua_fallback(tmp_path: Path) -> None:
     target.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
 
     ctx = SimpleNamespace(debug_bootstrap=True, allow_lua_run=True)
-    decoder = BootstrapDecoder(ctx, str(target), "zkzhqwk4b58pjnudvikpf")
+    decoder = BootstrapDecoder(ctx, str(target), "ug7bdorqbifndbz6yj0o4a")
     result = decoder.run_full_extraction()
 
     assert result.success

@@ -4,7 +4,7 @@ The repository now ships the full scaffolding required to analyse and lift
 Luraph v14.4.1 bootstrappers end-to-end:
 
 * **Unpacked capture hooks** – `tools/devirtualize_v2.lua` injects the provided
- script key (`zkzhqwk4b58pjnudvikpf`), intercepts `LPH_UnpackData` via
+ script key (`ug7bdorqbifndbz6yj0o4a`), intercepts `LPH_UnpackData` via
   `debug.sethook`, and writes both `unpacked_dump.lua` and
   `unpacked_dump.json`.
 * **Opcode inference** – Lua and Python inference layers score opcode

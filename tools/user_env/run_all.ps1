@@ -1,6 +1,6 @@
 # run_all.ps1
 # Usage:
-#   ./run_all.ps1 -ScriptKey "zkzhqwk4b58pjnudvikpf" [-LuaJit "C:\path\to\luajit.exe"]
+#   ./run_all.ps1 -ScriptKey "ug7bdorqbifndbz6yj0o4a" [-LuaJit "C:\path\to\luajit.exe"]
 param(
   [string]$ScriptKey = $env:SCRIPT_KEY,
   [string]$LuaJit = "luajit"

@@ -6,7 +6,7 @@
 -- If result is a string -> writes decoded_output.lua
 -- If result is a table of strings -> writes decoded_chunk_###.lua
 
-local key = arg[1] or os.getenv("SCRIPT_KEY") or "zkzhqwk4b58pjnudvikpf"
+local key = arg[1] or os.getenv("SCRIPT_KEY") or "ug7bdorqbifndbz6yj0o4a"
 local json_path = "Obfuscated.json"
 
 -- Provide script_key to bootstrapper scopes

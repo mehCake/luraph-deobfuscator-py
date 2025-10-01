@@ -12,7 +12,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INITV4 = PROJECT_ROOT / "initv4.lua"
-SCRIPT_KEY = "zkzhqwk4b58pjnudvikpf"
+SCRIPT_KEY = "ug7bdorqbifndbz6yj0o4a"
 
 
 @pytest.mark.skipif(
