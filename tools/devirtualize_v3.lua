@@ -2,9 +2,10 @@ package.path = package.path .. ";./tools/?.lua;./tools/?/init.lua;./tools/shims/
 
 local script_key = arg and arg[1] or os.getenv("SCRIPT_KEY") or ""
 local json_path = (arg and arg[2]) or "Obfuscated.json"
-local out_dir = (arg and arg[3]) or "out"
+local out_dir = (arg and (arg[4] or arg[3])) or "out"
 local logs_dir = out_dir .. "/logs"
 
+-- BEGIN shim preload
 local dumper = dofile("tools/lua_dumper.lua")
 local shim_ok, shim_err = pcall(dofile, "tools/globals_shim.lua")
 if not shim_ok then
@@ -52,6 +53,7 @@ do
     end
   end
 end
+-- END shim preload
 
 local function timestamp()
   return os.date("!%Y-%m-%dT%H:%M:%SZ")

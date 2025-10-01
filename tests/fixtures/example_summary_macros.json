@@ -1,0 +1,28 @@
+{
+  "status": "partial",
+  "unpacked_dump_exists": true,
+  "runtime_capture_method": "luajit",
+  "macros": ["LPH_NO_VIRTUALIZE", "LPH_JIT_MAX"],
+  "settings": {
+    "known": {
+      "virtualize_all": false,
+      "exclude_list": ["foo", "bar"],
+      "max_jit_kernels": 6
+    },
+    "tables": {
+      "settings": {
+        "virtualize_all": false,
+        "exclude_list": ["foo", "bar"],
+        "max_jit_kernels": 6
+      }
+    }
+  },
+  "metadata": {
+    "luraph_version": "14.5"
+  },
+  "limitations": [
+    "Skipped lifter due to macro disabling virtualization",
+    "Verifier skipped due to LPH_JIT macro"
+  ],
+  "pipeline_mode": "partial"
+}

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -59,6 +60,17 @@ def _write_failure(out_dir: Path, message: str, details: str = "") -> None:
         contents.append(details)
     failure_path.write_text("\n".join(contents) + "\n", encoding="utf-8")
     _log(f"Failure report written to {failure_path}", "ERROR")
+
+
+def _append_failure_notes(out_dir: Path, header: str, lines: Sequence[str]) -> None:
+    if not lines:
+        return
+    failure_path = out_dir / "failure_report.txt"
+    with failure_path.open("a", encoding="utf-8") as handle:
+        handle.write(header + "\n")
+        for line in lines:
+            handle.write(line + "\n")
+    _log(f"Appended diagnostics to {failure_path}")
 
 
 def _copy_bootstrap_blob(json_path: Path, out_dir: Path) -> None:
@@ -141,6 +153,30 @@ def _write_unpacked_outputs(out_dir: Path, data: Any) -> None:
     json_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     lua_path.write_text("return " + _to_lua_literal(data), encoding="utf-8")
     _log(f"Wrote unpacked dump to {json_path} and {lua_path}")
+
+
+def _collect_weak_candidates(out_dir: Path) -> list[str]:
+    path = out_dir / "opcode_candidates.json"
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    notes: list[str] = []
+    for opnum, meta in sorted(payload.items(), key=lambda item: int(item[0])):
+        if not isinstance(meta, dict):
+            continue
+        candidates = meta.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            continue
+        placeholder = f"OP_{opnum}"
+        weak = placeholder in candidates[:2] or len(candidates) > 4
+        if weak:
+            notes.append(f"op {opnum}: {', '.join(str(c) for c in candidates)}")
+    return notes
 
 
 def _validate_unpacked(data: Any) -> Tuple[bool, str]:
@@ -228,15 +264,27 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
     return True, _normalise(raw), ""
 
 
-def _run_detection(init_path: Path, out_dir: Path) -> Dict[str, Any]:
+def _run_detection(init_path: Path, out_dir: Path, *, write_report: bool) -> Dict[str, Any]:
     version_dir = REPO_ROOT / "src" / "versions"
     candidates = [init_path]
     if version_dir.exists():
         candidates.extend(version_dir.rglob("*.lua"))
     report = detect_protections.scan_files(candidates)
-    report_path = out_dir / "protection_report.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    _log(f"Protection report written to {report_path}")
+    if write_report:
+        report_path = out_dir / "protection_report.json"
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        _log(f"Protection report written to {report_path}")
+    macros = report.get("macros", [])
+    if macros:
+        _log(f"Detected Luraph macros: {', '.join(macros)}", "WARN")
+    settings_known = report.get("settings", {}).get("known", {}) if isinstance(report.get("settings"), dict) else {}
+    if settings_known:
+        pretty = ", ".join(f"{key}={value}" for key, value in settings_known.items())
+        _log(f"Extracted settings: {pretty}")
+    metadata = report.get("metadata", {})
+    if metadata:
+        meta_pairs = ", ".join(f"{key}={value}" for key, value in metadata.items())
+        _log(f"Bootstrap metadata: {meta_pairs}")
     return report
 
 
@@ -324,7 +372,9 @@ def _write_summary(out_dir: Path, summary: Dict[str, Any]) -> None:
     _log(f"Summary written to {path}")
 
 
-def _run_lifter_pipeline(out_dir: Path) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def _run_lifter_pipeline(
+    out_dir: Path, *, skip_verifier: bool = False, skip_reconstruction: bool = False
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     from src.lifter_core import run_lifter
     from src.opcode_verifier import run_verification
     from src.deob_reconstruct import reconstruct
@@ -334,12 +384,21 @@ def _run_lifter_pipeline(out_dir: Path) -> Tuple[Dict[str, Any], Dict[str, Any],
     reconstruct_result: Dict[str, Any] = {"status": "skipped"}
 
     if lifter_result.get("status") == "ok":
-        verifier_result = run_verification(out_dir / "unpacked_dump.json", out_dir)
-        reconstruct_result = reconstruct(
-            out_dir / "unpacked_dump.json",
-            out_dir / "opcode_map.v14_4_1.verified.json",
-            out_dir,
-        )
+        if not skip_verifier:
+            verifier_result = run_verification(out_dir / "unpacked_dump.json", out_dir)
+        else:
+            verifier_result = {"status": "skipped", "reason": "jit_macro"}
+        if not skip_reconstruction:
+            reconstruct_result = reconstruct(
+                out_dir / "unpacked_dump.json",
+                out_dir / "opcode_map.v14_4_1.verified.json",
+                out_dir,
+            )
+        else:
+            reconstruct_result = {"status": "skipped", "reason": "disabled"}
+        weak_notes = _collect_weak_candidates(out_dir)
+        if weak_notes:
+            _append_failure_notes(out_dir, "Opcode candidates requiring review:", weak_notes)
     return lifter_result, verifier_result, reconstruct_result
 
 
@@ -405,50 +464,115 @@ def main(argv: list[str] | None = None) -> int:
 
     _copy_bootstrap_blob(json_path, out_dir)
 
-    detection_report: Dict[str, Any] | None = None
-    if args.detect_protections:
-        detection_report = _run_detection(init_path, out_dir)
+    detection_report: Dict[str, Any] = _run_detection(
+        init_path, out_dir, write_report=args.detect_protections
+    )
+    macros_detected = list(detection_report.get("macros", []))
+    settings_known = (
+        detection_report.get("settings", {}).get("known", {})
+        if isinstance(detection_report.get("settings"), dict)
+        else {}
+    )
+    detection_metadata = detection_report.get("metadata", {})
+    limitations_collected: list[str] = list(detection_report.get("limitations", []))
+
+    def _add_limitation(note: str) -> None:
+        if note and note not in limitations_collected:
+            limitations_collected.append(note)
+
+    def _first_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                result = _first_bool(item)
+                if result is not None:
+                    return result
+        return None
+
+    skip_lifter_due_to_macros = False
+    skip_verifier_due_to_jit = False
+
+    if any(name == "LPH_NO_VIRTUALIZE" or name == "LPH_SKIP" for name in macros_detected):
+        skip_lifter_due_to_macros = True
+        _log("Detected virtualization-disabling macro; entering partial deobfuscation mode", "WARN")
+        _add_limitation("Skipped lifter due to macro disabling virtualization")
+
+    virtualize_setting = settings_known.get("virtualize_all")
+    virtualize_all_flag = _first_bool(virtualize_setting)
+    if virtualize_all_flag is False and not skip_lifter_due_to_macros:
+        skip_lifter_due_to_macros = True
+        _log("Settings specify virtualize_all=false; running in partial mode", "WARN")
+        _add_limitation("Settings virtualize_all=false; lifter bypassed")
+
+    if any(name.startswith("LPH_JIT") for name in macros_detected):
+        skip_verifier_due_to_jit = True
+        _log("Detected JIT macro; opcode verifier will be skipped to avoid inline stub mismatches", "WARN")
+        _add_limitation("Verifier skipped due to LPH_JIT macro")
+
+    pipeline_mode = "full"
+    if skip_lifter_due_to_macros:
+        pipeline_mode = "partial"
+    elif skip_verifier_due_to_jit:
+        pipeline_mode = "jit-aware"
+
+    def _apply_detection_to_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+        summary["macros"] = list(macros_detected)
+        summary["settings"] = deepcopy(detection_report.get("settings", {}))
+        summary["metadata"] = deepcopy(detection_metadata)
+        summary["protection_detected"] = detection_report.get("protection_detected", False)
+        summary["protection_types"] = list(detection_report.get("types", []))
+        if limitations_collected:
+            summary["limitations"] = list(limitations_collected)
+        summary["pipeline_mode"] = pipeline_mode
+        return summary
 
     capture_status = False
     capture_data: Any = None
     fallback_used = False
-    capture_method = args.capture_runtime
+    capture_method_requested = args.capture_runtime
     runtime_metadata: Dict[str, Any] | None = None
+    capture_method_used: str | None = None
 
-    if capture_method:
+    if capture_method_requested:
         capture_output_dir = Path(args.capture_output) if args.capture_output else out_dir / "capture_traces"
-        try:
-            raw_data, runtime_metadata = _perform_runtime_capture(
-                capture_method,
-                capture_dir=capture_output_dir,
-                script_key=script_key,
-                json_path=json_path,
-                timeout=args.capture_timeout,
-                target=args.capture_target,
-            )
-        except Exception as exc:
-            _write_failure(out_dir, f"runtime capture ({capture_method}) failed", str(exc))
-            summary = {
-                "status": "fail",
-                "unpacked_dump_exists": False,
-                "instructions": 0,
-                "unique_opnums": 0,
-                "opcodes_verified": 0,
-                "high_confidence": 0,
-                "chunks": 0,
-                "fallback_fixture": False,
-                "runtime_capture_method": capture_method,
-            }
-            if detection_report is not None:
-                summary["protection_detected"] = detection_report["protection_detected"]
-                summary["protection_types"] = detection_report["types"]
-            _write_summary(out_dir, summary)
-            return 3
+        methods_to_try: list[str] = []
+        if capture_method_requested == "frida":
+            methods_to_try = ["frida", "luajit", "emulator"]
+        elif capture_method_requested == "luajit":
+            methods_to_try = ["luajit", "emulator"]
+        else:
+            methods_to_try = ["emulator"]
 
-        capture_status = True
-        capture_data = _normalise(raw_data)
-        _write_unpacked_outputs(out_dir, capture_data)
-        _log(f"Runtime capture via {capture_method} produced an unpacked dump")
+        for method in methods_to_try:
+            if method == "emulator" and not args.capture_target:
+                _log("Skipping emulator runtime capture because --capture-target was not provided", "WARN")
+                continue
+            try:
+                raw_data, runtime_metadata = _perform_runtime_capture(
+                    method,
+                    capture_dir=capture_output_dir,
+                    script_key=script_key,
+                    json_path=json_path,
+                    timeout=args.capture_timeout,
+                    target=args.capture_target,
+                )
+            except Exception as exc:
+                _log(f"Runtime capture via {method} failed: {exc}", "WARN")
+                continue
+
+            capture_status = True
+            capture_method_used = method
+            capture_data = _normalise(raw_data)
+            _write_unpacked_outputs(out_dir, capture_data)
+            _log(f"Runtime capture via {method} produced an unpacked dump")
+            break
+
+        if capture_method_requested and not capture_status:
+            _log(
+                "All requested runtime capture methods exhausted without success; falling back to sandbox",  # noqa: E501
+                "WARN",
+            )
 
     if not capture_status:
         _log("Attempting in-process sandbox via lupa")
@@ -484,11 +608,9 @@ def main(argv: list[str] | None = None) -> int:
                         "chunks": 0,
                         "fallback_fixture": fallback_used,
                     }
-                    if capture_method:
-                        summary["runtime_capture_method"] = capture_method
-                    if detection_report is not None:
-                        summary["protection_detected"] = detection_report["protection_detected"]
-                        summary["protection_types"] = detection_report["types"]
+                    if capture_method_used:
+                        summary["runtime_capture_method"] = capture_method_used
+                    summary = _apply_detection_to_summary(summary)
                     _write_summary(out_dir, summary)
                     return 3
 
@@ -505,11 +627,9 @@ def main(argv: list[str] | None = None) -> int:
             "chunks": 0,
             "fallback_fixture": fallback_used,
         }
-        if capture_method:
-            summary["runtime_capture_method"] = capture_method
-        if detection_report is not None:
-            summary["protection_detected"] = detection_report["protection_detected"]
-            summary["protection_types"] = detection_report["types"]
+        if capture_method_used:
+            summary["runtime_capture_method"] = capture_method_used
+        summary = _apply_detection_to_summary(summary)
         _write_summary(out_dir, summary)
         return 4
 
@@ -526,11 +646,9 @@ def main(argv: list[str] | None = None) -> int:
             "chunks": 0,
             "fallback_fixture": fallback_used,
         }
-        if capture_method:
-            summary["runtime_capture_method"] = capture_method
-        if detection_report is not None:
-            summary["protection_detected"] = detection_report["protection_detected"]
-            summary["protection_types"] = detection_report["types"]
+        if capture_method_used:
+            summary["runtime_capture_method"] = capture_method_used
+        summary = _apply_detection_to_summary(summary)
         _write_summary(out_dir, summary)
         return 5
 
@@ -544,35 +662,46 @@ def main(argv: list[str] | None = None) -> int:
         "chunks": 0,
         "fallback_fixture": fallback_used,
     }
-    if capture_method:
-        summary["runtime_capture_method"] = capture_method
+    if capture_method_used:
+        summary["runtime_capture_method"] = capture_method_used
     if runtime_metadata:
         summary["runtime_capture"] = runtime_metadata
-    if detection_report is not None:
-        summary["protection_detected"] = detection_report["protection_detected"]
-        summary["protection_types"] = detection_report["types"]
+    summary = _apply_detection_to_summary(summary)
 
     if args.run_lifter:
-        lifter_result, verifier_result, reconstruct_result = _run_lifter_pipeline(out_dir)
-        if lifter_result.get("status") != "ok":
-            _write_failure(out_dir, "lifter failed", lifter_result.get("message", ""))
-            summary["status"] = "fail"
+        if skip_lifter_due_to_macros:
+            summary["lifter_status"] = "skipped"
+            if summary.get("status") == "ok":
+                summary["status"] = "partial"
+            summary = _apply_detection_to_summary(summary)
         else:
-            summary["instructions"] = lifter_result.get("instructions", 0)
-            summary["unique_opnums"] = lifter_result.get("unique_opnums", 0)
-            if verifier_result.get("status") == "ok":
-                summary["opcodes_verified"] = verifier_result.get("verified", 0)
-                summary["high_confidence"] = verifier_result.get("high_confidence", 0)
-            else:
+            lifter_result, verifier_result, reconstruct_result = _run_lifter_pipeline(
+                out_dir, skip_verifier=skip_verifier_due_to_jit
+            )
+            if lifter_result.get("status") != "ok":
+                _write_failure(out_dir, "lifter failed", lifter_result.get("message", ""))
                 summary["status"] = "fail"
-                _write_failure(out_dir, "opcode verification failed", verifier_result.get("message", ""))
-            if reconstruct_result.get("status") == "ok":
-                summary["chunks"] = reconstruct_result.get("chunks", 0)
             else:
-                summary["status"] = "fail"
-                _write_failure(out_dir, "reconstruction failed", reconstruct_result.get("message", ""))
+                summary["instructions"] = lifter_result.get("instructions", 0)
+                summary["unique_opnums"] = lifter_result.get("unique_opnums", 0)
+                if verifier_result.get("status") == "ok":
+                    summary["opcodes_verified"] = verifier_result.get("verified", 0)
+                    summary["high_confidence"] = verifier_result.get("high_confidence", 0)
+                else:
+                    if skip_verifier_due_to_jit:
+                        summary["verifier_status"] = "skipped"
+                    else:
+                        summary["status"] = "fail"
+                        _write_failure(out_dir, "opcode verification failed", verifier_result.get("message", ""))
+                if verifier_result.get("status") == "ok" or skip_verifier_due_to_jit:
+                    if reconstruct_result.get("status") == "ok":
+                        summary["chunks"] = reconstruct_result.get("chunks", 0)
+                    else:
+                        summary["status"] = "fail"
+                        _write_failure(out_dir, "reconstruction failed", reconstruct_result.get("message", ""))
+            summary = _apply_detection_to_summary(summary)
     _write_summary(out_dir, summary)
-    return 0 if summary["status"] == "ok" else 1
+    return 0 if summary["status"] in {"ok", "partial"} else 1
 
 
 if __name__ == "__main__":

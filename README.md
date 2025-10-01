@@ -28,7 +28,8 @@ encrypted script payloads).
 
 ## Installation
 
-Clone the repository and install the required dependencies:
+Clone the repository and install the required dependencies. The toolkit targets
+Python **3.10 – 3.11** to remain compatible with the bundled `lupa` release:
 
 ```bash
 git clone https://github.com/example/luraph-deobfuscator-py.git
@@ -41,7 +42,9 @@ pip install -r requirements.txt
 ### Windows
 
 The repository bundles a 64-bit LuaJIT runtime under `bin/`, so no additional
-system setup is needed:
+system setup is needed. All helper scripts (including the new initv4 shim) are
+written with Windows 11 Command Prompt/PowerShell compatibility in mind—no
+POSIX-only shell features are required:
 
 ```powershell
 pip install -r requirements.txt
@@ -61,7 +64,9 @@ python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <scr
 
 Run `python tools/check_deps.py` at any time to confirm that both lupa and a
 LuaJIT executable are available. The script automatically prefers the bundled
-`bin/luajit.exe` when present.
+`bin/luajit.exe` when present. The Lua shim logs to `out/shim_usage.txt` and
+captures fallback payloads to `out/unpacked_dump.lua.json` for post-mortem
+analysis.
 
 ### Protection detection & runtime capture
 
@@ -73,6 +78,9 @@ heavily protected payloads:
 python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --detect-protections
 
+# Directly run the static detector if you only need the report
+python detect_protections.py initv4.lua -o out/protection_report.json
+
 # Attempt a runtime capture using the Frida helper against a prerecorded trace
 python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --capture-runtime frida \
@@ -82,6 +90,11 @@ python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
 python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --capture-runtime luajit --capture-timeout 20
 ```
+
+Runtime capture requests follow the fallback chain **Frida → LuaJIT wrapper →
+emulator → in-process sandbox**. When a method fails the runner logs the error
+and automatically proceeds to the next stage, ensuring static analysis still
+occurs even if dynamic tooling is unavailable.
 
 Runtime captures are written to `out/capture_traces/` (customisable via
 `--capture-output`) and automatically translated into `unpacked_dump.json`

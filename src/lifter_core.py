@@ -155,46 +155,58 @@ def _gather_stats(ir: Iterable[InstructionIR], const_count: int) -> Dict[int, Di
 
 
 def _candidate_names(stats: Dict[str, Any], opnum: int) -> List[str]:
-    candidates: List[str] = []
-    count = stats.get("count", 0) or 1
+    scores: Dict[str, float] = {}
+    count = max(1, stats.get("count", 0) or 1)
+
+    def bump(name: str, weight: float) -> None:
+        scores[name] = scores.get(name, 0.0) + weight
 
     b_const_ratio = stats.get("b_const", 0) / count
+    c_const_ratio = stats.get("c_const", 0) / count
+    b_int_ratio = stats.get("b_int", 0) / count
     c_int_ratio = stats.get("c_int", 0) / count
     b_none_ratio = stats.get("b_none", 0) / count
+    c_none_ratio = stats.get("c_none", 0) / count
     a_int_ratio = stats.get("a_int", 0) / count
 
-    if b_const_ratio > 0.5:
-        candidates.extend(["LOADK", "GETGLOBAL", "SETGLOBAL"])
-    if c_int_ratio > 0.5:
-        candidates.extend(["GETTABLE", "SETTABLE", "EQ", "LT", "LE"])
-    if a_int_ratio > 0.5 and stats.get("b_int", 0) > 0 and b_const_ratio < 0.3:
-        candidates.extend(["MOVE", "CALL", "RETURN"])
-    if b_none_ratio > 0.2:
-        candidates.extend(["RETURN", "VARARG"])
+    if b_const_ratio > 0.6:
+        bump("LOADK", 5.0)
+        bump("GETGLOBAL", 3.5)
+        bump("SETGLOBAL", 3.5)
+    elif b_const_ratio > 0.3:
+        bump("LOADK", 2.0)
 
-    # Always provide a baseline mnemonic from the canonical Lua opcode table if
-    # available to give downstream tooling a human-friendly hint.
+    if b_int_ratio > 0.6 and b_const_ratio < 0.2:
+        bump("MOVE", 4.5)
+        bump("CALL", 2.5)
+        bump("RETURN", 1.5)
+
+    if c_const_ratio > 0.5:
+        bump("SETTABLE", 3.5)
+        bump("GETTABLE", 3.5)
+    if c_int_ratio > 0.6 and c_const_ratio < 0.2:
+        bump("EQ", 2.5)
+        bump("LT", 2.5)
+        bump("LE", 2.0)
+
+    if b_none_ratio > 0.25 or c_none_ratio > 0.25:
+        bump("RETURN", 2.5)
+        bump("VARARG", 2.0)
+
+    if a_int_ratio > 0.7 and b_int_ratio > 0.5:
+        bump("MOVE", 1.5)
+
     base_spec = _BASE_OPCODE_TABLE.get(opnum)
     if base_spec:
         mnemonic = getattr(base_spec, "mnemonic", None) or str(base_spec)
-        candidates.append(mnemonic)
+        bump(str(mnemonic), 0.5)
 
-    # Deduplicate while preserving order.
-    seen = set()
-    ordered: List[str] = []
-    for name in candidates:
-        if name not in seen:
-            ordered.append(name)
-            seen.add(name)
-
-    # Fallback placeholder.
     placeholder = f"OP_{opnum}"
-    if not ordered:
-        ordered.append(placeholder)
-    elif ordered[-1] != placeholder:
-        ordered.append(placeholder)
+    if placeholder not in scores:
+        scores[placeholder] = 0.0
 
-    return ordered
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    return [name for name, _ in ordered]
 
 
 def run_lifter(unpacked_path: str | os.PathLike[str], out_dir: str | os.PathLike[str]) -> Dict[str, Any]:
@@ -302,5 +314,43 @@ def run_lifter(unpacked_path: str | os.PathLike[str], out_dir: str | os.PathLike
     }
 
 
-__all__ = ["run_lifter"]
+def cluster_candidate_rankings(reports: Iterable[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Aggregate candidate rankings across multiple runs.
+
+    Each ``report`` should contain the JSON payload produced by
+    ``opcode_candidates.json``. The return value maps opcode numbers to candidate
+    lists ordered by descending aggregate weight.
+    """
+
+    aggregate: Dict[str, Dict[str, float]] = {}
+    for report in reports:
+        if not isinstance(report, MutableMapping):
+            continue
+        for opnum, meta in report.items():
+            if not isinstance(meta, MutableMapping):
+                continue
+            candidates = meta.get("candidates")
+            if not isinstance(candidates, list):
+                continue
+            bucket = aggregate.setdefault(str(opnum), {})
+            total = len(candidates)
+            for rank, name in enumerate(candidates):
+                weight = float(max(total - rank, 1))
+                bucket[str(name)] = bucket.get(str(name), 0.0) + weight
+
+    clustered: Dict[str, List[str]] = {}
+    for opnum, score_map in aggregate.items():
+        ordered = sorted(
+            score_map.items(),
+            key=lambda item: (
+                -item[1],
+                item[0].startswith("OP_"),
+                item[0],
+            ),
+        )
+        clustered[opnum] = [name for name, _ in ordered]
+    return clustered
+
+
+__all__ = ["run_lifter", "cluster_candidate_rankings"]
 
