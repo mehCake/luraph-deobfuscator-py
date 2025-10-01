@@ -1,10 +1,4 @@
--- tools/devirtualize_v3.lua
---
--- Hardened LuaJIT wrapper executed by the Python sandbox runner when lupa is
--- not available.  The wrapper loads the initv4 bootstrapper, injects safe
--- shims for missing globals, attempts to capture the ``unpackedData`` table,
--- and serialises it into the ``out/`` directory.  A short JSON status line is
--- printed to stdout so the caller can determine success or failure.
+package.path = package.path .. ";./tools/?.lua;./tools/?/init.lua;./tools/shims/?.lua"
 
 local script_key = arg and arg[1] or os.getenv("SCRIPT_KEY") or ""
 local json_path = (arg and arg[2]) or "Obfuscated.json"
@@ -39,6 +33,25 @@ end
 
 ensure_dir(out_dir)
 ensure_dir(logs_dir)
+
+do
+  local shim_module
+  local ok_shim, shim_candidate = pcall(dofile, "tools/shims/initv4_shim.lua")
+  if ok_shim and type(shim_candidate) == "table" and type(shim_candidate.install) == "function" then
+    shim_module = shim_candidate
+  else
+    local ok_req, shim_required = pcall(require, "tools.shims.initv4_shim")
+    if ok_req and type(shim_required) == "table" and type(shim_required.install) == "function" then
+      shim_module = shim_required
+    end
+  end
+  if shim_module then
+    local ok_install, err_install = pcall(shim_module.install, _G, { out_dir = out_dir })
+    if not ok_install then
+      io.stderr:write("[devirtualize_v3] shim install failed: " .. tostring(err_install) .. "\n")
+    end
+  end
+end
 
 local function timestamp()
   return os.date("!%Y-%m-%dT%H:%M:%SZ")
@@ -125,8 +138,7 @@ local function emit_status(status, message, extra)
     end
   end
   local encoded = dumper.to_json(payload)
-  io.stdout:write(encoded .. "
-")
+  io.stdout:write(encoded .. "\n")
   if status ~= 'ok' then
     local details = message or 'unknown failure'
     if extra then
@@ -135,21 +147,11 @@ local function emit_status(status, message, extra)
         lines[#lines + 1] = tostring(k) .. ': ' .. tostring(v)
       end
       if #lines > 0 then
-        details = details .. "
-" .. table.concat(lines, "
-")
+        details = details .. "\n" .. table.concat(lines, "\n")
       end
     end
     write_failure(details)
   end
-end
-  if extra then
-    for k, v in pairs(extra) do
-      payload[k] = v
-    end
-  end
-  local encoded = dumper.to_json(payload)
-  io.stdout:write(encoded .. "\n")
 end
 
 local function is_vm_data_shape(tbl)
