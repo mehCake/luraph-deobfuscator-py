@@ -59,5 +59,5 @@ def test_scan_files_merges_macros(tmp_path: Path) -> None:
     ],
 )
 def test_macro_comment_normalisation(sample: str, expected: list[str]) -> None:
-    report = detect_protections.scan_lua(sample)
+    report = detect_protections.scan_lua(sample, filename="macro.lua")
     assert report["macros"] == expected

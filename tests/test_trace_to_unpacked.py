@@ -9,7 +9,6 @@ from src.runtime_capture import trace_to_unpacked
 
 
 def test_convert_json_buffer(tmp_path: Path) -> None:
-    payload = {"4": [[None, None, 1]], "5": []}
     path = tmp_path / "dump.json"
     path.write_text('{"4": [[null, null, 1]], "5": []}', encoding="utf-8")
     result = trace_to_unpacked.convert_file(path)
@@ -36,5 +35,5 @@ def test_convert_vm_words(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("bad", [b"abc", b"12345"])
 def test_convert_invalid_vm(bad: bytes) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(trace_to_unpacked.ConversionError):
         trace_to_unpacked.convert_bytes(bad)

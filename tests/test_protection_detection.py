@@ -22,7 +22,7 @@ from src import detect_protections
     ],
 )
 def test_scan_lua_detects_categories(snippet: str, expected: str) -> None:
-    report = detect_protections.scan_lua(snippet)
+    report = detect_protections.scan_lua(snippet, filename="test.lua")
     assert report["protection_detected"] is True
     assert expected in report["types"]
 

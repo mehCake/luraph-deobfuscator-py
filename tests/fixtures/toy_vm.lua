@@ -1,20 +1,17 @@
--- Minimal VM sample used by regression tests.
-local payload = {0x41, 0x42, 0x43}
-local xor_key = 0x20
-
-local function decrypt(buf, key)
-  local out = {}
-  for i = 1, #buf do
-    out[i] = string.char(bit.bxor(buf[i], key))
-  end
-  return table.concat(out)
-end
+-- Minimal bootstrap used to exercise the initv4 shim helpers.
+local encrypted = {0x30, 0x31, 0x32}
+local key = {0x10}
+local decoded = L1(encrypted, key)
+local fragments = {
+  { {nil, nil, decoded[1]} },
+  { {nil, nil, decoded[2]} },
+  { {nil, nil, decoded[3]} },
+}
+local joined = Y1(fragments[1], fragments[2], fragments[3])
+local consts = { Y2({65, 66, 67}) }
 
 unpackedData = {
-  decrypt(payload, xor_key),
-  {
-    array = payload,
-    key = xor_key,
-  },
+  [4] = joined,
+  [5] = consts,
 }
 return unpackedData

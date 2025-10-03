@@ -1,14 +1,38 @@
 -- tools/shims/initv4_shim.lua
--- Purpose: Provide safe stand-ins for initv4 bootstrap helpers (L1, Y1, …)
--- so initv4.lua does not abort with "nil value" calls. Also, log each call
--- to a file and capture the first observed 'unpackedData' table as JSON.
 --
--- This shim is intentionally Windows-friendly: it uses only LuaJIT features
--- and ordinary file I/O (no shell commands, pipes, or POSIX paths).
+-- Bootstrap shim for Luraph v14.4.x initv4 loaders.  The shim provides the
+-- helper functions (L1/Y1/...) that the bootstrap expects, records macro
+-- usage, and captures the decoded ``unpackedData`` table even when it only
+-- lives in closure upvalues.  The implementation is Windows-friendly – it
+-- relies solely on stock LuaJIT facilities and plain file I/O.
 
 local M = {}
 
-local json_modules = { "cjson", "dkjson" }
+local unpack = table.unpack or unpack
+
+local function ensure_dir(path)
+  local sep = package.config:sub(1, 1)
+  local ok_lfs, lfs = pcall(require, "lfs")
+  if ok_lfs and lfs then
+    local accum = ""
+    for part in path:gmatch("[^" .. sep .. "]+") do
+      accum = accum == "" and part or (accum .. sep .. part)
+      local attr = lfs.attributes(accum)
+      if not attr then
+        lfs.mkdir(accum)
+      end
+    end
+    return
+  end
+
+  -- Fallback: attempt to create a probe file to ensure the directory exists.
+  local probe = path .. sep .. ".shim_probe"
+  local handle = io.open(probe, "a")
+  if handle then
+    handle:close()
+    os.remove(probe)
+  end
+end
 
 local function open_log(path)
   local ok, handle = pcall(io.open, path, "a")
@@ -18,675 +42,587 @@ local function open_log(path)
   return nil
 end
 
-local unpack = table.unpack or unpack
-
-local function pack(...)
-  return { n = select("#", ...), ... }
+local function close_log(state)
+  if state.log then
+    pcall(function()
+      state.log:flush()
+      state.log:close()
+    end)
+    state.log = nil
+  end
 end
 
-local has_bit, bit = pcall(require, "bit")
-
-local POW2 = {}
-for i = 0, 31 do
-  POW2[i] = 2 ^ i
+local function log_line(state, message)
+  if not state.log then
+    return
+  end
+  state.log:write(message .. "\n")
+  state.log:flush()
 end
 
-local function mask32(n)
-  n = tonumber(n) or 0
-  if has_bit and bit.band then
-    return bit.band(n, 0xFFFFFFFF)
+local function normalise_key(key)
+  if type(key) == "string" then
+    return key
   end
-  if n >= 0 then
-    return n % 0x100000000
+  if type(key) == "number" then
+    return tostring(key)
   end
-  local positive = (-n) % 0x100000000
-  return 0x100000000 - positive
+  return tostring(key)
 end
 
-local function bxor_pair(a, b)
-  if has_bit and bit.bxor then
-    return mask32(bit.bxor(a, b))
-  end
-  local ua = mask32(a)
-  local ub = mask32(b)
-  local result = 0
-  local bitval = 1
-  for _ = 0, 31 do
-    local abit = ua % 2
-    local bbit = ub % 2
-    if abit ~= bbit then
-      result = result + bitval
-    end
-    ua = math.floor(ua / 2)
-    ub = math.floor(ub / 2)
-    bitval = bitval * 2
-  end
-  return result
-end
-
-local function bor_pair(a, b)
-  if has_bit and bit.bor then
-    return mask32(bit.bor(a, b))
-  end
-  local ua = mask32(a)
-  local ub = mask32(b)
-  local result = 0
-  local bitval = 1
-  for _ = 0, 31 do
-    local abit = ua % 2
-    local bbit = ub % 2
-    if abit == 1 or bbit == 1 then
-      result = result + bitval
-    end
-    ua = math.floor(ua / 2)
-    ub = math.floor(ub / 2)
-    bitval = bitval * 2
-  end
-  return result
-end
-
-local function band_pair(a, b)
-  if has_bit and bit.band then
-    return mask32(bit.band(a, b))
-  end
-  local ua = mask32(a)
-  local ub = mask32(b)
-  local result = 0
-  local bitval = 1
-  for _ = 0, 31 do
-    local abit = ua % 2
-    local bbit = ub % 2
-    if abit == 1 and bbit == 1 then
-      result = result + bitval
-    end
-    ua = math.floor(ua / 2)
-    ub = math.floor(ub / 2)
-    bitval = bitval * 2
-  end
-  return result
-end
-
-local function bitwise_reduce(pair_func, first, second, ...)
-  if second == nil then
-    return mask32(first)
-  end
-  local result = pair_func(first, second)
-  local extra = { ... }
-  for i = 1, #extra do
-    result = pair_func(result, extra[i])
-  end
-  return mask32(result)
-end
-
-local function bxor(a, b, ...)
-  return bitwise_reduce(bxor_pair, a, b, ...)
-end
-
-local function bor(a, b, ...)
-  return bitwise_reduce(bor_pair, a, b, ...)
-end
-
-local function band(a, b, ...)
-  return bitwise_reduce(band_pair, a, b, ...)
-end
-
-local function bnot(a)
-  if has_bit and bit.bnot then
-    return mask32(bit.bnot(a))
-  end
-  return mask32(0xFFFFFFFF - mask32(a))
-end
-
-local function normalize_shift(s)
-  return math.floor((tonumber(s) or 0) % 32)
-end
-
-local function lshift(a, s)
-  if has_bit and bit.lshift then
-    return mask32(bit.lshift(a, s))
-  end
-  local value = mask32(a)
-  local shift = normalize_shift(s)
-  for _ = 1, shift do
-    value = (value * 2) % 0x100000000
-  end
-  return mask32(value)
-end
-
-local function rshift(a, s)
-  if has_bit and bit.rshift then
-    return mask32(bit.rshift(a, s))
-  end
-  local value = mask32(a)
-  local shift = normalize_shift(s)
-  for _ = 1, shift do
-    value = math.floor(value / 2)
-  end
-  return mask32(value)
-end
-
-local function arshift(a, s)
-  if has_bit and bit.arshift then
-    return mask32(bit.arshift(a, s))
-  end
-  local value = mask32(a)
-  local shift = normalize_shift(s)
-  if shift == 0 then
-    return value
-  end
-  local sign = band(value, 0x80000000) ~= 0
-  local result = rshift(value, shift)
-  if sign then
-    local fill = 0
-    for i = 0, shift - 1 do
-      fill = fill + POW2[31 - i]
-    end
-    result = bor(result, fill)
-  end
-  return mask32(result)
-end
-
-local function lrotate(a, s)
-  if has_bit and bit.rol then
-    return mask32(bit.rol(a, s))
-  end
-  local shift = normalize_shift(s)
-  if shift == 0 then
-    return mask32(a)
-  end
-  local left = lshift(a, shift)
-  local right = rshift(a, 32 - shift)
-  return mask32(bor(left, right))
-end
-
-local function rrotate(a, s)
-  if has_bit and bit.ror then
-    return mask32(bit.ror(a, s))
-  end
-  local shift = normalize_shift(s)
-  if shift == 0 then
-    return mask32(a)
-  end
-  local right = rshift(a, shift)
-  local left = lshift(a, 32 - shift)
-  return mask32(bor(left, right))
-end
-
-local function countlz(value)
-  if has_bit and bit.clz then
-    return bit.clz(mask32(value))
-  end
-  local v = mask32(value)
-  if v == 0 then
-    return 32
-  end
-  local count = 0
-  local mask = 0x80000000
-  while mask ~= 0 and band(v, mask) == 0 do
-    count = count + 1
-    mask = math.floor(mask / 2)
-  end
-  return count
-end
-
-local function countrz(value)
-  if has_bit and bit.ctz then
-    return bit.ctz(mask32(value))
-  end
-  local v = mask32(value)
-  if v == 0 then
-    return 32
-  end
-  local count = 0
-  local mask = 1
-  while mask <= 0x80000000 and band(v, mask) == 0 do
-    count = count + 1
-    mask = mask * 2
-  end
-  return count
-end
-
-local function ensure_bit32_table()
-  local existing = rawget(_G, "bit32")
-  local target = type(existing) == "table" and existing or {}
-  if target.band == nil then
-    target.band = band
-  end
-  if target.bor == nil then
-    target.bor = bor
-  end
-  if target.bxor == nil then
-    target.bxor = bxor
-  end
-  if target.bnot == nil then
-    target.bnot = bnot
-  end
-  if target.lshift == nil then
-    target.lshift = lshift
-  end
-  if target.rshift == nil then
-    target.rshift = rshift
-  end
-  if target.arshift == nil then
-    target.arshift = arshift
-  end
-  if target.lrotate == nil then
-    target.lrotate = lrotate
-  end
-  if target.rrotate == nil then
-    target.rrotate = rrotate
-  end
-  if target.rol == nil then
-    target.rol = lrotate
-  end
-  if target.ror == nil then
-    target.ror = rrotate
-  end
-  if target.countlz == nil then
-    target.countlz = countlz
-  end
-  if target.countrz == nil then
-    target.countrz = countrz
-  end
-  if existing == nil then
-    rawset(_G, "bit32", target)
-  end
-  return target
-end
-
-local function dump_table(t, depth, visited)
-  depth = depth or 0
-  visited = visited or {}
-  if type(t) ~= "table" then
-    return tostring(t)
-  end
-  if visited[t] then
-    return "<cycle>"
-  end
-  visited[t] = true
-  local parts = {"{"}
-  local count = 0
-  for k, v in pairs(t) do
-    count = count + 1
-    if depth < 2 then
-      parts[#parts + 1] = tostring(k) .. "=" .. dump_table(v, depth + 1, visited)
-    else
-      parts[#parts + 1] = tostring(k) .. "=…"
-    end
-    if count < 10 then
-      parts[#parts + 1] = ","
-    else
-      break
-    end
-  end
-  parts[#parts + 1] = "}"
-  return table.concat(parts)
-end
-
-local function encode_json(value, depth, seen)
-  depth = depth or 0
+local function to_basic(value, seen)
   seen = seen or {}
   local t = type(value)
-  if t == "number" then
-    return tostring(value)
-  elseif t == "boolean" then
-    return value and "true" or "false"
-  elseif t == "string" then
-    local s = value:gsub("\\", "\\\\"):gsub("\"", "\\""):gsub("\r", "\\r"):gsub("\n", "\\n")
-    return "\"" .. s .. "\""
-  elseif value == nil then
-    return "null"
-  elseif t == "table" then
+  if t == "table" then
     if seen[value] then
-      return '"<cycle>"'
+      return "<cycle>"
     end
     seen[value] = true
-    local is_array = true
-    local max_index = 0
-    local count = 0
-    for k, _ in pairs(value) do
-      if type(k) ~= "number" then
-        is_array = false
-      else
-        if k > max_index then
-          max_index = k
+    local arr = {}
+    local length = #value
+    for i = 1, length do
+      arr[i] = to_basic(value[i], seen)
+    end
+    local map = {}
+    for k, v in pairs(value) do
+      if not (type(k) == "number" and k >= 1 and k <= length) then
+        map[normalise_key(k)] = to_basic(v, seen)
+      end
+    end
+    if next(map) and length > 0 then
+      map.array = arr
+      return map
+    elseif next(map) then
+      return map
+    else
+      return arr
+    end
+  elseif t == "string" or t == "number" or t == "boolean" or value == nil then
+    return value
+  elseif t == "function" then
+    return string.format("<function:%s>", tostring(value))
+  else
+    return string.format("<%s>", t)
+  end
+end
+
+local function escape_json(str)
+  str = str:gsub('\\', '\\\\')
+  str = str:gsub('"', '\\"')
+  str = str:gsub('\r', '\\r')
+  str = str:gsub('\n', '\\n')
+  str = str:gsub('\t', '\\t')
+  return str
+end
+
+local function encode_json(value)
+  local t = type(value)
+  if t == "table" then
+    local length = #value
+    if length > 0 and (value.array == nil or type(value.array) ~= "table") then
+      local parts = {}
+      for i = 1, length do
+        parts[i] = encode_json(value[i])
+      end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
+    if value.array and type(value.array) == "table" then
+      local arr = {}
+      for i = 1, #value.array do
+        arr[i] = encode_json(value.array[i])
+      end
+      local entries = { '"array":[' .. table.concat(arr, ",") .. ']' }
+      for k, v in pairs(value) do
+        if k ~= "array" then
+          entries[#entries + 1] = string.format('"%s":%s', escape_json(normalise_key(k)), encode_json(v))
         end
       end
-      count = count + 1
+      table.sort(entries)
+      return "{" .. table.concat(entries, ",") .. "}"
     end
-    if is_array and max_index == count then
-      local items = {}
-      for i = 1, max_index do
-        items[i] = encode_json(value[i], depth + 1, seen)
+    local keys = {}
+    for k in pairs(value) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys, function(a, b)
+      return tostring(a) < tostring(b)
+    end)
+    local parts = {}
+    for i = 1, #keys do
+      local key = keys[i]
+      parts[i] = string.format('"%s":%s', escape_json(normalise_key(key)), encode_json(value[key]))
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  elseif t == "string" then
+    return '"' .. escape_json(value) .. '"'
+  elseif t == "number" or t == "boolean" then
+    return tostring(value)
+  elseif value == nil then
+    return "null"
+  else
+    return '"<' .. t .. '>"'
+  end
+end
+
+local function bitlib()
+  local ok, lib = pcall(require, "bit")
+  if ok and lib then
+    return lib
+  end
+  local shim = {}
+  local function mask32(n)
+    n = n % 0x100000000
+    if n < 0 then
+      n = n + 0x100000000
+    end
+    return n
+  end
+  function shim.band(a, b)
+    local result = 0
+    local bit = 1
+    a = mask32(a)
+    b = mask32(b)
+    for _ = 0, 31 do
+      if (a % 2 == 1) and (b % 2 == 1) then
+        result = result + bit
       end
-      return "[" .. table.concat(items, ",") .. "]"
+      a = math.floor(a / 2)
+      b = math.floor(b / 2)
+      bit = bit * 2
+    end
+    return result
+  end
+  function shim.bor(a, b)
+    local result = 0
+    local bit = 1
+    a = mask32(a)
+    b = mask32(b)
+    for _ = 0, 31 do
+      if (a % 2 == 1) or (b % 2 == 1) then
+        result = result + bit
+      end
+      a = math.floor(a / 2)
+      b = math.floor(b / 2)
+      bit = bit * 2
+    end
+    return result
+  end
+  function shim.bxor(a, b)
+    local result = 0
+    local bit = 1
+    a = mask32(a)
+    b = mask32(b)
+    for _ = 0, 31 do
+      if (a % 2) ~= (b % 2) then
+        result = result + bit
+      end
+      a = math.floor(a / 2)
+      b = math.floor(b / 2)
+      bit = bit * 2
+    end
+    return result
+  end
+  function shim.lshift(a, b)
+    return mask32(a * (2 ^ b))
+  end
+  function shim.rshift(a, b)
+    a = mask32(a)
+    return math.floor(a / (2 ^ b))
+  end
+  function shim.rol(a, b)
+    a = mask32(a)
+    b = b % 32
+    return mask32(shim.lshift(a, b) + shim.rshift(a, 32 - b))
+  end
+  function shim.ror(a, b)
+    a = mask32(a)
+    b = b % 32
+    return mask32(shim.rshift(a, b) + shim.lshift(a, 32 - b))
+  end
+  return shim
+end
+
+local BIT = bitlib()
+
+if not BIT.rol then
+  function BIT.rol(a, b)
+    a = BIT.band(a, 0xFFFFFFFF)
+    b = b % 32
+    local left = BIT.lshift(a, b)
+    local right = BIT.rshift(a, 32 - b)
+    return BIT.band(left + right, 0xFFFFFFFF)
+  end
+end
+
+if not BIT.ror then
+  function BIT.ror(a, b)
+    a = BIT.band(a, 0xFFFFFFFF)
+    b = b % 32
+    local right = BIT.rshift(a, b)
+    local left = BIT.lshift(a, 32 - b)
+    return BIT.band(left + right, 0xFFFFFFFF)
+  end
+end
+
+local function describe_args(args)
+  local parts = {}
+  for i = 1, math.min(4, #args) do
+    local v = args[i]
+    local t = type(v)
+    if t == "table" then
+      parts[#parts + 1] = string.format("table(len=%d)", #v)
+    elseif t == "string" then
+      local sample = v
+      if #sample > 16 then
+        sample = sample:sub(1, 16) .. "…"
+      end
+      parts[#parts + 1] = string.format('"%s"', sample)
     else
-      local items = {}
-      for k, v in pairs(value) do
-        items[#items + 1] = encode_json(tostring(k), depth + 1, seen) .. ":" .. encode_json(v, depth + 1, seen)
-      end
-      return "{" .. table.concat(items, ",") .. "}"
+      parts[#parts + 1] = tostring(v)
     end
   end
-  return '"<unsupported>"'
+  if #args > 4 then
+    parts[#parts + 1] = string.format("+%d", #args - 4)
+  end
+  return table.concat(parts, ", ")
 end
 
-local function best_effort_json(value)
-  for _, name in ipairs(json_modules) do
-    local ok, mod = pcall(require, name)
-    if ok and mod then
-      local ok_encode, encoded
-      if type(mod.encode) == "function" then
-        ok_encode, encoded = pcall(mod.encode, value, { indent = true })
-      elseif type(mod.new) == "function" then
-        local encoder = mod.new()
-        ok_encode, encoded = pcall(encoder.encode, encoder, value)
-      end
-      if ok_encode and type(encoded) == "string" then
-        return encoded
-      end
-    end
+local function helper_xor_buffer(buffer, key, salt)
+  if type(buffer) == "string" then
+    local bytes = { buffer:byte(1, #buffer) }
+    local result = helper_xor_buffer(bytes, key, salt)
+    return string.char(table.unpack(result))
   end
-  return encode_json(value)
+  if type(buffer) ~= "table" then
+    return buffer
+  end
+  local key_bytes = {}
+  if type(key) == "string" then
+    for i = 1, #key do
+      key_bytes[#key_bytes + 1] = key:byte(i)
+    end
+  elseif type(key) == "number" then
+    key_bytes[1] = key % 0x100
+  elseif type(key) == "table" then
+    for i = 1, #key do
+      key_bytes[#key_bytes + 1] = tonumber(key[i]) or 0
+    end
+  else
+    key_bytes[1] = 0
+  end
+  if salt and type(salt) == "number" then
+    key_bytes[#key_bytes + 1] = salt % 0x100
+  end
+  local result = {}
+  local key_len = #key_bytes
+  if key_len == 0 then
+    key_len = 1
+    key_bytes[1] = 0
+  end
+  for i = 1, #buffer do
+    local value = tonumber(buffer[i]) or 0
+    local key_val = key_bytes[((i - 1) % key_len) + 1]
+    result[i] = BIT.bxor(value, key_val) % 0x100
+  end
+  return result
 end
 
-local function is_probable_payload(tbl)
-  if type(tbl) ~= "table" then
+local function helper_rotate(value, amount)
+  amount = tonumber(amount) or 0
+  return BIT.rol(tonumber(value) or 0, amount)
+end
+
+local function helper_unrotate(value, amount)
+  amount = tonumber(amount) or 0
+  return BIT.ror(tonumber(value) or 0, amount)
+end
+
+local function helper_join_tables(...)
+  local out = {}
+  local index = 1
+  for i = 1, select("#", ...) do
+    local chunk = select(i, ...)
+    if type(chunk) == "table" then
+      for j = 1, #chunk do
+        out[index] = chunk[j]
+        index = index + 1
+      end
+    elseif chunk ~= nil then
+      out[index] = chunk
+      index = index + 1
+    end
+  end
+  return out
+end
+
+local function helper_to_string(buffer)
+  if type(buffer) == "table" then
+    local chars = {}
+    for i = 1, #buffer do
+      local byte = tonumber(buffer[i]) or 0
+      chars[i] = string.char(byte % 0x100)
+    end
+    return table.concat(chars)
+  elseif type(buffer) == "string" then
+    return buffer
+  end
+  return tostring(buffer)
+end
+
+local function helper_slice(buffer, offset, length)
+  if type(buffer) ~= "table" then
+    return buffer
+  end
+  offset = math.max(tonumber(offset) or 1, 1)
+  length = tonumber(length) or (#buffer - offset + 1)
+  local result = {}
+  local last = offset + length - 1
+  for i = offset, last do
+    result[#result + 1] = buffer[i]
+  end
+  return result
+end
+
+local function helper_truthy()
+  return true
+end
+
+local helper_impl = {
+  L1 = helper_xor_buffer,
+  L2 = helper_rotate,
+  L3 = helper_unrotate,
+  Y1 = helper_join_tables,
+  Y2 = helper_to_string,
+  Y3 = helper_slice,
+  G1 = helper_join_tables,
+  Q1 = helper_join_tables,
+  Z1 = helper_truthy,
+}
+
+local macro_limitations = {
+  LPH_ENCFUNC = "Encountered LPH_ENCFUNC macro – encrypted functions require manual keys",
+}
+
+local function is_vm_shape(value)
+  if type(value) ~= "table" then
     return false
   end
-  local numeric = 0
-  local total = 0
-  local notable = false
-  for k, v in pairs(tbl) do
-    total = total + 1
-    if type(k) == "number" then
-      numeric = numeric + 1
-      if type(v) == "table" and (v.const or v.consts or v[3]) then
-        notable = true
-      end
-    elseif type(k) == "string" then
-      local key = string.lower(k)
-      if key == "array" or key == "const" or key == "consts" or key == "instructions" or key == "bytecode" then
-        notable = true
-      end
-    end
-    if total > 2048 then
-      notable = true
-      break
-    end
-  end
-  if total == 0 then
+  local instructions = value[4] or value["4"]
+  if type(instructions) ~= "table" then
     return false
   end
-  if notable then
-    return true
-  end
-  if numeric >= 64 and numeric >= math.floor(total * 0.6) then
-    return true
+  local first = instructions[1] or instructions["1"]
+  if type(first) == "table" then
+    local opcode = first[3] or first["3"]
+    if type(opcode) == "number" then
+      return true
+    end
   end
   return false
 end
 
-local function table_overview(tbl)
-  if type(tbl) ~= "table" then
-    return tostring(tbl)
+local function capture_candidate(state, value, origin)
+  if state.dump_written then
+    return
   end
-  local count = 0
-  local numeric = 0
-  for k, _ in pairs(tbl) do
-    count = count + 1
-    if type(k) == "number" then
-      numeric = numeric + 1
+  if not is_vm_shape(value) then
+    return
+  end
+  state.dump_written = true
+  state.capture_sources[#state.capture_sources + 1] = origin
+  local basic = to_basic(value, {})
+  local json_str = encode_json(basic)
+  local path = state.out_dir .. "/unpacked_dump.json"
+  local ok, err = pcall(function()
+    local handle = assert(io.open(path, "w"))
+    handle:write(json_str)
+    handle:close()
+  end)
+  if not ok then
+    log_line(state, string.format("[shim] failed to write unpacked dump: %s", tostring(err)))
+  else
+    log_line(state, string.format("[shim] wrote unpacked dump (%s)", origin))
+    for name, message in pairs(state.limitations) do
+      log_line(state, string.format("[shim] limitation %s: %s", name, message))
     end
-    if count > 32 then
-      break
-    end
-  end
-  return string.format("table(count=%d,numeric=%d)", count, numeric)
-end
-
-local state = {
-  captured = false,
-  capture_path = nil,
-  log = nil,
-  out_dir = nil,
-  visited_tables = setmetatable({}, { __mode = "k" }),
-  visited_functions = setmetatable({}, { __mode = "k" }),
-}
-
-local function log_line(msg)
-  if state.log then
-    state.log:write(msg .. "
-")
-    state.log:flush()
   end
 end
 
-local function record_capture(reason, payload)
-  if state.captured then
-    log_line("[shim] capture already performed, skipping subsequent capture for " .. tostring(reason))
-    return
-  end
-  state.captured = true
-  local out_dir = state.out_dir or "out"
-  local path = out_dir .. "/unpacked_dump.lua.json"
-  state.capture_path = path
-  local json_blob = best_effort_json(payload)
-  local ok_open, handle = pcall(io.open, path, "w")
-  if not ok_open or not handle then
-    log_line("[shim] failed to open capture file: " .. tostring(handle))
-    return
-  end
-  handle:write(json_blob)
-  handle:close()
-  log_line("[shim] wrote captured payload to " .. path .. " (" .. tostring(reason) .. ")")
-end
-
-local function inspect_table(tbl, reason)
-  if type(tbl) ~= "table" then
-    return
-  end
-  if state.visited_tables[tbl] then
-    return
-  end
-  state.visited_tables[tbl] = true
-  if is_probable_payload(tbl) then
-    log_line("[shim] probable payload detected via " .. reason .. " => " .. table_overview(tbl))
-    record_capture(reason, tbl)
-  end
-end
-
-local function scan_function(fn, reason, depth)
+local function scan_function(state, fn, origin)
   if type(fn) ~= "function" then
     return
   end
-  depth = depth or 0
-  if depth > 4 then
+  if not debug or not debug.getupvalue then
     return
   end
-  if state.visited_functions[fn] then
-    return
-  end
-  state.visited_functions[fn] = true
-  local dbg = debug
-  if not dbg or type(dbg.getupvalue) ~= "function" then
-    return
-  end
-  local index = 1
-  while true do
-    local name, value = dbg.getupvalue(fn, index)
-    if not name then
-      break
+  local visited = {}
+  local function visit(target, label)
+    if visited[target] then
+      return
     end
-    local label = string.format("%s.upvalue[%d]=%s", reason, index, tostring(name))
-    if type(value) == "table" then
-      inspect_table(value, label)
-    elseif type(value) == "function" then
-      scan_function(value, label, depth + 1)
+    visited[target] = true
+    local index = 1
+    while true do
+      local name, value = debug.getupvalue(target, index)
+      if not name then
+        break
+      end
+      if type(value) == "table" then
+        capture_candidate(state, value, label .. ":" .. name)
+      elseif type(value) == "function" then
+        visit(value, label .. ":" .. name)
+      end
+      index = index + 1
     end
-    index = index + 1
+  end
+  visit(fn, origin)
+end
+
+local function wrap_loader(state, target, name, loader)
+  if type(loader) ~= "function" then
+    return
+  end
+  target[name] = function(...)
+    local ok, chunk, err = pcall(loader, ...)
+    if not ok then
+      error(chunk)
+    end
+    if type(chunk) == "function" then
+      scan_function(state, chunk, name)
+    end
+    return chunk, err
   end
 end
 
-local function wrap_loaded_function(fn, origin)
-  if type(fn) ~= "function" then
-    return fn
-  end
-  local label = "load:" .. (origin or "<chunk>")
-  scan_function(fn, label)
-  return function(...)
-    log_line("[shim] executing wrapped chunk from " .. label)
-    scan_function(fn, label .. ":pre")
-    local results = pack(fn(...))
-    scan_function(fn, label .. ":post")
-    return unpack(results, 1, results.n)
+local function install_helper(state, target, name, impl)
+  local existing = target[name]
+  target[name] = function(...)
+    local args = { ... }
+    state.helper_counts[name] = (state.helper_counts[name] or 0) + 1
+    log_line(state, string.format("[shim] %s(%s)", name, describe_args(args)))
+    local results
+    if impl then
+      results = { impl(...) }
+    elseif type(existing) == "function" then
+      results = { existing(...) }
+    else
+      results = args
+    end
+    if results[1] and type(results[1]) == "table" then
+      capture_candidate(state, results[1], name .. "(return)")
+    end
+    return unpack(results)
   end
 end
 
-local function install_unpacked_capture(env)
-  local target = env or _G
-  local meta = getmetatable(target) or {}
-  local original_newindex = meta.__newindex
-  meta.__newindex = function(t, k, v)
-    if k == "unpackedData" then
-      log_line("[shim] observed assignment to global 'unpackedData'")
-      inspect_table(v, "global.unpackedData")
+local function install_macro(state, target, name)
+  local limitation = macro_limitations[name]
+  target[name] = function(...)
+    state.macros[name] = true
+    log_line(state, string.format("[shim] macro %s invoked", name))
+    if limitation then
+      state.limitations[name] = limitation
+    end
+    local first = select(1, ...)
+    if type(first) == "function" then
+      local ok, result = pcall(first, select(2, ...))
+      if not ok then
+        log_line(state, string.format("[shim] macro %s inner call failed: %s", name, tostring(result)))
+        return function()
+          error("LPH macro placeholder invoked")
+        end
+      end
+      return result
+    end
+    return first
+  end
+end
+
+local function install_unpacked_hook(state, target)
+  local mt = getmetatable(target)
+  if not mt then
+    mt = {}
+    setmetatable(target, mt)
+  end
+  local original_newindex = mt.__newindex
+  mt.__newindex = function(tbl, key, value)
+    if key == "unpackedData" then
+      capture_candidate(state, value, "global:unpackedData")
+    end
+    if key and type(key) == "string" and key:match("^LPH_") and type(value) == "function" then
+      state.macros[key] = true
+      log_line(state, string.format("[shim] macro definition detected: %s", key))
     end
     if original_newindex then
-      return original_newindex(t, k, v)
+      original_newindex(tbl, key, value)
+    else
+      rawset(tbl, key, value)
     end
-    rawset(t, k, v)
-  end
-  setmetatable(target, meta)
-end
-
-local function helper_wrapper(name, impl)
-  return function(...)
-    local argc = select("#", ...)
-    log_line(string.format("[shim] %s invoked (%d args)", name, argc))
-    for idx = 1, argc do
-      local arg = select(idx, ...)
-      if type(arg) == "table" then
-        inspect_table(arg, string.format("%s.arg[%d]", name, idx))
-      end
-    end
-    local results = pack(impl(...))
-    for idx = 1, results.n do
-      local value = results[idx]
-      if type(value) == "table" then
-        inspect_table(value, string.format("%s.ret[%d]", name, idx))
-      end
-    end
-    return unpack(results, 1, results.n)
   end
 end
 
 function M.install(env, opts)
   opts = opts or {}
-  state.out_dir = opts.out_dir or "out"
-  local log_path = state.out_dir .. "/shim_usage.txt"
-  state.log = open_log(log_path)
-  if state.log then
-    log_line("[shim] install begin")
-  end
-
-  ensure_bit32_table()
-
-  local target = env or _G
-  install_unpacked_capture(target)
-
-  local helper_impls = {
-    L1 = function(a, b)
-      return rrotate(a, b)
-    end,
-    Y1 = function(a, b, ...)
-      return bor(a, b, ...)
-    end,
-    Z1 = function(a, b, ...)
-      return band(a, b, ...)
-    end,
-    U1 = function(a, b)
-      return lrotate(a, b)
-    end,
-    T1 = function(a, b)
-      return lshift(a, b)
-    end,
-    C1 = function(a)
-      return countlz(a)
-    end,
-    H1 = function(a)
-      return countrz(a)
-    end,
-    M1 = function(a, b)
-      return rshift(a, b)
-    end,
-    u1 = function(a)
-      return bnot(a)
-    end,
-    q1 = function(a, b, ...)
-      return bxor(a, b, ...)
-    end,
+  local out_dir = opts.out_dir or "out"
+  ensure_dir(out_dir)
+  local state = {
+    out_dir = out_dir,
+    log = open_log(out_dir .. "/shim_usage.txt"),
+    helper_counts = {},
+    macros = {},
+    limitations = {},
+    capture_sources = {},
+    dump_written = false,
   }
-
-  for name, impl in pairs(helper_impls) do
-    if target[name] == nil then
-      target[name] = helper_wrapper(name, impl)
-    end
-  end
-
   if state.log then
-    local original_print = target.print or print
+    log_line(state, "[shim] installing initv4 shim for Luraph v14.4.x")
+  end
+  local target = env or _G
+  install_unpacked_hook(state, target)
+  for name, impl in pairs(helper_impl) do
+    if type(target[name]) ~= "function" then
+      install_helper(state, target, name, impl)
+    else
+      install_helper(state, target, name, nil)
+    end
+  end
+  local macros = {
+    "LPH_NO_VIRTUALIZE",
+    "LPH_JIT",
+    "LPH_JIT_MAX",
+    "LPH_ENCFUNC",
+    "LPH_SKIP",
+    "LPH_NO_UPVALUES",
+  }
+  for _, macro in ipairs(macros) do
+    install_macro(state, target, macro)
+  end
+  if target.print then
+    local original_print = target.print
     target.print = function(...)
-      state.log:write("[shim] print: ")
-      for i = 1, select("#", ...) do
-        local v = select(i, ...)
-        state.log:write(tostring(v))
-        if i < select("#", ...) then
-          state.log:write(" ")
-        end
-      end
-      state.log:write("\n")
-      state.log:flush()
-      if original_print then
-        pcall(original_print, ...)
-      end
+      local args = { ... }
+      log_line(state, "[shim] print: " .. describe_args(args))
+      return original_print(...)
     end
   end
-
-  local original_load = target.load or load
-  if type(original_load) == "function" then
-    target.load = function(chunk, chunkname, mode, env2)
-      local fn, err = original_load(chunk, chunkname, mode, env2)
-      if type(fn) == "function" then
-        fn = wrap_loaded_function(fn, chunkname)
-      end
-      return fn, err
-    end
+  if load then
+    wrap_loader(state, target, "load", load)
   end
-
-  local original_loadstring = target.loadstring or loadstring
-  if type(original_loadstring) == "function" then
-    target.loadstring = function(src, chunkname)
-      local fn, err = original_loadstring(src, chunkname)
-      if type(fn) == "function" then
-        fn = wrap_loaded_function(fn, chunkname or "loadstring")
-      end
-      return fn, err
-    end
+  if loadstring then
+    wrap_loader(state, target, "loadstring", loadstring)
   end
-
-  local original_loadfile = target.loadfile or loadfile
-  if type(original_loadfile) == "function" then
-    target.loadfile = function(filename, mode, env2)
-      local fn, err = original_loadfile(filename, mode, env2)
-      if type(fn) == "function" then
-        fn = wrap_loaded_function(fn, filename or "loadfile")
-      end
-      return fn, err
-    end
+  if loadfile then
+    wrap_loader(state, target, "loadfile", loadfile)
   end
+  target.__LURAPH_SHIM_STATE = state
+  log_line(state, "[shim] install complete")
+end
 
-  log_line("[shim] installed")
+function M.shutdown()
+  if _G.__LURAPH_SHIM_STATE then
+    close_log(_G.__LURAPH_SHIM_STATE)
+    _G.__LURAPH_SHIM_STATE = nil
+  end
 end
 
 return M

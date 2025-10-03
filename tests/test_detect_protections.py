@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import json
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +30,8 @@ def test_detects_multiple_categories(tmp_path: Path) -> None:
     report = detect_protections.scan_files([path])
     assert report["protection_detected"] is True
     assert set(report["types"]) >= {"xor", "fragmentation", "compression", "vm_bootstrap", "randomisation"}
+    assert report["path"] == path.as_posix()
+    assert report["recommendation"] == "frida"
 
 
 @pytest.mark.parametrize(
@@ -45,6 +49,7 @@ def test_individual_patterns(snippet: str, expected: str, tmp_path: Path) -> Non
     path = write_temp(tmp_path, "single.lua", snippet)
     report = detect_protections.scan_files([path])
     assert expected in report["types"]
+    assert report["path"] == path.as_posix()
 
 
 def test_cli_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -56,3 +61,4 @@ def test_cli_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytes
     out = capsys.readouterr().out
     data = json.loads(out)
     assert "vm_bootstrap" in data["types"]
+    assert data["path"].endswith("initv4.lua")

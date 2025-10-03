@@ -285,6 +285,9 @@ def _run_detection(init_path: Path, out_dir: Path, *, write_report: bool) -> Dic
     if metadata:
         meta_pairs = ", ".join(f"{key}={value}" for key, value in metadata.items())
         _log(f"Bootstrap metadata: {meta_pairs}")
+    recommendation = detection_report.get("recommendation")
+    if recommendation:
+        _log(f"Recommended capture strategy: {recommendation}")
     return report
 
 
@@ -522,6 +525,12 @@ def main(argv: list[str] | None = None) -> int:
         summary["metadata"] = deepcopy(detection_metadata)
         summary["protection_detected"] = detection_report.get("protection_detected", False)
         summary["protection_types"] = list(detection_report.get("types", []))
+        if detection_report.get("path"):
+            summary["bootstrap_path"] = detection_report.get("path")
+        if detection_report.get("scanned"):
+            summary["scanned_paths"] = list(detection_report.get("scanned", []))
+        if detection_report.get("recommendation"):
+            summary["capture_recommendation"] = detection_report.get("recommendation")
         if limitations_collected:
             summary["limitations"] = list(limitations_collected)
         summary["pipeline_mode"] = pipeline_mode

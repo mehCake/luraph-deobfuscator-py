@@ -88,12 +88,15 @@ _CATEGORY_PATTERNS = {
 }
 
 _MACRO_REGEX = re.compile(r"\b(LPH_[A-Z0-9_]+)\b")
-_MACRO_COMMENT_REGEX = re.compile(r"--\s*@?(lph_[a-z0-9_]+)")
+_MACRO_COMMENT_REGEX = re.compile(r"--\s*@?(lph[_-]?[a-z0-9_]+)")
 
 _COMMENT_MACRO_CANONICAL = {
     "LPH_NOVIRTUALIZE": "LPH_NO_VIRTUALIZE",
     "LPH_NO_VIRT": "LPH_NO_VIRTUALIZE",
     "LPH_NOVIRT": "LPH_NO_VIRTUALIZE",
+    "LPH_JITMAX": "LPH_JIT_MAX",
+    "LPH_ENCFUNC": "LPH_ENCFUNC",
+    "LPH_NOUPVALUES": "LPH_NO_UPVALUES",
 }
 
 _METADATA_VERSION_REGEX = re.compile(
@@ -269,6 +272,30 @@ def _ensure_list(value: Any) -> List[Any]:
     return [value]
 
 
+def _first_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            result = _first_bool(item)
+            if result is not None:
+                return result
+    if isinstance(value, dict):
+        for item in value.values():
+            result = _first_bool(item)
+            if result is not None:
+                return result
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
+
+
 def _map_known_settings(known: Dict[str, Any], node: Any) -> None:
     if isinstance(node, dict):
         for key, value in node.items():
@@ -326,6 +353,7 @@ def _detect_macros(source: str) -> List[str]:
         ordered.setdefault(macro, None)
     for match in _MACRO_COMMENT_REGEX.finditer(source):
         comment_macro = match.group(1).upper()
+        comment_macro = comment_macro.replace("-", "_")
         if not comment_macro.startswith("LPH_"):
             comment_macro = f"LPH_{comment_macro}" if not comment_macro.startswith("LURAPH") else comment_macro
         macro = _canonical_macro(comment_macro)
@@ -399,6 +427,27 @@ def _merge_settings(
                     known_accum[key] = [existing, value]
 
 
+def _compute_recommendation(macros: Sequence[str], settings: Dict[str, Any], types: Sequence[str]) -> str:
+    macro_set = {name.upper() for name in macros}
+    prefer_frida = False
+    if {"LPH_JIT", "LPH_JIT_MAX", "LPH_ENCFUNC"} & macro_set:
+        prefer_frida = True
+    if "compression" in types or "anti_trace" in types:
+        prefer_frida = True
+    if "LPH_ENCFUNC" in macro_set:
+        prefer_frida = True
+    virtualize_flag: bool | None = None
+    if isinstance(settings, dict):
+        known = settings.get("known") if isinstance(settings.get("known"), dict) else settings
+        if isinstance(known, dict) and "virtualize_all" in known:
+            virtualize_flag = _first_bool(known["virtualize_all"])
+    if "LPH_NO_VIRTUALIZE" in macro_set or "LPH_SKIP" in macro_set or virtualize_flag is False:
+        return "luajit"
+    if prefer_frida:
+        return "frida"
+    return "luajit"
+
+
 def scan_lua(source: str, *, filename: str = "<memory>") -> dict:
     """Scan a Lua script and return structured protection evidence."""
 
@@ -414,8 +463,13 @@ def scan_lua(source: str, *, filename: str = "<memory>") -> dict:
     if metadata_augmented:
         metadata = {**metadata, **metadata_augmented}
     limitations = _merge_unique(list(metadata_limitations), augmentation_limitations)
+    if "LPH_ENCFUNC" in macros:
+        limitations = _merge_unique(limitations, ["encrypted functions present (LPH_ENCFUNC)"])
+
+    recommendation = _compute_recommendation(macros, settings, categories)
 
     result = {
+        "path": filename,
         "protection_detected": bool(categories),
         "types": categories,
         "evidence": [item.to_json() for item in findings],
@@ -423,6 +477,7 @@ def scan_lua(source: str, *, filename: str = "<memory>") -> dict:
         "settings": settings,
         "metadata": metadata,
         "limitations": limitations,
+        "recommendation": recommendation,
     }
     return result
 
@@ -436,12 +491,14 @@ def scan_files(paths: Iterable[Path]) -> dict:
     known_settings: Dict[str, Any] = {}
     metadata: Dict[str, Any] = {}
     limitations: List[str] = []
+    path_list: List[str] = []
 
     for path in paths:
         try:
             data = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        path_list.append(path.as_posix())
         per_file = scan_lua(data, filename=path.as_posix())
         for item in per_file["evidence"]:
             combined.append(
@@ -458,7 +515,9 @@ def scan_files(paths: Iterable[Path]) -> dict:
         limitations = _merge_unique(limitations, per_file.get("limitations", []))
 
     categories = sorted({item.category for item in combined})
+    recommendation = _compute_recommendation(macros, {"known": known_settings}, categories)
     return {
+        "path": path_list[0] if path_list else "<memory>",
         "protection_detected": bool(categories),
         "types": categories,
         "evidence": [item.to_json() for item in combined],
@@ -466,6 +525,8 @@ def scan_files(paths: Iterable[Path]) -> dict:
         "settings": {"tables": settings_tables, "known": known_settings},
         "metadata": metadata,
         "limitations": limitations,
+        "recommendation": recommendation,
+        "scanned": path_list,
     }
 
 
