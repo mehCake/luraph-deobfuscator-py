@@ -8,16 +8,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Sequence
 
+from .luajit_paths import find_luajit
 from .trace_to_unpacked import convert_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WRAPPER_PATH = REPO_ROOT / "tools" / "devirtualize_v3.lua"
 SHIM_PATH = REPO_ROOT / "tools" / "shims" / "initv4_shim.lua"
-
-try:
-    from src.sandbox_runner import _find_luajit  # type: ignore
-except Exception:  # pragma: no cover - fallback import path when run as script
-    from ..sandbox_runner import _find_luajit  # type: ignore
 
 
 @dataclass(slots=True)
@@ -74,7 +70,7 @@ def _prepare_environment(out_dir: Path) -> dict:
 def run_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int = 10) -> LuajitCapture:
     """Execute the LuaJIT bootstrap wrapper with the initv4 shim preloaded."""
 
-    luajit_cmd = _find_luajit()
+    luajit_cmd = find_luajit()
     if not luajit_cmd:
         raise RuntimeError("luajit executable not found; cannot perform wrapper capture")
     if not WRAPPER_PATH.exists():

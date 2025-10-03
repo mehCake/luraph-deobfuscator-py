@@ -7,7 +7,6 @@ import argparse
 import base64
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import detect_protections, protections
 from .runtime_capture import trace_to_unpacked
+from .runtime_capture.luajit_paths import find_luajit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOG_PATH: Path | None = None
@@ -204,14 +204,9 @@ def _validate_unpacked(data: Any) -> Tuple[bool, str]:
 
 
 def _find_luajit() -> list[str] | None:
-    candidates = [REPO_ROOT / "bin" / "luajit.exe", shutil.which("luajit"), REPO_ROOT / "bin" / "luajit"]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate)
-        if path.exists():
-            return [str(path)]
-    return None
+    """Compatibility wrapper for legacy imports."""
+
+    return find_luajit()
 
 
 def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int) -> Tuple[bool, Any, str]:

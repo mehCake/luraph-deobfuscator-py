@@ -50,7 +50,7 @@ single command:
 
 ```powershell
 pip install -r requirements.txt
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
 # or
 tools\run_capture_windows.cmd --key <script_key>
 ```
@@ -63,7 +63,7 @@ Install LuaJIT and `lua-cjson`, then install the Python dependencies:
 sudo apt-get install -y luajit luarocks
 sudo luarocks install lua-cjson
 pip install -r requirements.txt
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
 ```
 
 Run `python tools/check_deps.py` at any time to confirm that both lupa and a
