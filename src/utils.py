@@ -1,4 +1,5 @@
 import os
+import sys
 import base64
 import binascii
 import json
@@ -702,7 +703,18 @@ def benchmark_parallel(
         worker(item)
     sequential = timer() - start
 
-    _, parallel = run_parallel(items, worker, jobs=jobs, timer=timer)
+    package = sys.modules.get("src.utils")
+    run_parallel_fn: Callable[..., tuple[list[R], float]]
+    if package is not None:
+        candidate = getattr(package, "run_parallel", None)
+        if callable(candidate):
+            run_parallel_fn = candidate  # type: ignore[assignment]
+        else:
+            run_parallel_fn = run_parallel  # fallback to local implementation
+    else:
+        run_parallel_fn = run_parallel
+
+    _, parallel = run_parallel_fn(items, worker, jobs=jobs, timer=timer)
 
     ratio = parallel / sequential if sequential > 0 else 0.0
     if ratio > 2.0:

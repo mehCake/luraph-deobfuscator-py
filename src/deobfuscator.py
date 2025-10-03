@@ -709,6 +709,16 @@ class LuaDeobfuscator:
     ) -> str:
         """Run the full pipeline on ``content`` and return decoded Lua."""
 
+        if not self._script_key:
+            match = re.search(
+                r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+                content,
+            )
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    self._script_key = candidate
+
         # Fast path used by the unit tests: when ``content`` already resembles
         # the canonical JSON payload emitted by the sandbox we can execute it
         # directly inside the Python implementation of the Luraph VM.  This

@@ -238,6 +238,24 @@ class InitV4Decoder:
         return dict(self._opcode_table)
 
     # ------------------------------------------------------------------
+    _OPCODE_ASSIGN_RE = re.compile(
+        r"\[(0x[0-9A-Fa-f]+|\d+)\]\s*=\s*['\"]([A-Za-z0-9_]+)['\"]"
+    )
+
+    def _extract_opcodes(self, text: str) -> Dict[int, str]:
+        """Parse ``text`` for ``[index] = 'NAME'`` style entries."""
+
+        mapping: Dict[int, str] = {}
+        for match in self._OPCODE_ASSIGN_RE.finditer(text or ""):
+            raw_index, name = match.groups()
+            try:
+                index = int(raw_index, 0)
+            except ValueError:
+                continue
+            mapping[index] = name.upper()
+        return mapping
+
+    # ------------------------------------------------------------------
     def locate_payload(self, text: str) -> List[str]:
         return [match.group(0) for match in _PAYLOAD_RE.finditer(text)]
 
@@ -279,6 +297,21 @@ class InitV4Decoder:
             self.opcode_map = dict(sorted(opcode_map.items()))
             self._opcode_table.update(self.opcode_map)
             self._custom_opcodes = True
+
+        # Ensure canonical operations remain present even if the bootstrap
+        # emits a reduced or reordered table.  Some stripped bootstrappers drop
+        # rarely used opcodes (such as ``CONCAT``) from the dispatch metadata;
+        # the pipeline relies on their presence when rebuilding bytecode, so we
+        # re-introduce the defaults when necessary.
+        existing_names = {name.upper() for name in self._opcode_table.values()}
+        if "CONCAT" not in existing_names:
+            fallback = _DEFAULT_OPCODE_MAP.get(0x22) or "CONCAT"
+            self._opcode_table[0x22] = fallback
+            existing_names.add("CONCAT")
+        if "CALL" not in existing_names:
+            self._opcode_table.setdefault(0x1C, "CALL")
+        if "RETURN" not in existing_names:
+            self._opcode_table.setdefault(0x1D, "RETURN")
 
         extraction = summary.get("extraction") if isinstance(summary, dict) else {}
         meta: Dict[str, Any] = {}
