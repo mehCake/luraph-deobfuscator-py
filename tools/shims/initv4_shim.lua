@@ -70,42 +70,6 @@ local function normalise_key(key)
   return tostring(key)
 end
 
-local function to_basic(value, seen)
-  seen = seen or {}
-  local t = type(value)
-  if t == "table" then
-    if seen[value] then
-      return "<cycle>"
-    end
-    seen[value] = true
-    local arr = {}
-    local length = #value
-    for i = 1, length do
-      arr[i] = to_basic(value[i], seen)
-    end
-    local map = {}
-    for k, v in pairs(value) do
-      if not (type(k) == "number" and k >= 1 and k <= length) then
-        map[normalise_key(k)] = to_basic(v, seen)
-      end
-    end
-    if next(map) and length > 0 then
-      map.array = arr
-      return map
-    elseif next(map) then
-      return map
-    else
-      return arr
-    end
-  elseif t == "string" or t == "number" or t == "boolean" or value == nil then
-    return value
-  elseif t == "function" then
-    return string.format("<function:%s>", tostring(value))
-  else
-    return string.format("<%s>", t)
-  end
-end
-
 local function escape_json(str)
   str = str:gsub('\\', '\\\\')
   str = str:gsub('"', '\\"')
@@ -115,50 +79,61 @@ local function escape_json(str)
   return str
 end
 
-local function encode_json(value)
+local function encode_json(value, seen, path)
+  if value == nil then
+    return "null"
+  end
+  seen = seen or {}
+  path = path or ""
   local t = type(value)
   if t == "table" then
-    local length = #value
-    if length > 0 and (value.array == nil or type(value.array) ~= "table") then
-      local parts = {}
-      for i = 1, length do
-        parts[i] = encode_json(value[i])
+    if seen[value] then
+      return '"<cycle>"'
+    end
+    seen[value] = true
+    local numeric_keys = {}
+    for k in pairs(value) do
+      if type(k) == "number" and k >= 1 then
+        numeric_keys[#numeric_keys + 1] = k
       end
+    end
+    table.sort(numeric_keys)
+    local is_array = (#numeric_keys > 0 and numeric_keys[1] == 1)
+    if not is_array and #numeric_keys > 0 then
+      if path == "/4" or path:match("^/4/%d+$") then
+        is_array = true
+      end
+    end
+    if is_array then
+      local max_index = numeric_keys[#numeric_keys]
+      local parts = {}
+      for i = 1, max_index do
+        parts[i] = encode_json(value[i], seen, path .. "/" .. tostring(i))
+      end
+      seen[value] = nil
       return "[" .. table.concat(parts, ",") .. "]"
     end
-    if value.array and type(value.array) == "table" then
-      local arr = {}
-      for i = 1, #value.array do
-        arr[i] = encode_json(value.array[i])
+    local entries = {}
+    local used_numeric = {}
+    for _, idx in ipairs(numeric_keys) do
+      entries[#entries + 1] = string.format('"%s":%s', normalise_key(idx), encode_json(value[idx], seen, path .. "/" .. tostring(idx)))
+      used_numeric[idx] = true
+    end
+    for k, v in pairs(value) do
+      local key_type = type(k)
+      if not (key_type == "number" and k >= 1 and used_numeric[k]) then
+        entries[#entries + 1] = string.format('"%s":%s', escape_json(normalise_key(k)), encode_json(v, seen, path .. "/" .. normalise_key(k)))
       end
-      local entries = { '"array":[' .. table.concat(arr, ",") .. ']' }
-      for k, v in pairs(value) do
-        if k ~= "array" then
-          entries[#entries + 1] = string.format('"%s":%s', escape_json(normalise_key(k)), encode_json(v))
-        end
-      end
-      table.sort(entries)
-      return "{" .. table.concat(entries, ",") .. "}"
     end
-    local keys = {}
-    for k in pairs(value) do
-      keys[#keys + 1] = k
-    end
-    table.sort(keys, function(a, b)
-      return tostring(a) < tostring(b)
-    end)
-    local parts = {}
-    for i = 1, #keys do
-      local key = keys[i]
-      parts[i] = string.format('"%s":%s', escape_json(normalise_key(key)), encode_json(value[key]))
-    end
-    return "{" .. table.concat(parts, ",") .. "}"
+    table.sort(entries)
+    seen[value] = nil
+    return "{" .. table.concat(entries, ",") .. "}"
   elseif t == "string" then
     return '"' .. escape_json(value) .. '"'
   elseif t == "number" or t == "boolean" then
     return tostring(value)
-  elseif value == nil then
-    return "null"
+  elseif t == "function" then
+    return string.format('"<function:%s>"', tostring(value))
   else
     return '"<' .. t .. '>"'
   end
@@ -430,8 +405,7 @@ local function capture_candidate(state, value, origin)
   end
   state.dump_written = true
   state.capture_sources[#state.capture_sources + 1] = origin
-  local basic = to_basic(value, {})
-  local json_str = encode_json(basic)
+  local json_str = encode_json(value, {}, "")
   local path = state.out_dir .. "/unpacked_dump.json"
   local ok, err = pcall(function()
     local handle = assert(io.open(path, "w"))

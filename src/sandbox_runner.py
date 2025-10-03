@@ -14,9 +14,9 @@ import time
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from . import detect_protections
+from . import detect_protections, protections
 from .runtime_capture import trace_to_unpacked
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -264,12 +264,12 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
     return True, _normalise(raw), ""
 
 
-def _run_detection(init_path: Path, out_dir: Path, *, write_report: bool) -> Dict[str, Any]:
+def _run_detection(init_path: Path, out_dir: Path, *, write_report: bool, api_key: str | None) -> Dict[str, Any]:
     version_dir = REPO_ROOT / "src" / "versions"
     candidates = [init_path]
     if version_dir.exists():
         candidates.extend(version_dir.rglob("*.lua"))
-    report = detect_protections.scan_files(candidates)
+    report = detect_protections.scan_files(candidates, api_key=api_key)
     if write_report:
         report_path = out_dir / "protection_report.json"
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -285,7 +285,7 @@ def _run_detection(init_path: Path, out_dir: Path, *, write_report: bool) -> Dic
     if metadata:
         meta_pairs = ", ".join(f"{key}={value}" for key, value in metadata.items())
         _log(f"Bootstrap metadata: {meta_pairs}")
-    recommendation = detection_report.get("recommendation")
+    recommendation = report.get("recommendation")
     if recommendation:
         _log(f"Recommended capture strategy: {recommendation}")
     return report
@@ -419,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture-timeout", type=int, default=10, help="Timeout used for runtime capture helpers")
     parser.add_argument("--capture-output", default=None, help="Directory for runtime capture traces")
     parser.add_argument("--capture-target", default=None, help="Process name or file path used by runtime capture helpers")
+    parser.add_argument("--lph-api-key", default=None, help="Optional Luraph API key for metadata lookups")
+    parser.add_argument("--force-partial", action="store_true", help="Force partial pipeline mode even if macros/settings allow full run")
 
     args = parser.parse_args(argv)
 
@@ -468,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     _copy_bootstrap_blob(json_path, out_dir)
 
     detection_report: Dict[str, Any] = _run_detection(
-        init_path, out_dir, write_report=args.detect_protections
+        init_path, out_dir, write_report=args.detect_protections, api_key=args.lph_api_key
     )
     macros_detected = list(detection_report.get("macros", []))
     settings_known = (
@@ -513,11 +515,17 @@ def main(argv: list[str] | None = None) -> int:
         _log("Detected JIT macro; opcode verifier will be skipped to avoid inline stub mismatches", "WARN")
         _add_limitation("Verifier skipped due to LPH_JIT macro")
 
+    if args.force_partial and not skip_lifter_due_to_macros:
+        skip_lifter_due_to_macros = True
+        _add_limitation("Partial mode forced via CLI")
+
     pipeline_mode = "full"
     if skip_lifter_due_to_macros:
         pipeline_mode = "partial"
     elif skip_verifier_due_to_jit:
         pipeline_mode = "jit-aware"
+
+    runtime_protections: List[dict] = []
 
     def _apply_detection_to_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         summary["macros"] = list(macros_detected)
@@ -534,26 +542,37 @@ def main(argv: list[str] | None = None) -> int:
         if limitations_collected:
             summary["limitations"] = list(limitations_collected)
         summary["pipeline_mode"] = pipeline_mode
+        if runtime_protections:
+            summary["runtime_protections"] = runtime_protections
         return summary
 
     capture_status = False
     capture_data: Any = None
     fallback_used = False
     capture_method_requested = args.capture_runtime
+    recommended_method = detection_report.get("recommendation")
     runtime_metadata: Dict[str, Any] | None = None
     capture_method_used: str | None = None
 
+    runtime_plan: List[str] = []
     if capture_method_requested:
-        capture_output_dir = Path(args.capture_output) if args.capture_output else out_dir / "capture_traces"
-        methods_to_try: list[str] = []
         if capture_method_requested == "frida":
-            methods_to_try = ["frida", "luajit", "emulator"]
+            runtime_plan = ["frida", "luajit", "emulator"]
         elif capture_method_requested == "luajit":
-            methods_to_try = ["luajit", "emulator"]
+            runtime_plan = ["luajit", "emulator"]
         else:
-            methods_to_try = ["emulator"]
+            runtime_plan = ["emulator"]
+    elif recommended_method == "frida":
+        runtime_plan = ["frida", "luajit", "emulator"]
+    elif recommended_method == "luajit":
+        runtime_plan = ["luajit", "emulator"]
+    elif recommended_method == "emulator":
+        runtime_plan = ["emulator", "luajit"]
 
-        for method in methods_to_try:
+    if runtime_plan:
+        capture_output_dir = Path(args.capture_output) if args.capture_output else out_dir / "capture_traces"
+        _log(f"Runtime capture plan: {', '.join(runtime_plan)}")
+        for method in runtime_plan:
             if method == "emulator" and not args.capture_target:
                 _log("Skipping emulator runtime capture because --capture-target was not provided", "WARN")
                 continue
@@ -579,7 +598,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if capture_method_requested and not capture_status:
             _log(
-                "All requested runtime capture methods exhausted without success; falling back to sandbox",  # noqa: E501
+                "All requested runtime capture methods exhausted without success; falling back to sandbox",
                 "WARN",
             )
 
@@ -597,31 +616,59 @@ def main(argv: list[str] | None = None) -> int:
             if success:
                 capture_status = True
                 capture_data = data
-            else:
-                if args.use_fixtures:
-                    _log("Wrapper failed but --use-fixtures supplied; attempting fixture load", "WARN")
-                    success, data, details = _load_fixture(out_dir)
-                    if success:
-                        capture_status = True
-                        capture_data = data
-                        fallback_used = True
-                if not capture_status:
-                    _write_failure(out_dir, "sandbox capture failed", details)
-                    summary = {
-                        "status": "fail",
-                        "unpacked_dump_exists": False,
-                        "instructions": 0,
-                        "unique_opnums": 0,
-                        "opcodes_verified": 0,
-                        "high_confidence": 0,
-                        "chunks": 0,
-                        "fallback_fixture": fallback_used,
-                    }
-                    if capture_method_used:
-                        summary["runtime_capture_method"] = capture_method_used
-                    summary = _apply_detection_to_summary(summary)
-                    _write_summary(out_dir, summary)
-                    return 3
+            elif args.use_fixtures:
+                _log("Wrapper failed but --use-fixtures supplied; attempting fixture load", "WARN")
+                success, data, details = _load_fixture(out_dir)
+                if success:
+                    capture_status = True
+                    capture_data = data
+                    fallback_used = True
+
+    if not capture_status:
+        _write_failure(out_dir, "sandbox capture failed", details)
+        summary = {
+            "status": "fail",
+            "unpacked_dump_exists": False,
+            "instructions": 0,
+            "unique_opnums": 0,
+            "opcodes_verified": 0,
+            "high_confidence": 0,
+            "chunks": 0,
+            "fallback_fixture": fallback_used,
+        }
+        if capture_method_used:
+            summary["runtime_capture_method"] = capture_method_used
+        summary = _apply_detection_to_summary(summary)
+        _write_summary(out_dir, summary)
+        return 3
+
+    observations: List[protections.BufferObservation] = []
+    if capture_method_used and runtime_metadata:
+        for dump_path in runtime_metadata.get("dumps", []):
+            path = Path(dump_path)
+            if not path.is_absolute():
+                path = (out_dir / dump_path).resolve()
+            if path.exists():
+                data = path.read_bytes()
+                observations.append(protections.BufferObservation(data=data, label=path.name))
+    if not observations:
+        try:
+            observations.append(
+                protections.BufferObservation(
+                    data=json.dumps(capture_data).encode("utf-8"),
+                    label="unpacked_json",
+                )
+            )
+        except Exception:
+            pass
+    if observations:
+        runtime_protections.extend(protections.analyse_protections(observations))
+        if runtime_protections:
+            _log(
+                "Runtime protection findings: "
+                + ", ".join(item["type"] for item in runtime_protections),
+                "INFO",
+            )
 
     valid, message = _validate_unpacked(capture_data)
     if not valid:

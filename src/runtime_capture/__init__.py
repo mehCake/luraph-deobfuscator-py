@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from . import emulator_stub, frida_hook, luajit_wrapper, symbolic_stub, trace_to_unpacked
+from . import emulator, frida_hook, luajit_wrapper, trace_to_unpacked
 
 __all__ = [
-    "emulator_stub",
+    "emulator",
     "frida_hook",
     "luajit_wrapper",
-    "symbolic_stub",
     "trace_to_unpacked",
 ]

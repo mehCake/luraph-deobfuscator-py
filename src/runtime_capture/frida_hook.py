@@ -1,4 +1,4 @@
-"""Helpers for capturing decoded buffers via Frida."""
+"""Frida helpers for capturing decoded buffers from LuaJIT processes."""
 
 from __future__ import annotations
 
@@ -6,23 +6,25 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, List
 
-DEFAULT_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "tools" / "frida-scripts" / "default_hook.js"
+DEFAULT_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "tools" / "frida-scripts" / "luraph_hook.js"
 
 try:  # pragma: no cover - optional dependency
     import frida  # type: ignore
-except Exception:  # pragma: no cover - the module is optional
+except Exception:  # pragma: no cover
     frida = None  # type: ignore
 
 
-@dataclass
+@dataclass(slots=True)
 class CaptureResult:
+    """Record of a runtime capture performed via Frida."""
+
     method: str
-    dumps: list[Path]
+    dumps: List[Path]
     metadata: dict
 
-    def to_json(self) -> dict:
+    def to_json(self) -> dict:  # pragma: no cover - trivial serialiser
         return {
             "method": self.method,
             "dumps": [path.as_posix() for path in self.dumps],
@@ -34,6 +36,32 @@ def _ensure_output_dir(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _load_script_source(script_path: Path | None, script_source: str | None) -> str:
+    if script_source:
+        return script_source
+    path = script_path or DEFAULT_SCRIPT_PATH
+    return path.read_text(encoding="utf-8")
+
+
+def _attach_session(target: str, *, spawn: bool) -> tuple["frida.Session", int | None]:  # type: ignore[name-defined]
+    if frida is None:  # pragma: no cover - optional dependency
+        raise RuntimeError("frida module is not installed")
+
+    pid: int | None = None
+    if spawn:
+        argv = target if isinstance(target, list) else [target]
+        pid = frida.spawn(argv)
+        session = frida.attach(pid)
+    else:
+        # Allow numeric PID strings, otherwise treat as process name
+        try:
+            pid = int(target)
+            session = frida.attach(pid)
+        except ValueError:
+            session = frida.attach(target)
+    return session, pid
+
+
 def capture_with_frida(
     target: str,
     *,
@@ -41,63 +69,63 @@ def capture_with_frida(
     output_dir: Path,
     timeout: int = 10,
     script_source: str | None = None,
+    spawn: bool | None = None,
 ) -> CaptureResult:
-    """Attach to ``target`` using Frida and dump decoded buffers.
+    """Attach to ``target`` using Frida and dump decoded buffers."""
 
-    Parameters
-    ----------
-    target:
-        Process name or pid accepted by ``frida.attach``/``frida.spawn``.
-    symbols:
-        Symbols to hook inside the runtime. The default script handles common
-        Lua APIs and generic buffer-producing functions if empty.
-    output_dir:
-        Directory where captured buffers and metadata are written.
-    timeout:
-        Maximum time to wait for the script to produce captures.
-    script_source:
-        Optional Frida JavaScript. If ``None`` the bundled default script is used.
-    """
+    _ensure_output_dir(output_dir)
 
     if target.startswith("file://"):
         dummy_path = Path(target[7:])
         if not dummy_path.exists():
             raise FileNotFoundError(dummy_path)
-        _ensure_output_dir(output_dir)
         dump_path = output_dir / f"frida_{int(time.time()*1000)}.bin"
         dump_path.write_bytes(dummy_path.read_bytes())
-        metadata = {"target": target, "symbols": list(symbols or []), "timestamp": time.time(), "offline": True}
+        metadata = {
+            "target": target,
+            "symbols": list(symbols or []),
+            "timestamp": time.time(),
+            "offline": True,
+        }
         return CaptureResult("frida-file", [dump_path], metadata)
 
     if frida is None:  # pragma: no cover - optional dependency path
         raise RuntimeError("frida module not available; install `frida` to enable runtime capture")
 
-    _ensure_output_dir(output_dir)
-    if script_source is None:
-        script_source = DEFAULT_SCRIPT_PATH.read_text(encoding="utf-8")
+    script_text = _load_script_source(DEFAULT_SCRIPT_PATH, script_source)
 
-    dumps: list[Path] = []
+    spawn_flag = bool(spawn)
+    if spawn is None:
+        path_candidate = Path(target)
+        if path_candidate.exists():
+            spawn_flag = True
+    session, spawned_pid = _attach_session(target, spawn=spawn_flag)
+    script = session.create_script(script_text)
+
+    dumps: List[Path] = []
     metadata: dict = {
         "target": target,
         "symbols": list(symbols or []),
         "timestamp": time.time(),
     }
 
-    session = frida.attach(target)
-    script = session.create_script(script_source)
+    if spawned_pid is not None:
+        metadata["spawned_pid"] = spawned_pid
 
-    def on_message(message, data):  # pragma: no cover - exercised in integration tests only
+    def on_message(message, data):  # pragma: no cover - integration tested
         if message["type"] == "send":
             payload = message.get("payload")
-            if not isinstance(payload, dict):
-                return
-            if payload.get("type") == "buffer":
-                raw: bytes = data or payload.get("data", b"")
-                dump_path = output_dir / f"frida_{int(time.time()*1000)}.bin"
-                dump_path.write_bytes(raw)
-                dumps.append(dump_path)
-            else:
-                metadata.setdefault("messages", []).append(payload)
+            if isinstance(payload, dict):
+                msg_type = payload.get("type")
+                if msg_type == "buffer":
+                    raw: bytes = data or b""
+                    dump_path = output_dir / f"frida_{int(time.time()*1000)}.bin"
+                    dump_path.write_bytes(raw)
+                    dumps.append(dump_path)
+                elif msg_type == "ready":
+                    metadata.setdefault("messages", []).append(payload)
+                else:
+                    metadata.setdefault("messages", []).append(payload)
         elif message["type"] == "error":
             metadata.setdefault("errors", []).append(message)
 
@@ -105,9 +133,13 @@ def capture_with_frida(
     script.load()
 
     if symbols:
-        script.post({"type": "configure", "symbols": list(symbols)})
+        try:
+            script.exports.configure(list(symbols))
+        except frida.InvalidOperationError:  # pragma: no cover - script lacks exports
+            pass
 
-    session.enable_debugger()
+    if spawned_pid is not None:
+        frida.resume(spawned_pid)
 
     start = time.time()
     while time.time() - start < timeout:
@@ -121,7 +153,10 @@ def capture_with_frida(
         raise RuntimeError("frida hook completed without producing dumps")
 
     manifest_path = output_dir / f"frida_capture_{int(start)}.json"
-    manifest_path.write_text(json.dumps({"dumps": [d.as_posix() for d in dumps], "metadata": metadata}, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps({"dumps": [d.as_posix() for d in dumps], "metadata": metadata}, indent=2),
+        encoding="utf-8",
+    )
     metadata["manifest"] = manifest_path.as_posix()
     return CaptureResult("frida", dumps, metadata)
 

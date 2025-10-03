@@ -11,9 +11,10 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from lua_literal_parser import LuaTable, parse_lua_expression
+from .luraph_api import LuraphAPI
 
 # Regular expression patterns for each protection type. Patterns are compiled lazily at
 # module import so unit tests pay a fixed cost.
@@ -376,11 +377,19 @@ def _extract_metadata(source: str) -> tuple[Dict[str, Any], List[str]]:
     return metadata, limitations
 
 
-def _augment_metadata_from_api(metadata: Dict[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+def _augment_metadata_from_api(metadata: Dict[str, Any], api_client: Optional[LuraphAPI]) -> tuple[Dict[str, Any], List[str]]:
     endpoint = os.environ.get("LURAPH_SIGNATURE_ENDPOINT")
-    if not endpoint or "luraph_version" not in metadata:
+    if api_client is None and not endpoint:
+        return {}, []
+    if "luraph_version" not in metadata:
         return {}, []
     version = metadata["luraph_version"]
+    if api_client:
+        try:
+            payload = api_client.version_info(version)
+        except RuntimeError as exc:
+            return {}, [f"luraph_api_error: {exc}"]
+        return {"signature_lookup": payload}, []
     url = endpoint.rstrip("/") + f"/{version}"
     try:
         with urllib.request.urlopen(url, timeout=3) as handle:
@@ -448,7 +457,7 @@ def _compute_recommendation(macros: Sequence[str], settings: Dict[str, Any], typ
     return "luajit"
 
 
-def scan_lua(source: str, *, filename: str = "<memory>") -> dict:
+def scan_lua(source: str, *, filename: str = "<memory>", api_client: Optional[LuraphAPI] = None) -> dict:
     """Scan a Lua script and return structured protection evidence."""
 
     findings: List[DetectionEvidence] = []
@@ -459,7 +468,7 @@ def scan_lua(source: str, *, filename: str = "<memory>") -> dict:
     macros = _detect_macros(source)
     settings = _extract_settings(source)
     metadata, metadata_limitations = _extract_metadata(source)
-    metadata_augmented, augmentation_limitations = _augment_metadata_from_api(metadata)
+    metadata_augmented, augmentation_limitations = _augment_metadata_from_api(metadata, api_client)
     if metadata_augmented:
         metadata = {**metadata, **metadata_augmented}
     limitations = _merge_unique(list(metadata_limitations), augmentation_limitations)
@@ -482,7 +491,7 @@ def scan_lua(source: str, *, filename: str = "<memory>") -> dict:
     return result
 
 
-def scan_files(paths: Iterable[Path]) -> dict:
+def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
     """Scan a list of Lua files and aggregate evidence."""
 
     combined: List[DetectionEvidence] = []
@@ -493,13 +502,17 @@ def scan_files(paths: Iterable[Path]) -> dict:
     limitations: List[str] = []
     path_list: List[str] = []
 
+    api_client: Optional[LuraphAPI] = None
+    if api_key:
+        api_client = LuraphAPI(api_key=api_key)
+
     for path in paths:
         try:
             data = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         path_list.append(path.as_posix())
-        per_file = scan_lua(data, filename=path.as_posix())
+        per_file = scan_lua(data, filename=path.as_posix(), api_client=api_client)
         for item in per_file["evidence"]:
             combined.append(
                 DetectionEvidence(
@@ -530,10 +543,10 @@ def scan_files(paths: Iterable[Path]) -> dict:
     }
 
 
-def dump_report(paths: Iterable[Path], output: Path) -> None:
+def dump_report(paths: Iterable[Path], output: Path, *, api_key: str | None = None) -> None:
     """Write detection results to ``output`` as JSON."""
 
-    report = scan_files(paths)
+    report = scan_files(paths, api_key=api_key)
     output.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
@@ -543,11 +556,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Detect Luraph protection features")
     parser.add_argument("init", nargs="?", default="initv4.lua", help="Bootstrap file to analyse")
     parser.add_argument("--output", "-o", default=None, help="Optional JSON output path")
+    parser.add_argument("--api-key", default=None, help="Optional Luraph API key for metadata lookups")
     parser.add_argument("--extra", nargs="*", default=(), help="Additional Lua files to include")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     paths = [Path(args.init)] + [Path(item) for item in args.extra]
-    report = scan_files(paths)
+    report = scan_files(paths, api_key=args.api_key)
     text = json.dumps(report, indent=2)
     print(text)
     if args.output:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
+import zlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
@@ -20,6 +22,15 @@ def _try_json(data: bytes) -> Any | None:
         return json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+
+
+def _try_decompress(data: bytes) -> bytes | None:
+    for decoder in (zlib.decompress,):
+        try:
+            return decoder(data)
+        except Exception:
+            continue
+    return None
 
 
 def _maybe_index(key: Any) -> int | None:
@@ -63,6 +74,10 @@ def _normalise_dump(obj: Any) -> Dict[str, Any]:
         for key in ("map", "constants", "bytecode"):
             if key in meta:
                 normalised[key] = meta[key]
+        if "instructions" in meta and not normalised["4"]:
+            normalised["4"] = _normalise_sequence(meta["instructions"])
+        if "consts" in meta and not normalised["5"]:
+            normalised["5"] = _normalise_sequence(meta["consts"])
         return normalised
     if isinstance(obj, Sequence):
         return {"4": _normalise_sequence(obj), "5": []}
@@ -109,6 +124,26 @@ def convert_bytes(data: bytes) -> Dict[str, Any]:
         dump = _normalise_dump(json_payload)
         _validate_dump(dump)
         return dump
+
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error):  # type: ignore[name-defined]
+        decoded = None
+    if decoded and decoded != data:
+        try:
+            return convert_bytes(decoded)
+        except ConversionError:
+            pass
+
+    decompressed = _try_decompress(data)
+    if decompressed:
+        json_payload = _try_json(decompressed)
+        if json_payload is not None:
+            dump = _normalise_dump(json_payload)
+            _validate_dump(dump)
+            return dump
+        if decompressed.startswith(LUA_BYTECODE_MAGIC) or decompressed.startswith(LUAJIT_MAGIC):
+            return _convert_lua_bytecode(decompressed)
 
     if data.startswith(LUA_BYTECODE_MAGIC) or data.startswith(LUAJIT_MAGIC):
         return _convert_lua_bytecode(data)
