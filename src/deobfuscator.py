@@ -669,7 +669,75 @@ class LuaDeobfuscator:
         """Apply lightweight decoding passes to ``lua_src``."""
 
         cleaned = utils.decode_simple_obfuscations(lua_src)
-        return utils.strip_non_printable(cleaned)
+        cleaned = utils.strip_non_printable(cleaned)
+        embedded = self._decode_embedded_initv4_payload(cleaned)
+        if embedded is not None and embedded.strip():
+            cleaned = embedded
+        return cleaned
+
+    def _decode_embedded_initv4_payload(self, text: str) -> str | None:
+        """Decode initv4-style payload stubs embedded directly in ``text``.
+
+        Some obfuscation presets ship a miniature bootstrapper that simply
+        concatenates one or more basE91 strings and returns the resulting
+        payload.  Those payloads already follow the initv4 encoding pipeline –
+        basE91 followed by a script-key XOR and the index XOR.  When such a
+        pattern is detected we decode the chunks in-process and hand the
+        reconstructed Lua source back to the caller so the higher level
+        formatter can pretty-print it.
+        """
+
+        chunk_re = re.compile(
+            r"chunk_\d+\s*=\s*(?:local\s+)?([\"'])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]+)\1",
+        )
+        matches = list(chunk_re.finditer(text))
+        if not matches:
+            return None
+
+        script_key = self._script_key
+        if not script_key:
+            key_match = re.search(
+                r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+                text,
+            )
+            if key_match:
+                script_key = key_match.group(1).strip()
+        if not script_key:
+            return None
+
+        try:
+            from .versions.luraph_v14_4_initv4 import decode_blob
+        except Exception:
+            return None
+
+        key_bytes = script_key.encode("utf-8", "ignore")
+        combined = bytearray()
+        for match in matches:
+            blob = match.group("blob")
+            try:
+                chunk = decode_blob(blob, key_bytes=key_bytes)
+            except Exception:
+                return None
+            combined.extend(chunk)
+
+        if not combined:
+            return None
+
+        try:
+            decoded_text = combined.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+        try:
+            payload = json.loads(decoded_text)
+        except json.JSONDecodeError:
+            return None
+
+        if isinstance(payload, dict):
+            script = payload.get("script")
+            if isinstance(script, str) and script.strip():
+                return script
+        return None
 
     def render(self, lua_src: str) -> str:
         """Pretty print Lua code for readability."""
