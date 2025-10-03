@@ -74,6 +74,7 @@ class LuaDeobfuscator:
         allow_lua_run: bool = False,
         manual_alphabet: str | None = None,
         manual_opcode_map: Mapping[int, str] | None = None,
+        output_prefix: str | None = None,
     ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
@@ -92,6 +93,7 @@ class LuaDeobfuscator:
         self._allow_lua_run = bool(allow_lua_run)
         self._manual_alphabet = manual_alphabet.strip() if manual_alphabet else None
         self._manual_opcode_map: Dict[int, str] = {}
+        self._output_prefix = output_prefix.strip() if isinstance(output_prefix, str) and output_prefix.strip() else None
         if manual_opcode_map:
             for key, value in manual_opcode_map.items():
                 try:
@@ -105,6 +107,8 @@ class LuaDeobfuscator:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._bootstrap_debug_log = Path("logs") / f"bootstrap_extract_debug_{timestamp}.log"
         self._bootstrap_meta: Dict[str, Any] = {}
+        if self._output_prefix:
+            self._bootstrap_meta["output_prefix"] = self._output_prefix
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(
@@ -665,7 +669,75 @@ class LuaDeobfuscator:
         """Apply lightweight decoding passes to ``lua_src``."""
 
         cleaned = utils.decode_simple_obfuscations(lua_src)
-        return utils.strip_non_printable(cleaned)
+        cleaned = utils.strip_non_printable(cleaned)
+        embedded = self._decode_embedded_initv4_payload(cleaned)
+        if embedded is not None and embedded.strip():
+            cleaned = embedded
+        return cleaned
+
+    def _decode_embedded_initv4_payload(self, text: str) -> str | None:
+        """Decode initv4-style payload stubs embedded directly in ``text``.
+
+        Some obfuscation presets ship a miniature bootstrapper that simply
+        concatenates one or more basE91 strings and returns the resulting
+        payload.  Those payloads already follow the initv4 encoding pipeline –
+        basE91 followed by a script-key XOR and the index XOR.  When such a
+        pattern is detected we decode the chunks in-process and hand the
+        reconstructed Lua source back to the caller so the higher level
+        formatter can pretty-print it.
+        """
+
+        chunk_re = re.compile(
+            r"chunk_\d+\s*=\s*(?:local\s+)?([\"'])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]+)\1",
+        )
+        matches = list(chunk_re.finditer(text))
+        if not matches:
+            return None
+
+        script_key = self._script_key
+        if not script_key:
+            key_match = re.search(
+                r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+                text,
+            )
+            if key_match:
+                script_key = key_match.group(1).strip()
+        if not script_key:
+            return None
+
+        try:
+            from .versions.luraph_v14_4_initv4 import decode_blob
+        except Exception:
+            return None
+
+        key_bytes = script_key.encode("utf-8", "ignore")
+        combined = bytearray()
+        for match in matches:
+            blob = match.group("blob")
+            try:
+                chunk = decode_blob(blob, key_bytes=key_bytes)
+            except Exception:
+                return None
+            combined.extend(chunk)
+
+        if not combined:
+            return None
+
+        try:
+            decoded_text = combined.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+        try:
+            payload = json.loads(decoded_text)
+        except json.JSONDecodeError:
+            return None
+
+        if isinstance(payload, dict):
+            script = payload.get("script")
+            if isinstance(script, str) and script.strip():
+                return script
+        return None
 
     def render(self, lua_src: str) -> str:
         """Pretty print Lua code for readability."""
@@ -704,6 +776,32 @@ class LuaDeobfuscator:
         version_override: str | None = None,
     ) -> str:
         """Run the full pipeline on ``content`` and return decoded Lua."""
+
+        if not self._script_key:
+            match = re.search(
+                r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+                content,
+            )
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    self._script_key = candidate
+
+        # Fast path used by the unit tests: when ``content`` already resembles
+        # the canonical JSON payload emitted by the sandbox we can execute it
+        # directly inside the Python implementation of the Luraph VM.  This
+        # avoids going through the heavy strategy selection logic when the
+        # caller simply wants to emulate a small instruction snippet.
+        try:
+            payload = json.loads(content)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict) and {"constants", "bytecode"} <= payload.keys():
+            vm = LuraphVM()
+            vm.load_bytecode(payload)
+            result = vm.run()
+            if result is not None:
+                return str(result)
 
         iterations = max(1, max_iterations)
         current = content

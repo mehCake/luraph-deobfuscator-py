@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, MutableMapping
 
+import networkx as nx
+
 
 def _read_json(path: str | os.PathLike[str]) -> Any:
     with open(path, "rb") as handle:
@@ -79,57 +81,114 @@ def reconstruct(
 
     opcode_map = _load_opmap(opcode_map_json)
 
-    lines: List[str] = []
-    lines.append("-- deobfuscated scaffold\n")
+    register_alias: Dict[int, str] = {}
+    defined_aliases: set[str] = set()
 
+    def alias_for(index: int) -> str:
+        name = register_alias.get(index)
+        if name is None:
+            name = f"r{index}"
+            register_alias[index] = name
+        return name
+
+    entries: List[Dict[str, Any]] = []
     for pc, raw in enumerate(instrs, start=1):
         if isinstance(raw, list):
             op = raw[2] if len(raw) >= 3 else None
             A = raw[5] if len(raw) >= 6 else None
             B = raw[6] if len(raw) >= 7 else None
             C = raw[7] if len(raw) >= 8 else None
+            extra = raw
         elif isinstance(raw, dict):
             op = raw.get("3", raw.get(3))
             A = raw.get("6", raw.get(6))
             B = raw.get("7", raw.get(7))
             C = raw.get("8", raw.get(8))
+            extra = list(raw.values())
         else:
             op = A = B = C = None
+            extra = []
 
         op_meta = opcode_map.get(int(op)) if isinstance(op, int) else None
         mnemonic = op_meta.get("mnemonic") if isinstance(op_meta, dict) else None
         mnemonic = mnemonic or (f"OP_{op}" if op is not None else "OP_UNKNOWN")
 
         line: str
+        terminates = mnemonic in {"RETURN"}
         if mnemonic == "LOADK" and isinstance(A, int):
-            const_index = B if isinstance(B, int) and 1 <= B <= len(consts) else None
-            if const_index is None and isinstance(raw, list):
-                for value in raw:
+            const_index: int | None = None
+            if isinstance(B, int) and 1 <= B <= len(consts):
+                const_index = B
+            else:
+                for value in extra:
                     if isinstance(value, int) and 1 <= value <= len(consts):
                         const_index = value
                         break
-            if const_index is not None and 1 <= const_index <= len(consts):
-                line = f"R[{A}] = {_const_to_lua(consts[const_index - 1])}  -- [{pc}] LOADK\n"
+            if const_index is not None:
+                alias = alias_for(A)
+                prefix = "local " if alias not in defined_aliases else ""
+                defined_aliases.add(alias)
+                line = f"{prefix}{alias} = {_const_to_lua(consts[const_index - 1])}  -- [{pc}] LOADK\n"
             else:
-                line = f"-- [{pc}] LOADK A={A}, B={B}, C={C}\n"
+                line = f"-- [{pc}] LOADK unresolved constant A={A}, B={B}, C={C}\n"
         elif mnemonic == "MOVE" and isinstance(A, int) and isinstance(B, int):
-            line = f"R[{A}] = R[{B}]  -- [{pc}] MOVE\n"
+            dest = alias_for(A)
+            src = alias_for(B)
+            prefix = "local " if dest not in defined_aliases else ""
+            defined_aliases.add(dest)
+            line = f"{prefix}{dest} = {src}  -- [{pc}] MOVE\n"
         else:
-            line = f"-- [{pc}] {mnemonic} A={A}, B={B}, C={C}\n"
+            if mnemonic.startswith("OP_"):
+                line = f"-- [{pc}] unresolved {mnemonic} A={A}, B={B}, C={C}\n"
+            else:
+                line = f"-- [{pc}] {mnemonic} A={A}, B={B}, C={C}\n"
+            terminates = terminates or mnemonic.startswith("OP_")
 
-        lines.append(line)
+        entries.append({"pc": pc, "line": line, "terminates": terminates})
 
-    chunks = []
-    for offset in range(0, len(lines), chunk_lines):
+    graph = nx.Graph()
+    block_nodes: List[int] = []
+    for entry in entries:
+        pc = entry["pc"]
+        graph.add_node(pc)
+        block_nodes.append(pc)
+        if entry["terminates"]:
+            for left, right in zip(block_nodes, block_nodes[1:]):
+                graph.add_edge(left, right)
+            block_nodes = []
+    if block_nodes:
+        for left, right in zip(block_nodes, block_nodes[1:]):
+            graph.add_edge(left, right)
+
+    entry_map = {entry["pc"]: entry for entry in entries}
+    ordered_blocks = []
+    for component in nx.connected_components(graph):
+        block = sorted(component)
+        if block:
+            ordered_blocks.append(block)
+    ordered_blocks.sort(key=lambda block: block[0])
+
+    output_lines: List[str] = ["-- deobfuscated scaffold\n"]
+    for index, block in enumerate(ordered_blocks, start=1):
+        output_lines.append(f"-- block {index} (pc {block[0]}-{block[-1]})\n")
+        for pc in block:
+            output_lines.append(entry_map[pc]["line"])
+        output_lines.append("\n")
+    if output_lines and output_lines[-1] == "\n":
+        output_lines.pop()
+
+    chunks: List[Path] = []
+    for offset in range(0, len(output_lines), chunk_lines):
         chunk_index = len(chunks) + 1
-        chunk_lines_data = lines[offset : offset + chunk_lines]
+        chunk_lines_data = output_lines[offset : offset + chunk_lines]
         chunk_path = out_path / f"deobfuscated.part{chunk_index:02d}.lua"
         chunk_path.write_text("".join(chunk_lines_data), encoding="utf-8")
         chunks.append(chunk_path)
 
-    total_lines = len(lines)
+    full_text = "".join(output_lines)
+    total_lines = len(full_text.splitlines())
     if total_lines <= 3000:
-        (out_path / "deobfuscated.full.lua").write_text("".join(lines), encoding="utf-8")
+        (out_path / "deobfuscated.full.lua").write_text(full_text, encoding="utf-8")
 
     return {"status": "ok", "chunks": len(chunks), "total_lines": total_lines}
 

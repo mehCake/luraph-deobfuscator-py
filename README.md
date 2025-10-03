@@ -28,7 +28,8 @@ encrypted script payloads).
 
 ## Installation
 
-Clone the repository and install the required dependencies:
+Clone the repository and install the required dependencies. The toolkit targets
+Python **3.10 – 3.11** to remain compatible with the bundled `lupa` release:
 
 ```bash
 git clone https://github.com/example/luraph-deobfuscator-py.git
@@ -41,11 +42,17 @@ pip install -r requirements.txt
 ### Windows
 
 The repository bundles a 64-bit LuaJIT runtime under `bin/`, so no additional
-system setup is needed:
+system setup is needed. All helper scripts (including the initv4 shim and the
+runtime capture helpers) are written with Windows 11 Command Prompt/PowerShell
+compatibility in mind—no POSIX-only shell features are required. A convenience
+wrapper is provided under `tools/run_capture_windows.cmd` if you prefer a
+single command:
 
 ```powershell
 pip install -r requirements.txt
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
+# or
+tools\run_capture_windows.cmd --key <script_key>
 ```
 
 ### Linux / macOS
@@ -56,12 +63,14 @@ Install LuaJIT and `lua-cjson`, then install the Python dependencies:
 sudo apt-get install -y luajit luarocks
 sudo luarocks install lua-cjson
 pip install -r requirements.txt
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key <script_key> --out out --run-lifter
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
 ```
 
 Run `python tools/check_deps.py` at any time to confirm that both lupa and a
 LuaJIT executable are available. The script automatically prefers the bundled
-`bin/luajit.exe` when present.
+`bin/luajit.exe` when present. The Lua shim logs to `out/shim_usage.txt` and
+captures fallback payloads to `out/unpacked_dump.lua.json` for post-mortem
+analysis.
 
 ### Protection detection & runtime capture
 
@@ -73,6 +82,9 @@ heavily protected payloads:
 python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --detect-protections
 
+# Directly run the static detector if you only need the report
+python detect_protections.py initv4.lua -o out/protection_report.json
+
 # Attempt a runtime capture using the Frida helper against a prerecorded trace
 python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --capture-runtime frida \
@@ -81,16 +93,30 @@ python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
 # Force the LuaJIT wrapper capture with extended logging
 python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --capture-runtime luajit --capture-timeout 20
+
+# Run in partial mode when macros disable virtualization
+python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
+    --key <script_key> --out out --force-partial
 ```
+
+Runtime capture requests follow the fallback chain **Frida → LuaJIT wrapper →
+emulator → in-process sandbox**. When a method fails the runner logs the error
+and automatically proceeds to the next stage, ensuring static analysis still
+occurs even if dynamic tooling is unavailable. The detector also adapts the
+plan based on discovered macros/settings (e.g. `LPH_NO_VIRTUALIZE` will skip the
+heavy lifter).
 
 Runtime captures are written to `out/capture_traces/` (customisable via
 `--capture-output`) and automatically translated into `unpacked_dump.json`
-through `src/runtime_capture/trace_to_unpacked.py`.  Frida integration relies
-on the script shipped under `tools/frida-scripts/default_hook.js`; feel free to
+through `src/runtime_capture/trace_to_unpacked.py`. Frida integration relies on
+the script shipped under `tools/frida-scripts/luraph_hook.js`; feel free to
 extend it with additional symbol hooks for non-standard bootstrappers.  The
 optional Unicorn- and Triton-based helpers live in
-`src/runtime_capture/emulator_stub.py` and `src/runtime_capture/symbolic_stub.py`;
-install `unicorn`/`triton` if you want to experiment with those paths.
+`src/runtime_capture/emulator.py` and `src/runtime_capture/symbolic_stub.py`; install
+`unicorn`/`triton` if you want to experiment with those paths.
+
+For helper coverage, runtime capture internals, and Windows-specific notes see
+[`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## Local Lua environment
 

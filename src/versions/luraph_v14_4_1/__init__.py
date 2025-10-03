@@ -179,6 +179,8 @@ HANDLER = InitV4_2Handler()
 def looks_like_vm_bytecode(
     blob: Sequence[int] | bytes,
     opcode_probe: Mapping[int, Any] | None = None,
+    *,
+    opcode_map: Mapping[int, Any] | None = None,
 ) -> bool:
     """Heuristic check for decoded VM bytecode buffers."""
 
@@ -205,11 +207,15 @@ def looks_like_vm_bytecode(
     if printable > len(data) // 2:
         return False
 
-    if opcode_probe:
+    probe = opcode_probe
+    if probe is None and opcode_map:
+        probe = opcode_map
+
+    if probe:
         try:
             probe_keys = {
                 int(key, 0) if isinstance(key, str) else int(key)
-                for key in opcode_probe.keys()
+                for key in probe.keys()
             }
         except Exception:
             probe_keys = set()

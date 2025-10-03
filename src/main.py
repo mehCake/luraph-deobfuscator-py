@@ -634,6 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--only-passes", help="comma separated list of passes to run exclusively")
     parser.add_argument("--profile", action="store_true", help="print pass timings to stdout")
     parser.add_argument("--verbose", action="store_true", help="enable verbose colourised logging")
+    parser.add_argument("--all", action="store_true", help="legacy alias with no effect (kept for compatibility)")
     parser.add_argument(
         "--debug-bootstrap",
         action="store_true",
@@ -675,6 +676,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Path to an init bootstrap stub (file or directory)",
     )
     parser.add_argument(
+        "--output-prefix",
+        dest="output_prefix",
+        help="Override the artifact prefix used for captured bootstrap blobs",
+    )
+    parser.add_argument(
         "--yes",
         dest="yes",
         action="store_true",
@@ -696,6 +702,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--dump-ir",
         metavar="PATH",
         help="write a textual VM IR listing to PATH (file or directory)",
+    )
+    parser.add_argument(
+        "--chunk-lines",
+        type=int,
+        default=800,
+        help="maximum number of lines per Lua chunk when splitting output",
+    )
+    parser.add_argument(
+        "--artifact-only",
+        action="store_true",
+        help="generate intermediate artifacts without running the full reconstruction",
     )
     parser.add_argument(
         "--step-limit",
@@ -845,6 +862,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_lua_run=args.allow_lua_run,
             manual_alphabet=manual_alphabet,
             manual_opcode_map=manual_opcode_map,
+            output_prefix=args.output_prefix,
         )
         source_suffix = item.source.suffix.lower()
         is_json_input = source_suffix == ".json"
@@ -882,6 +900,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     allow_lua_run=args.allow_lua_run,
                     manual_alphabet=manual_alphabet,
                     manual_opcode_map=manual_opcode_map,
+                    output_prefix=args.output_prefix,
+                    artifact_only=args.artifact_only,
                 )
                 ctx.options.update(
                     {
@@ -896,6 +916,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "allow_lua_run": args.allow_lua_run,
                         "manual_alphabet": manual_alphabet,
                         "manual_opcode_map": manual_opcode_map,
+                        "output_prefix": args.output_prefix,
+                        "artifact_only": args.artifact_only,
+                        "chunk_lines": max(1, args.chunk_lines),
+                        "render_chunk_lines": max(1, args.chunk_lines),
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()

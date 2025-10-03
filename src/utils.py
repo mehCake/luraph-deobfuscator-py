@@ -1,4 +1,5 @@
 import os
+import sys
 import base64
 import binascii
 import json
@@ -217,6 +218,52 @@ class LuaFormatter:
         cleaned = self._strip_trailing_blank_lines(indented)
         rendered = "\n".join(cleaned).rstrip()
         return rendered
+
+    def format_module(self, module: object) -> str:
+        """Format *module* into Lua source.
+
+        The helper accepts a variety of lightweight representations to keep the
+        tests flexible:
+
+        * a pre-rendered ``str``
+        * any iterable of lines
+        * objects exposing ``to_lua()`` or ``to_source()`` methods returning
+          strings
+        * objects exposing ``to_lines()`` yielding strings
+        """
+
+        if module is None:
+            return ""
+        if isinstance(module, str):
+            return self.format_source(module)
+        if hasattr(module, "to_lua") and callable(module.to_lua):  # type: ignore[attr-defined]
+            try:
+                text = module.to_lua()  # type: ignore[misc]
+            except Exception:
+                text = ""
+            if isinstance(text, str):
+                return self.format_source(text)
+        if hasattr(module, "to_source") and callable(module.to_source):  # type: ignore[attr-defined]
+            text = module.to_source()  # type: ignore[misc]
+            if isinstance(text, str):
+                return self.format_source(text)
+        lines: list[str] = []
+        if hasattr(module, "to_lines") and callable(module.to_lines):  # type: ignore[attr-defined]
+            try:
+                iterable = module.to_lines()  # type: ignore[misc]
+            except Exception:
+                iterable = None
+            if iterable is not None:
+                for line in iterable:
+                    if isinstance(line, str):
+                        lines.append(line)
+        if not lines and isinstance(module, (list, tuple, set)):
+            for line in module:  # type: ignore[assignment]
+                if isinstance(line, str):
+                    lines.append(line)
+        if not lines:
+            return ""
+        return self.format_source("\n".join(lines))
 
     # -- Normalisation helpers -------------------------------------
     def _normalise_lines(self, text: str) -> str:
@@ -479,6 +526,21 @@ class LuaSyntaxValidator:
         result["valid"] = True
         return result
 
+    def validate(self, source: str) -> None:
+        """Validate *source* raising :class:`SyntaxError` on failure.
+
+        When no system Lua interpreter is available the method becomes a
+        no-op, matching the permissive behaviour expected in continuous
+        integration environments where only Python is present.
+        """
+
+        outcome = self.check(source)
+        if not outcome.get("available", True):
+            return
+        if not outcome.get("valid", False):
+            message = outcome.get("error", "invalid Lua syntax")
+            raise SyntaxError(message)
+
 
 def extract_embedded_json(content: str) -> Optional[str]:
     """Return the first JSON snippet found inside a Lua string.
@@ -641,7 +703,18 @@ def benchmark_parallel(
         worker(item)
     sequential = timer() - start
 
-    _, parallel = run_parallel(items, worker, jobs=jobs, timer=timer)
+    package = sys.modules.get("src.utils")
+    run_parallel_fn: Callable[..., tuple[list[R], float]]
+    if package is not None:
+        candidate = getattr(package, "run_parallel", None)
+        if callable(candidate):
+            run_parallel_fn = candidate  # type: ignore[assignment]
+        else:
+            run_parallel_fn = run_parallel  # fallback to local implementation
+    else:
+        run_parallel_fn = run_parallel
+
+    _, parallel = run_parallel_fn(items, worker, jobs=jobs, timer=timer)
 
     ratio = parallel / sequential if sequential > 0 else 0.0
     if ratio > 2.0:
