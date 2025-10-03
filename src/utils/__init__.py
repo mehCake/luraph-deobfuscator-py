@@ -43,12 +43,37 @@ def _missing(name: str) -> Callable[..., Any]:  # pragma: no cover - defensive
 
 
 if _legacy_utils is not None:
-    LuaFormatter = _legacy_utils.LuaFormatter  # type: ignore[attr-defined]
-    LuaSyntaxValidator = _legacy_utils.LuaSyntaxValidator  # type: ignore[attr-defined]
-    run_parallel = _legacy_utils.run_parallel  # type: ignore[attr-defined]
-    benchmark_parallel = _legacy_utils.benchmark_parallel  # type: ignore[attr-defined]
-    serialise_metadata = _legacy_utils.serialise_metadata  # type: ignore[attr-defined]
-    summarise_metadata = _legacy_utils.summarise_metadata  # type: ignore[attr-defined]
+    # Mirror the legacy module's public surface so existing imports keep
+    # working.  Tests exercise helpers such as ``safe_read_file`` and
+    # ``decode_simple_obfuscations`` which previously lived in
+    # ``src/utils.py``.  Importing them eagerly keeps attribute access fast
+    # while still deferring the actual module import until runtime.
+    _private_exports = {"_is_printable"}
+    for _name in dir(_legacy_utils):  # pragma: no branch - executed in tests
+        if _name.startswith("_") and _name not in _private_exports:
+            continue
+        globals()[_name] = getattr(_legacy_utils, _name)
+
+    # ``__all__`` advertises the combined API.  The explicit list makes the
+    # package play nicely with tools such as ``from src import utils`` that
+    # rely on :mod:`pkgutil` style introspection.
+    __all__ = sorted(
+        {
+            "chunk_lines",
+            "ensure_out",
+            "parse_escaped_lua_string",
+            "try_xor",
+            "write_b64_text",
+            "write_json",
+            "write_text",
+            "rebuild_vm_bytecode",
+            "looks_like_vm_bytecode",
+            "infer_opcode_map",
+            *_legacy_utils.__dict__.keys(),
+            *_private_exports,
+        }
+        - {name for name in dir(_legacy_utils) if name.startswith("_") and name not in _private_exports}
+    )
 else:  # pragma: no cover - minimal fallback when legacy helpers unavailable
     from .LuaFormatter import LuaFormatter  # noqa: F401
 
@@ -64,21 +89,21 @@ else:  # pragma: no cover - minimal fallback when legacy helpers unavailable
     summarise_metadata = _missing("summarise_metadata")  # type: ignore[assignment]
 
 
-__all__ = [
-    "chunk_lines",
-    "ensure_out",
-    "parse_escaped_lua_string",
-    "try_xor",
-    "write_b64_text",
-    "write_json",
-    "write_text",
-    "rebuild_vm_bytecode",
-    "looks_like_vm_bytecode",
-    "infer_opcode_map",
-    "LuaFormatter",
-    "LuaSyntaxValidator",
-    "run_parallel",
-    "benchmark_parallel",
-    "serialise_metadata",
-    "summarise_metadata",
-]
+    __all__ = [
+        "chunk_lines",
+        "ensure_out",
+        "parse_escaped_lua_string",
+        "try_xor",
+        "write_b64_text",
+        "write_json",
+        "write_text",
+        "rebuild_vm_bytecode",
+        "looks_like_vm_bytecode",
+        "infer_opcode_map",
+        "LuaFormatter",
+        "LuaSyntaxValidator",
+        "run_parallel",
+        "benchmark_parallel",
+        "serialise_metadata",
+        "summarise_metadata",
+    ]
