@@ -217,6 +217,8 @@ class Context:
     report: DeobReport = field(default_factory=_default_report)
     result: Dict[str, Any] = field(default_factory=dict)
     bootstrapper_metadata: Dict[str, Any] = field(default_factory=dict)
+    output_prefix: str | None = None
+    artifact_only: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.options, dict):
@@ -235,6 +237,7 @@ class Context:
                 allow_lua_run=self.allow_lua_run,
                 manual_alphabet=self.manual_alphabet,
                 manual_opcode_map=self.manual_opcode_map,
+                output_prefix=self.output_prefix,
             )
         if self.script_key and not self.report.script_key_used:
             self.report.script_key_used = self.script_key

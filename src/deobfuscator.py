@@ -74,6 +74,7 @@ class LuaDeobfuscator:
         allow_lua_run: bool = False,
         manual_alphabet: str | None = None,
         manual_opcode_map: Mapping[int, str] | None = None,
+        output_prefix: str | None = None,
     ) -> None:
         self.logger = logger
         self._version_detector = VersionDetector()
@@ -92,6 +93,7 @@ class LuaDeobfuscator:
         self._allow_lua_run = bool(allow_lua_run)
         self._manual_alphabet = manual_alphabet.strip() if manual_alphabet else None
         self._manual_opcode_map: Dict[int, str] = {}
+        self._output_prefix = output_prefix.strip() if isinstance(output_prefix, str) and output_prefix.strip() else None
         if manual_opcode_map:
             for key, value in manual_opcode_map.items():
                 try:
@@ -105,6 +107,8 @@ class LuaDeobfuscator:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._bootstrap_debug_log = Path("logs") / f"bootstrap_extract_debug_{timestamp}.log"
         self._bootstrap_meta: Dict[str, Any] = {}
+        if self._output_prefix:
+            self._bootstrap_meta["output_prefix"] = self._output_prefix
 
     # --- Pipeline stages -------------------------------------------------
     def detect_version(

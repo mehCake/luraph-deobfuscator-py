@@ -15,15 +15,15 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import detect_protections, protections
-from .runtime_capture import trace_to_unpacked
-from .runtime_capture.luajit_paths import find_luajit
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOG_PATH: Path | None = None
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from src import detect_protections, protections
+from src.runtime_capture import trace_to_unpacked
+from src.runtime_capture.luajit_paths import find_luajit
 
 
 def _log(message: str, level: str = "INFO") -> None:
