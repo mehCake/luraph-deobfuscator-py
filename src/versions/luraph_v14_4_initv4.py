@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import string
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -286,7 +287,7 @@ class InitV4Decoder:
 
         if not self._manual_override_alphabet and alphabet:
             self._alphabet = alphabet
-            self._alphabet_source = "bootstrapper"
+            self._alphabet_source = "bootstrap"
 
         table_map = {opcode: spec.mnemonic for opcode, spec in table.items()}
         if table_map:
@@ -323,6 +324,16 @@ class InitV4Decoder:
         if self.opcode_map:
             meta.setdefault("opcode_map_count", len(self.opcode_map))
             meta.setdefault("opcode_map", dict(self.opcode_map))
+        if (
+            self._alphabet is DEFAULT_ALPHABET
+            and self.bootstrap is not None
+            and "alphabet_length" not in meta
+        ):
+            fallback_alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits
+            meta.setdefault("alphabet_length", len(fallback_alphabet))
+            meta.setdefault("alphabet_preview", fallback_alphabet[:32] + ("..." if len(fallback_alphabet) > 32 else ""))
+            meta.setdefault("alphabet_source", "bootstrap")
+            meta.setdefault("alphabet_fallback", fallback_alphabet)
         if meta:
             existing = getattr(self.ctx, "bootstrapper_metadata", None)
             if isinstance(existing, Mapping):

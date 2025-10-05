@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, MutableMapping
 
-import networkx as nx
+from . import simple_graph as nx
 
 
 def _read_json(path: str | os.PathLike[str]) -> Any:

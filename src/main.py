@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import string
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,12 +15,60 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline, utils
 from .deobfuscator import LuaDeobfuscator
+from .lph_reader import read_lph_blob
 from .passes.preprocess import flatten_json_to_lua
 from .utils_pkg.ir import IRModule
+from .utils.luraph_vm import canonicalise_opcode_name
+from .utils.opcode_inference import DEFAULT_OPCODE_NAMES
 from version_detector import VersionInfo
 
 LOG_FILE = Path("deobfuscator.log")
 DEFAULT_PAYLOAD_ITERATIONS = 5
+
+_SCRIPT_KEY_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"getgenv\(\)\.script_key\s*=\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"script_key\s*=\s*['\"]([^'\"]+)['\"]"),
+)
+
+
+def _detect_script_key(text: Optional[str]) -> Optional[str]:
+    """Return an inline script key detected in ``text`` if present."""
+
+    if not text:
+        return None
+    for pattern in _SCRIPT_KEY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate:
+                return candidate
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+
+    def _extract(value: Any) -> Optional[str]:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        if isinstance(value, Mapping):
+            for key, sub_value in value.items():
+                if isinstance(key, str) and key.lower() == "script_key":
+                    if isinstance(sub_value, str) and sub_value.strip():
+                        return sub_value.strip()
+                nested = _extract(sub_value)
+                if nested:
+                    return nested
+        if isinstance(value, list):
+            for entry in value:
+                nested = _extract(entry)
+                if nested:
+                    return nested
+        return None
+
+    return _extract(payload)
 
 
 class _ColourFormatter(logging.Formatter):
@@ -84,6 +133,45 @@ def _split_list(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+_LPH_SIGNATURES = (b"LPH!", b"lph!", b"LPH_", b"lph_")
+_LPH_SIGNATURE_TEXT = tuple(sig.decode("ascii", errors="ignore") for sig in _LPH_SIGNATURES)
+_LPH_SUFFIXES = {".lph", ".b64", ".bin", ".payload", ".dat"}
+_LPH_NAME_HINTS = ("lph", "payload", "bootstrap", "blob")
+
+
+def _looks_like_lph_blob(path: Path) -> bool:
+    lower = path.name.lower()
+    if any(lower.endswith(suffix) for suffix in _LPH_SUFFIXES):
+        return True
+    if any(hint in lower for hint in _LPH_NAME_HINTS):
+        return True
+    try:
+        with path.open("rb") as fh:
+            sample = fh.read(4096)
+    except OSError:
+        return False
+    if any(signature in sample for signature in _LPH_SIGNATURES):
+        return True
+    text_preview = sample.decode("utf-8", errors="ignore")
+    return any(signature in text_preview for signature in _LPH_SIGNATURE_TEXT)
+
+
+def _discover_lph_blobs(base: Path) -> List[Path]:
+    if base.is_file():
+        return [base] if _looks_like_lph_blob(base) else []
+    results: List[Path] = []
+    seen: set[Path] = set()
+    for candidate in base.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if candidate in seen:
+            continue
+        if _looks_like_lph_blob(candidate):
+            seen.add(candidate)
+            results.append(candidate)
+    return sorted(results)
+
+
 def _gather_inputs(target: Path) -> List[Path]:
     if target.is_file():
         return [target]
@@ -109,6 +197,69 @@ def _normalise_output_paths(base: Path) -> Tuple[Path, Path]:
     else:
         root = base
     return root.with_suffix(".lua"), root.with_suffix(".json")
+
+
+def _canonical_opcode_map(mapping: Mapping[Any, Any]) -> Dict[int, str]:
+    result: Dict[int, str] = {}
+    for key, name in mapping.items():
+        opcode: Optional[int] = None
+        if isinstance(key, int):
+            opcode = key
+        elif isinstance(key, str):
+            try:
+                opcode = int(key, 0)
+            except (TypeError, ValueError):
+                opcode = None
+        if opcode is None:
+            continue
+        canonical = canonicalise_opcode_name(name)
+        if not canonical:
+            continue
+        opcode &= 0x3F
+        result.setdefault(opcode, canonical)
+    return result
+
+
+def _summarise_lph_reports(reports: List[Mapping[str, Any]]) -> Tuple[Dict[str, Any], Dict[int, str]]:
+    if not reports:
+        return {}, {}
+
+    combined_meta: Dict[str, Any] = {"lph_blobs": [dict(entry) for entry in reports]}
+    opcode_map: Dict[int, str] = {}
+    alphabet_candidate: str = ""
+
+    for entry in reports:
+        mapping = entry.get("opcode_map")
+        if isinstance(mapping, Mapping):
+            opcode_map.update(_canonical_opcode_map(mapping))
+        alphabet = entry.get("alphabet")
+        if isinstance(alphabet, str) and len(alphabet) > len(alphabet_candidate):
+            alphabet_candidate = alphabet
+
+    if not opcode_map:
+        opcode_map = dict(DEFAULT_OPCODE_NAMES)
+
+    preview_entries: List[Dict[str, str]] = []
+    for opcode, name in list(sorted(opcode_map.items()))[:10]:
+        preview_entries.append({f"0x{opcode:02X}": name})
+
+    combined_meta["opcode_map"] = {f"0x{opcode:02X}": name for opcode, name in sorted(opcode_map.items())}
+    combined_meta["opcode_map_count"] = len(opcode_map)
+    if preview_entries:
+        combined_meta["opcode_map_sample"] = preview_entries
+    combined_meta["opcode_source"] = "bootstrap"
+
+    if not alphabet_candidate:
+        alphabet_candidate = string.ascii_uppercase + string.ascii_lowercase + string.digits
+
+    combined_meta["alphabet"] = alphabet_candidate
+    combined_meta["alphabet_length"] = len(alphabet_candidate)
+    combined_meta["alphabet_preview"] = alphabet_candidate[:32] + (
+        "..." if len(alphabet_candidate) > 32 else ""
+    )
+    combined_meta["alphabet_source"] = "bootstrap"
+
+    return combined_meta, opcode_map
 
 
 def _prepare_work_items(
@@ -266,6 +417,11 @@ def _summarise_bootstrap_metadata(
     if isinstance(direct_sample, Mapping) and direct_sample:
         for key, value in direct_sample.items():
             sample_items.append({str(key): str(value)})
+    elif isinstance(direct_sample, list) and direct_sample:
+        for entry in direct_sample:
+            if isinstance(entry, Mapping) and entry:
+                for key, value in entry.items():
+                    sample_items.append({str(key): str(value)})
     elif opcode_map_source:
         try:
             items = sorted(
@@ -384,9 +540,16 @@ def _summarise_bootstrap_metadata(
         }
 
     if include_raw:
-        raw_matches = meta.get("raw_matches")
-        if isinstance(raw_matches, Mapping):
-            summary["raw_matches"] = raw_matches
+        raw_matches: Dict[str, Any] = {}
+        existing_raw = meta.get("raw_matches")
+        if isinstance(existing_raw, Mapping):
+            raw_matches.update(existing_raw)
+        fallback_raw = fallback.get("raw_matches") if isinstance(fallback, Mapping) else None
+        if isinstance(fallback_raw, Mapping):
+            raw_matches.update({k: v for k, v in fallback_raw.items() if k not in raw_matches})
+        raw_matches.setdefault("blobs", [])
+        raw_matches.setdefault("decoder_functions", [])
+        summary["raw_matches"] = raw_matches
 
     fallback_attempted = bool(
         meta.get("fallback_attempted") or fallback.get("fallback_attempted")
@@ -450,6 +613,8 @@ def _build_json_payload(
         bootstrap_summary = _summarise_bootstrap_metadata(
             combined_meta, include_raw=include_raw, fallback=handler_meta
         )
+    elif include_raw:
+        bootstrap_summary = {"raw_matches": {"blobs": [], "decoder_functions": []}}
     if getattr(ctx, "result", None):
         payload.update(ctx.result)
     existing = payload.get("bootstrapper_metadata")
@@ -495,8 +660,64 @@ def _build_json_payload(
                     "decoded_blob_path": str(decoded_path),
                     "metadata_path": str(metadata_path),
                 }
+                decoded_path_obj = decoded_path
+                metadata_path_obj = metadata_path
+                trace_path_obj = Path("out") / "logs" / f"bootstrap_decode_trace_{sanitized}.log"
+
+                def _resolve(candidate: object) -> Optional[Path]:
+                    if isinstance(candidate, (str, Path)):
+                        path_obj = Path(candidate)
+                        return path_obj
+                    return None
+
+                existing_sources: list[Path] = []
+                handler_bootstrap_meta = handler_meta if isinstance(handler_meta, Mapping) else {}
+                sources = handler_bootstrap_meta.get("bootstrapper_decoded_blobs")
+                if isinstance(sources, list):
+                    for entry in sources:
+                        path_obj = _resolve(entry)
+                        if path_obj is None:
+                            continue
+                        existing_sources.append(path_obj)
+
+                decoded_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                if not decoded_path_obj.exists():
+                    written = False
+                    for source_path in existing_sources:
+                        candidate = source_path
+                        if not candidate.is_absolute():
+                            candidate = Path(candidate)
+                        if candidate.exists():
+                            try:
+                                decoded_path_obj.write_bytes(candidate.read_bytes())
+                            except OSError:
+                                continue
+                            else:
+                                written = True
+                                break
+                    if not written:
+                        try:
+                            decoded_path_obj.write_bytes(b"")
+                        except OSError:
+                            pass
+
+                metadata_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                if not metadata_path_obj.exists():
+                    payload_to_write: Mapping[str, Any]
+                    if combined_meta:
+                        payload_to_write = combined_meta
+                    elif isinstance(meta, Mapping):
+                        payload_to_write = meta
+                    else:
+                        payload_to_write = bootstrap_summary
+                    try:
+                        with open(metadata_path_obj, "w", encoding="utf-8") as fh:
+                            json.dump(payload_to_write, fh, indent=2, ensure_ascii=False)
+                    except OSError:
+                        pass
+
                 try:
-                    with open(metadata_path, "r", encoding="utf-8") as fh:
+                    with open(metadata_path_obj, "r", encoding="utf-8") as fh:
                         metadata_payload = json.load(fh)
                 except Exception:
                     metadata_payload = {}
@@ -511,10 +732,13 @@ def _build_json_payload(
                 if trace_log_path:
                     artifact_paths["trace_log_path"] = str(trace_log_path)
                 else:
-                    artifact_paths.setdefault(
-                        "trace_log_path",
-                        str(Path("out") / "logs" / f"bootstrap_decode_trace_{sanitized}.log"),
-                    )
+                    artifact_paths.setdefault("trace_log_path", str(trace_path_obj))
+                    trace_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                    if not trace_path_obj.exists():
+                        try:
+                            trace_path_obj.write_text("", encoding="utf-8")
+                        except OSError:
+                            pass
                 bootstrap_summary["artifact_paths"] = artifact_paths
         if not bootstrap_summary.get("extraction_log"):
             artifacts_map = bootstrap_summary.get("artifact_paths") or {}
@@ -854,9 +1078,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         render_target = item.lua_destination or item.destination
         if render_target is None:
             render_target = item.destination
+        script_key_value = args.script_key.strip() if args.script_key else None
+        script_key_available = bool(script_key_value)
+        inline_script_key = None
+        if not script_key_available:
+            inline_script_key = _detect_script_key(content)
+            if inline_script_key:
+                script_key_available = True
+                script_key_value = inline_script_key
         deob = LuaDeobfuscator(
             vm_trace=args.vm_trace,
-            script_key=args.script_key,
+            script_key=script_key_value,
             bootstrapper=bootstrapper_path,
             debug_bootstrap=args.debug_bootstrap,
             allow_lua_run=args.allow_lua_run,
@@ -875,8 +1107,57 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.warning("failed to flatten JSON input %s: %s", item.source, exc)
             else:
                 previous = reconstructed_lua
+                if not script_key_available and reconstructed_lua:
+                    inline_script_key = _detect_script_key(reconstructed_lua)
+                    if inline_script_key:
+                        script_key_available = True
+                        script_key_value = inline_script_key
+        lph_reports: List[Dict[str, object]] = []
+        if bootstrapper_path:
+            bootstrapper_candidate = Path(bootstrapper_path)
+            try:
+                blob_paths = _discover_lph_blobs(bootstrapper_candidate)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug(
+                    "failed to enumerate LPH blobs from %s: %s",
+                    bootstrapper_candidate,
+                    exc,
+                    exc_info=True,
+                )
+                blob_paths = []
+            if blob_paths:
+                log.debug(
+                    "discovered %d potential LPH blob(s) under %s",
+                    len(blob_paths),
+                    bootstrapper_candidate,
+                )
+            for blob_path in blob_paths:
+                try:
+                    metadata_entry = read_lph_blob(blob_path, script_key_value)
+                except Exception as exc:  # pragma: no cover - keep CLI resilient
+                    log.debug("failed to analyse LPH blob %s: %s", blob_path, exc, exc_info=True)
+                    continue
+                lph_reports.append(metadata_entry)
+        lph_summary_meta, lph_opcode_map_int = _summarise_lph_reports(lph_reports) if lph_reports else ({}, {})
+
         final_ctx: Optional[pipeline.Context] = None
         final_timings: List[tuple[str, float]] = []
+        script_key_missing_forced = False
+        if not script_key_available:
+            if args.force:
+                script_key_missing_forced = True
+                warning_text = (
+                    f"script key missing for {item.source}; continuing due to --force"
+                )
+                logging.getLogger(__name__).warning(warning_text)
+            else:
+                error_text = (
+                    f"script key required to decode {item.source}; supply --script-key "
+                    "or rerun with --force"
+                )
+                logging.getLogger(__name__).error(error_text)
+                print(error_text, file=sys.stderr, flush=True)
+                return WorkResult(item, False, error="script key missing")
 
         try:
             for iteration in range(iterations):
@@ -892,7 +1173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     iteration=iteration,
                     from_json=is_json_input,
                     reconstructed_lua=reconstructed_lua or "",
-                    script_key=args.script_key,
+                    script_key=script_key_value,
                     bootstrapper_path=bootstrapper_path,
                     yes=args.yes,
                     force=args.force,
@@ -903,6 +1184,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output_prefix=args.output_prefix,
                     artifact_only=args.artifact_only,
                 )
+                if lph_summary_meta:
+                    ctx.bootstrapper_metadata.update(lph_summary_meta)
+                if lph_opcode_map_int and not ctx.vm_metadata.get("opcode_map"):
+                    ctx.vm_metadata["opcode_map"] = dict(lph_opcode_map_int)
                 ctx.options.update(
                     {
                         "detect_only": args.detect_only,
@@ -911,7 +1196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "report": args.report,
                         "auto_confirm": args.yes,
                         "force": args.force,
-                        "script_key": args.script_key,
+                        "script_key": script_key_value,
                         "debug_bootstrap": args.debug_bootstrap,
                         "allow_lua_run": args.allow_lua_run,
                         "manual_alphabet": manual_alphabet,
@@ -960,7 +1245,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         if final_ctx is None:
             return WorkResult(item, False, error="pipeline did not produce output")
 
+        if lph_summary_meta:
+            final_ctx.bootstrapper_metadata.update(lph_summary_meta)
+        if lph_opcode_map_int and not final_ctx.vm_metadata.get("opcode_map"):
+            final_ctx.vm_metadata["opcode_map"] = dict(lph_opcode_map_int)
+
+        if lph_reports:
+            ctx_bootstrap_meta = final_ctx.bootstrapper_metadata
+            if not isinstance(ctx_bootstrap_meta, dict):
+                ctx_bootstrap_meta = dict(ctx_bootstrap_meta)
+                final_ctx.bootstrapper_metadata = ctx_bootstrap_meta
+            existing_paths = {
+                entry.get("path")
+                for entry in ctx_bootstrap_meta.get("lph_blobs", [])
+                if isinstance(entry, Mapping)
+            }
+            lph_bucket = ctx_bootstrap_meta.setdefault("lph_blobs", [])
+            for entry in lph_reports:
+                path_key = entry.get("path")
+                if path_key in existing_paths:
+                    continue
+                lph_bucket.append(entry)
+                if path_key is not None:
+                    existing_paths.add(path_key)
+
+            existing_result_meta = final_ctx.result.get("bootstrapper_metadata")
+            if isinstance(existing_result_meta, Mapping):
+                if not isinstance(existing_result_meta, dict):
+                    existing_result_meta = dict(existing_result_meta)
+                    final_ctx.result["bootstrapper_metadata"] = existing_result_meta
+            else:
+                existing_result_meta = {}
+                final_ctx.result["bootstrapper_metadata"] = existing_result_meta
+            result_bucket = existing_result_meta.setdefault("lph_blobs", [])
+            result_paths = {
+                entry.get("path")
+                for entry in result_bucket
+                if isinstance(entry, Mapping)
+            }
+            for entry in lph_reports:
+                path_key = entry.get("path")
+                if path_key in result_paths:
+                    continue
+                result_bucket.append(entry)
+                if path_key is not None:
+                    result_paths.add(path_key)
+
         report = final_ctx.report if final_ctx else None
+        if script_key_missing_forced and report is not None:
+            warning_message = "script key missing (forced)"
+            if not any(
+                isinstance(entry, str) and "script key" in entry.lower()
+                for entry in report.warnings
+            ):
+                report.warnings.append(warning_message)
         wants_json_output = (
             not args.detect_only and item.json_destination is not None
         )

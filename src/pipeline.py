@@ -581,6 +581,14 @@ def _pass_preprocess(ctx: Context) -> None:
         ctx.write_artifact("preprocess", ctx.stage_output)
 
 
+def _ensure_vm_metadata_bucket(ctx: Context, key: str) -> Dict[str, Any]:
+    bucket = ctx.vm_metadata.get(key)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        ctx.vm_metadata[key] = bucket
+    return bucket
+
+
 def _pass_payload_decode(ctx: Context) -> None:
     metadata = payload_decode_run(ctx)
     report = ctx.report
@@ -601,7 +609,7 @@ def _pass_vm_lift(ctx: Context) -> None:
     metadata = vm_lift_run(ctx)
     module = ctx.ir_module
     if module is not None:
-        lifter_meta = ctx.vm_metadata.setdefault("lifter", {})
+        lifter_meta = _ensure_vm_metadata_bucket(ctx, "lifter")
         lifter_meta.update(
             {
                 "instruction_count": module.instruction_count,
@@ -671,7 +679,7 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
         return
     metadata = vm_devirtualize_run(ctx)
     if metadata:
-        devirt_meta = ctx.vm_metadata.setdefault("devirtualizer", {})
+        devirt_meta = _ensure_vm_metadata_bucket(ctx, "devirtualizer")
         for key in (
             "pc_mapping",
             "statement_map",
@@ -686,11 +694,11 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
                 devirt_meta[key] = value
         unreachable = metadata.get("unreachable_pcs")
         if isinstance(unreachable, list) and unreachable:
-            traps_meta = ctx.vm_metadata.setdefault("traps", {})
+            traps_meta = _ensure_vm_metadata_bucket(ctx, "traps")
             traps_meta["unreachable_pcs"] = list(unreachable)
         eliminated = metadata.get("eliminated_instructions")
         if isinstance(eliminated, int) and eliminated > 0:
-            traps_meta = ctx.vm_metadata.setdefault("traps", {})
+            traps_meta = _ensure_vm_metadata_bucket(ctx, "traps")
             traps_meta["eliminated_instructions"] = eliminated
     ctx.record_metadata("vm_devirtualize", dict(metadata))
     if ctx.stage_output:
@@ -709,7 +717,7 @@ def _pass_cleanup(ctx: Context) -> None:
         if isinstance(dummy_loops, int):
             traps += max(dummy_loops, 0)
         report.traps_removed = traps
-        trap_meta = ctx.vm_metadata.setdefault("traps", {})
+        trap_meta = _ensure_vm_metadata_bucket(ctx, "traps")
         if isinstance(assert_traps, int):
             trap_meta["assert_traps"] = max(assert_traps, 0)
         lines = metadata.get("assert_trap_lines")

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence
 
-from .luraph_vm import rebuild_vm_bytecode
+from .luraph_vm import canonicalise_opcode_name, rebuild_vm_bytecode
 
 DEFAULT_OPCODE_NAMES: Dict[int, str] = {
     0: "MOVE",
@@ -47,6 +47,123 @@ DEFAULT_OPCODE_NAMES: Dict[int, str] = {
     36: "CLOSURE",
     37: "VARARG",
 }
+
+_METADATA_KEYS: Sequence[str] = (
+    "opcode_map",
+    "opcode_dispatch",
+    "opcode_table",
+    "named_opcode_map",
+    "opcodeLookup",
+    "opcode_lookup",
+)
+
+
+def _coerce_opcode(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value & 0x3F
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            if text.lower().startswith("0x"):
+                return int(text, 16) & 0x3F
+            return int(text, 10) & 0x3F
+        except ValueError:
+            return None
+    return None
+
+
+def _normalise_opcode_entries(candidate: Any) -> Dict[int, str]:
+    normalised: Dict[int, str] = {}
+
+    if isinstance(candidate, Mapping):
+        mapping: MutableMapping[Any, Any] = dict(candidate)
+        array = mapping.get("array")
+        nested_map = mapping.get("map")
+        if isinstance(nested_map, Mapping):
+            mapping = dict(nested_map)
+        elif isinstance(array, Sequence):
+            for index, item in enumerate(array):
+                name = None
+                if isinstance(item, str):
+                    name = item
+                elif isinstance(item, Mapping):
+                    name = (
+                        item.get("mnemonic")
+                        or item.get("name")
+                        or item.get("op")
+                        or item.get("value")
+                    )
+                if name:
+                    normalised[index] = name
+            return normalised
+
+        for key, value in mapping.items():
+            opcode = _coerce_opcode(key)
+            if opcode is None:
+                continue
+            name = None
+            if isinstance(value, str):
+                name = value
+            elif isinstance(value, Mapping):
+                name = (
+                    value.get("mnemonic")
+                    or value.get("name")
+                    or value.get("op")
+                    or value.get("value")
+                )
+            elif isinstance(value, Sequence):
+                if value and isinstance(value[0], str):
+                    name = value[0]
+            if name:
+                normalised[opcode] = name
+        return normalised
+
+    if isinstance(candidate, Sequence) and not isinstance(candidate, (bytes, bytearray, str)):
+        for index, item in enumerate(candidate):
+            name = None
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, Mapping):
+                name = (
+                    item.get("mnemonic")
+                    or item.get("name")
+                    or item.get("op")
+                    or item.get("value")
+                )
+            if name:
+                normalised[index] = name
+    return normalised
+
+
+def _opcode_map_from_metadata(
+    metadata: Mapping[str, object] | Sequence[object] | None,
+) -> Dict[int, str]:
+    if metadata is None:
+        return {}
+
+    found: Dict[int, str] = {}
+    stack: list[Any] = [metadata]
+    seen: set[int] = set()
+
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            for key in _METADATA_KEYS:
+                if key in item and id(item[key]) not in seen:
+                    seen.add(id(item[key]))
+                    mapping = _normalise_opcode_entries(item[key])
+                    if mapping:
+                        for opcode, name in mapping.items():
+                            canonical = canonicalise_opcode_name(name)
+                            if canonical:
+                                found[opcode] = canonical
+            stack.extend(item.values())
+        elif isinstance(item, Sequence) and not isinstance(item, (bytes, bytearray, str)):
+            stack.extend(item)
+
+    return found
 
 
 def _normalise_instruction(instr: Mapping[str, object] | Sequence[object]) -> Dict[str, int]:
@@ -108,27 +225,46 @@ def _score_candidates(features: Dict[str, int]) -> Dict[str, float]:
     return scores
 
 
-def infer_opcode_map(unpacked: Mapping[str, object] | Sequence[object]) -> Dict[int, str]:
+def infer_opcode_map(
+    unpacked: Mapping[str, object] | Sequence[object],
+    *,
+    bootstrap_metadata: Mapping[str, object] | None = None,
+) -> Dict[int, str]:
     """Return a best-effort mapping of opcode numbers to Lua 5.1 mnemonics."""
 
+    metadata_map = _opcode_map_from_metadata(bootstrap_metadata)
+    unpacked_map = _opcode_map_from_metadata(unpacked)
+    combined: Dict[int, str] = dict(metadata_map)
+    for opcode, name in unpacked_map.items():
+        combined.setdefault(opcode, name)
+
+    heuristics: Dict[int, str] = {}
     try:
         rebuild = rebuild_vm_bytecode(unpacked)
         instructions: Iterable[Mapping[str, object]] = rebuild.instructions
     except Exception:  # pragma: no cover - defensive
+        heuristics = {}
+    else:
+        for instr in instructions:
+            features = _normalise_instruction(instr)
+            opnum = features["opnum"]
+            if opnum in heuristics:
+                continue
+            scores = _score_candidates(features)
+            if not scores:
+                continue
+            name = max(scores.items(), key=lambda item: item[1])[0]
+            canonical = canonicalise_opcode_name(name)
+            if canonical:
+                heuristics[opnum] = canonical
+
+    for opcode, name in heuristics.items():
+        combined.setdefault(opcode, name)
+
+    if not combined:
         return dict(DEFAULT_OPCODE_NAMES)
 
-    inferred: Dict[int, str] = {}
-    for instr in instructions:
-        features = _normalise_instruction(instr)
-        opnum = features["opnum"]
-        if opnum in inferred:
-            continue
-        scores = _score_candidates(features)
-        if not scores:
-            continue
-        name = max(scores.items(), key=lambda item: item[1])[0]
-        inferred[opnum] = name
-    return inferred
+    return combined
 
 
 __all__ = ["infer_opcode_map", "DEFAULT_OPCODE_NAMES"]

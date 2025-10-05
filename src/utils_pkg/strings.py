@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 import string
 from typing import Iterable, Optional
 
@@ -131,6 +132,37 @@ def unique_preserving(items: Iterable[bytes]) -> list[bytes]:
     return ordered
 
 
+def lua_placeholder_function(name_hint: Optional[str], comments: Iterable[str]) -> str:
+    """Return a Lua function stub describing a placeholder chunk.
+
+    ``name_hint`` is converted into a safe identifier so the generated function
+    can be loaded without syntax errors.  ``comments`` is rendered into the
+    function body as ``--`` comment lines to preserve diagnostic information
+    about why the chunk could not be decoded.
+    """
+
+    hint = (name_hint or "chunk").strip()
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", hint)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    if not sanitized:
+        sanitized = "chunk"
+    if sanitized[0].isdigit():
+        sanitized = f"chunk_{sanitized}"
+    function_name = f"placeholder_{sanitized.lower()}"
+
+    rendered_lines = []
+    for line in comments:
+        if not line:
+            continue
+        stripped = str(line).strip()
+        if stripped:
+            rendered_lines.append(f"  -- {stripped}")
+    if not rendered_lines:
+        rendered_lines.append("  -- undecoded chunk")
+    body = "\n".join(rendered_lines)
+    return f"function {function_name}()\n{body}\nend\n"
+
+
 __all__ = [
     "maybe_base64",
     "maybe_hex",
@@ -141,4 +173,5 @@ __all__ = [
     "text_score",
     "sanitise_key_candidate",
     "unique_preserving",
+    "lua_placeholder_function",
 ]

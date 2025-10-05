@@ -24,6 +24,7 @@ from .passes import Devirtualizer
 from .passes.vm_lift import VMLifter
 from .passes.vm_devirtualize import IRDevirtualizer
 from .utils_pkg import ast as lua_ast
+from .utils_pkg.strings import lua_placeholder_function
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
 
@@ -691,8 +692,14 @@ class LuaDeobfuscator:
             r"chunk_\d+\s*=\s*(?:local\s+)?([\"'])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]+)\1",
         )
         matches = list(chunk_re.finditer(text))
+        simple_match: re.Match[str] | None = None
         if not matches:
-            return None
+            simple_match = re.search(
+                r"local\s+payload\s*=\s*([\"'])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]{32,})\1",
+                text,
+            )
+            if simple_match is None:
+                return None
 
         script_key = self._script_key
         if not script_key:
@@ -712,13 +719,20 @@ class LuaDeobfuscator:
 
         key_bytes = script_key.encode("utf-8", "ignore")
         combined = bytearray()
-        for match in matches:
-            blob = match.group("blob")
+        if matches:
+            for match in matches:
+                blob = match.group("blob")
+                try:
+                    chunk = decode_blob(blob, key_bytes=key_bytes)
+                except Exception:
+                    return None
+                combined.extend(chunk)
+        elif simple_match:
+            blob = simple_match.group("blob")
             try:
-                chunk = decode_blob(blob, key_bytes=key_bytes)
+                combined.extend(decode_blob(blob, key_bytes=key_bytes))
             except Exception:
                 return None
-            combined.extend(chunk)
 
         if not combined:
             return None
@@ -1261,11 +1275,18 @@ class LuaDeobfuscator:
             rename_counts.append(rename_count)
             emitted = renamed_chunk or chunk_source or ""
             if not emitted.strip():
-                placeholder = (
+                placeholder_comment = (
                     f"--[[ undecoded initv4 chunk {index + 1} ({decoded_length} bytes) ]]"
                 )
-                chunk_detail["placeholder"] = placeholder
-                chunk_sources.append(placeholder)
+                chunk_detail["placeholder"] = placeholder_comment
+                placeholder_function = lua_placeholder_function(
+                    f"chunk_{index + 1}",
+                    [
+                        f"undecoded initv4 chunk {index + 1}",
+                        f"decoded bytes: {decoded_length}",
+                    ],
+                )
+                chunk_sources.append(f"{placeholder_comment}\n{placeholder_function}")
             else:
                 chunk_sources.append(emitted)
 
