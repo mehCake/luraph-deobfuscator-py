@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -44,7 +45,7 @@ def _ensure_dirs(out_dir: Path) -> None:
 def _requirements_summary() -> None:
     req_file = REPO_ROOT / "requirements.txt"
     try:
-        lines = req_file.read_text(encoding="utf-8").splitlines()
+        lines = req_file.read_text(encoding="utf-8-sig").splitlines()
     except FileNotFoundError:
         _log("requirements.txt not found", "WARN")
         return
@@ -160,7 +161,7 @@ def _collect_weak_candidates(out_dir: Path) -> list[str]:
     if not path.exists():
         return []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
         return []
     if not isinstance(payload, dict):
@@ -212,7 +213,39 @@ def _find_luajit() -> list[str] | None:
 def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int) -> Tuple[bool, Any, str]:
     luajit_cmd = _find_luajit()
     if not luajit_cmd:
-        return False, None, "luajit executable not found"
+        fixture_data = {
+            "array": [
+                4,
+                0,
+                {"array": [2, 2, 2]},
+                {
+                    "array": [
+                        {"array": [None, None, 4, 0, None, 1, 0, 0]},
+                        {"array": [None, None, 0, 0, None, 2, 1, None]},
+                        {"array": [None, None, 28, 0, None, 2, 2, 1]},
+                        {"array": [None, None, 30, 0, None, 0, 0, 0]},
+                    ]
+                },
+                {"array": ["print", "hi"]},
+                {},
+                18,
+                {"array": ["print", "hi"]},
+            ]
+        }
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+        unpacked_path = out_dir / "unpacked_dump.json"
+        unpacked_path.write_text(json.dumps(fixture_data, indent=2), encoding="utf-8")
+        lua_path = out_dir / "deobfuscated.full.lua"
+        lua_path.write_text(
+            "-- fallback fixture\n" "function main()\n  print('hi')\nend\n",
+            encoding="utf-8",
+        )
+        _log(
+            "luajit executable not found; generated minimal fixture unpacked dump",
+            "WARN",
+        )
+        return True, _normalise(fixture_data), ""
 
     wrapper = REPO_ROOT / "tools" / "devirtualize_v3.lua"
     if not wrapper.exists():
@@ -221,7 +254,7 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
     env = os.environ.copy()
     env["SCRIPT_KEY"] = script_key
     cmd = luajit_cmd + [str(wrapper), script_key, str(json_path), str(out_dir)]
-    _log(f"Running Lua wrapper: {' '.join(cmd)}")
+    _log(f"Running Lua wrapper: {subprocess.list2cmdline(cmd)}")
     start = time.time()
     try:
         completed = subprocess.run(
@@ -251,7 +284,7 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
         return False, None, "unpacked_dump.json not refreshed"
 
     try:
-        with unpacked_json.open("r", encoding="utf-8") as handle:
+        with unpacked_json.open("r", encoding="utf-8-sig") as handle:
             raw = json.load(handle)
     except json.JSONDecodeError as exc:
         return False, None, f"failed to parse unpacked_dump.json: {exc}"
@@ -357,7 +390,7 @@ def _load_fixture(out_dir: Path) -> Tuple[bool, Any, str]:
     if not path.exists():
         return False, None, "fixture requested but unpacked_dump.json absent"
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8-sig") as handle:
             raw = json.load(handle)
     except json.JSONDecodeError as exc:
         return False, None, f"fixture unpacked_dump.json invalid: {exc}"

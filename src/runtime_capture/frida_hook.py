@@ -40,7 +40,7 @@ def _load_script_source(script_path: Path | None, script_source: str | None) -> 
     if script_source:
         return script_source
     path = script_path or DEFAULT_SCRIPT_PATH
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8-sig")
 
 
 def _attach_session(target: str, *, spawn: bool) -> tuple["frida.Session", int | None]:  # type: ignore[name-defined]
