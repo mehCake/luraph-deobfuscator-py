@@ -120,7 +120,7 @@ For helper coverage, runtime capture internals, and Windows-specific notes see
 
 ## Local Lua environment
 
-We vendor a Python↔Lua bridge so you (and CI/Codex) can run Lua from the repo:
+We vendor a Python↔Lua bridge so you (and CI) can run Lua from the repo:
 
 - Python deps: `pip install -r requirements.txt`
 - Linux/macOS Lua setup: `bash scripts/setup_lua.sh`
