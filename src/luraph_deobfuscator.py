@@ -15,6 +15,8 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 
+from src.utils_pkg.strings import lua_placeholder_function
+
 logger = logging.getLogger("Deobfuscator")
 logger.setLevel(logging.DEBUG)
 
@@ -166,7 +168,15 @@ class Deobfuscator:
                 if b"function" in decoded[:4096]:
                     return decoded.decode("latin1", errors="ignore")
                 self.json_report.setdefault("raw_decoded_blobs", []).append({"path": cand.get("path"), "len": len(decoded)})
-                return f"-- UNPARSED BYTES (len={len(decoded)}) --\n"
+                placeholder = lua_placeholder_function(
+                    cand.get("path"),
+                    [
+                        f"unparsed bytes len={len(decoded)}",
+                        f"path={cand.get('path')}",
+                    ],
+                )
+                self.json_report.setdefault("warnings", []).append("placeholder_chunk_emitted")
+                return f"-- UNPARSED BYTES (len={len(decoded)}) --\n{placeholder}"
 
             ir = lift_entry(decoded, self.bootstrapper_metadata)
             lua_text = devirtualize_entry(ir, self.bootstrapper_metadata)
@@ -174,7 +184,15 @@ class Deobfuscator:
         except Exception as exc:
             logger.exception("Lifting/devirtualization failed: %s", exc)
             self.json_report["errors"].append(f"lifter_error_{str(exc)}")
-            return f"-- LIFTER FAILED: {exc} --\n-- raw decoded len={len(decoded)} --\n"
+            placeholder = lua_placeholder_function(
+                cand.get("path"),
+                [
+                    f"lifter failed: {exc}",
+                    f"raw decoded len={len(decoded)}",
+                ],
+            )
+            self.json_report.setdefault("warnings", []).append("placeholder_chunk_emitted")
+            return f"-- LIFTER FAILED: {exc} --\n{placeholder}"
 
     def run(self) -> Dict[str, Any]:
         self.json_report["start_time"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"

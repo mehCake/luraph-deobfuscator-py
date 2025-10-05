@@ -9,6 +9,7 @@ __all__ = [
     "VMRebuildResult",
     "rebuild_vm_bytecode",
     "looks_like_vm_bytecode",
+    "canonicalise_opcode_name",
 ]
 
 
@@ -31,6 +32,23 @@ class VMRebuildResult:
     bytecode: bytes
     instructions: List[Dict[str, Any]]
     constants: List[Any]
+
+
+_CANONICAL_OPCODE_ALIASES: Mapping[str, str] = {
+    "LOADB": "LOADBOOL",
+    "PUSHK": "LOADK",
+}
+
+
+def canonicalise_opcode_name(name: Optional[str]) -> Optional[str]:
+    """Normalise bootstrap mnemonics to canonical Lua 5.1 names."""
+
+    if not name:
+        return None
+    upper = str(name).strip().upper()
+    if not upper:
+        return None
+    return _CANONICAL_OPCODE_ALIASES.get(upper, upper)
 
 
 def looks_like_vm_bytecode(blob: Sequence[int] | bytes) -> bool:
@@ -213,7 +231,10 @@ def _normalise_instruction(raw: Any, opcode_map: Optional[Mapping[int, str]]) ->
     }
 
     if opcode_map and info["opcode"] in opcode_map:
-        info["mnemonic"] = opcode_map[info["opcode"]]
+        canonical = canonicalise_opcode_name(opcode_map[info["opcode"]])
+        info["mnemonic"] = canonical
+        if canonical:
+            info["op"] = canonical
 
     return info
 

@@ -266,6 +266,11 @@ def _summarise_bootstrap_metadata(
     if isinstance(direct_sample, Mapping) and direct_sample:
         for key, value in direct_sample.items():
             sample_items.append({str(key): str(value)})
+    elif isinstance(direct_sample, list) and direct_sample:
+        for entry in direct_sample:
+            if isinstance(entry, Mapping) and entry:
+                for key, value in entry.items():
+                    sample_items.append({str(key): str(value)})
     elif opcode_map_source:
         try:
             items = sorted(
@@ -384,9 +389,16 @@ def _summarise_bootstrap_metadata(
         }
 
     if include_raw:
-        raw_matches = meta.get("raw_matches")
-        if isinstance(raw_matches, Mapping):
-            summary["raw_matches"] = raw_matches
+        raw_matches: Dict[str, Any] = {}
+        existing_raw = meta.get("raw_matches")
+        if isinstance(existing_raw, Mapping):
+            raw_matches.update(existing_raw)
+        fallback_raw = fallback.get("raw_matches") if isinstance(fallback, Mapping) else None
+        if isinstance(fallback_raw, Mapping):
+            raw_matches.update({k: v for k, v in fallback_raw.items() if k not in raw_matches})
+        raw_matches.setdefault("blobs", [])
+        raw_matches.setdefault("decoder_functions", [])
+        summary["raw_matches"] = raw_matches
 
     fallback_attempted = bool(
         meta.get("fallback_attempted") or fallback.get("fallback_attempted")
@@ -450,6 +462,8 @@ def _build_json_payload(
         bootstrap_summary = _summarise_bootstrap_metadata(
             combined_meta, include_raw=include_raw, fallback=handler_meta
         )
+    elif include_raw:
+        bootstrap_summary = {"raw_matches": {"blobs": [], "decoder_functions": []}}
     if getattr(ctx, "result", None):
         payload.update(ctx.result)
     existing = payload.get("bootstrapper_metadata")
@@ -495,8 +509,64 @@ def _build_json_payload(
                     "decoded_blob_path": str(decoded_path),
                     "metadata_path": str(metadata_path),
                 }
+                decoded_path_obj = decoded_path
+                metadata_path_obj = metadata_path
+                trace_path_obj = Path("out") / "logs" / f"bootstrap_decode_trace_{sanitized}.log"
+
+                def _resolve(candidate: object) -> Optional[Path]:
+                    if isinstance(candidate, (str, Path)):
+                        path_obj = Path(candidate)
+                        return path_obj
+                    return None
+
+                existing_sources: list[Path] = []
+                handler_bootstrap_meta = handler_meta if isinstance(handler_meta, Mapping) else {}
+                sources = handler_bootstrap_meta.get("bootstrapper_decoded_blobs")
+                if isinstance(sources, list):
+                    for entry in sources:
+                        path_obj = _resolve(entry)
+                        if path_obj is None:
+                            continue
+                        existing_sources.append(path_obj)
+
+                decoded_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                if not decoded_path_obj.exists():
+                    written = False
+                    for source_path in existing_sources:
+                        candidate = source_path
+                        if not candidate.is_absolute():
+                            candidate = Path(candidate)
+                        if candidate.exists():
+                            try:
+                                decoded_path_obj.write_bytes(candidate.read_bytes())
+                            except OSError:
+                                continue
+                            else:
+                                written = True
+                                break
+                    if not written:
+                        try:
+                            decoded_path_obj.write_bytes(b"")
+                        except OSError:
+                            pass
+
+                metadata_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                if not metadata_path_obj.exists():
+                    payload_to_write: Mapping[str, Any]
+                    if combined_meta:
+                        payload_to_write = combined_meta
+                    elif isinstance(meta, Mapping):
+                        payload_to_write = meta
+                    else:
+                        payload_to_write = bootstrap_summary
+                    try:
+                        with open(metadata_path_obj, "w", encoding="utf-8") as fh:
+                            json.dump(payload_to_write, fh, indent=2, ensure_ascii=False)
+                    except OSError:
+                        pass
+
                 try:
-                    with open(metadata_path, "r", encoding="utf-8") as fh:
+                    with open(metadata_path_obj, "r", encoding="utf-8") as fh:
                         metadata_payload = json.load(fh)
                 except Exception:
                     metadata_payload = {}
@@ -511,10 +581,13 @@ def _build_json_payload(
                 if trace_log_path:
                     artifact_paths["trace_log_path"] = str(trace_log_path)
                 else:
-                    artifact_paths.setdefault(
-                        "trace_log_path",
-                        str(Path("out") / "logs" / f"bootstrap_decode_trace_{sanitized}.log"),
-                    )
+                    artifact_paths.setdefault("trace_log_path", str(trace_path_obj))
+                    trace_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                    if not trace_path_obj.exists():
+                        try:
+                            trace_path_obj.write_text("", encoding="utf-8")
+                        except OSError:
+                            pass
                 bootstrap_summary["artifact_paths"] = artifact_paths
         if not bootstrap_summary.get("extraction_log"):
             artifacts_map = bootstrap_summary.get("artifact_paths") or {}
