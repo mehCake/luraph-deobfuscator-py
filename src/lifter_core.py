@@ -20,12 +20,14 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, MutableMapping
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
 # Opcodes for vanilla Lua 5.1 – used as suggestions when generating the
 # candidate list.  The final verified opcode map is produced by
 # ``opcode_verifier`` once it has executed its checks.
 from src.versions.luraph_v14_4_1 import _BASE_OPCODE_TABLE
+from src.utils.luraph_vm import canonicalise_opcode_name
+from src.vm.lifter_core import lift_program
 
 
 @dataclass
@@ -279,11 +281,46 @@ def run_lifter(unpacked_path: str | os.PathLike[str], out_dir: str | os.PathLike
             "sample_pcs": info.get("sample_pcs", [])[:5],
         }
 
-    # Serialise IR to Lua + JSON for downstream tooling.
-    lua_ir = "return " + _to_lua_literal([item.as_dict() for item in ir])
-    (out_path / "lift_ir.lua").write_text(lua_ir, encoding="utf-8")
+    ir_dicts = [item.as_dict() for item in ir]
+
+    opcode_lookup: Dict[int, str] = {}
+    verified_map_path = out_path / "opcode_map.v14_4_1.verified.json"
+    if verified_map_path.exists():
+        try:
+            with verified_map_path.open("r", encoding="utf-8") as handle:
+                verified_payload = json.load(handle)
+        except Exception:
+            verified_payload = {}
+        if isinstance(verified_payload, MutableMapping):
+            for key, value in verified_payload.items():
+                try:
+                    opnum = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, MutableMapping):
+                    mnemonic = value.get("mnemonic") or value.get("name")
+                else:
+                    mnemonic = value
+                canon = canonicalise_opcode_name(mnemonic)
+                if canon:
+                    opcode_lookup[opnum] = canon
+
+    for index, entry in enumerate(ir_dicts):
+        entry.setdefault("index", index)
+        if "opcode" not in entry and isinstance(entry.get("opnum"), int):
+            entry["opcode"] = entry["opnum"]
+        opnum = entry.get("opnum")
+        mnemonic: Optional[str] = None
+        if isinstance(opnum, int):
+            mnemonic = opcode_lookup.get(opnum)
+        if mnemonic:
+            entry["mnemonic"] = mnemonic
+
+    lift_result = lift_program(ir_dicts, consts, opcode_lookup)
+
+    (out_path / "lift_ir.lua").write_text(lift_result.lua_source, encoding="utf-8")
     (out_path / "lift_ir.json").write_text(
-        json.dumps([item.as_dict() for item in ir], indent=2),
+        json.dumps(lift_result.ir_entries, indent=2),
         encoding="utf-8",
     )
 

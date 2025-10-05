@@ -27,8 +27,17 @@ def run_verification(unpacked_json_path: str | Path, out_dir: str | Path) -> Dic
             }
 
     from .emulator import run_verification as emulator_verification
+    result = emulator_verification(ir_path, unpacked_json_path, candidates_path, out_path)
 
-    return emulator_verification(ir_path, unpacked_json_path, candidates_path, out_path)
+    if isinstance(result, dict) and result.get("status") == "ok":
+        try:
+            from .lifter_core import run_lifter
+
+            run_lifter(unpacked_json_path, out_path)
+        except Exception:  # pragma: no cover - lifter rerun best-effort
+            pass
+
+    return result
 
 
 __all__ = ["run_verification"]

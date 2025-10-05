@@ -127,6 +127,7 @@ def rebuild_vm_bytecode(
             continue
         encoded.extend(_encode_instruction(normalised))
         normalised.setdefault("pc", index * 4)
+        normalised.setdefault("index", index)
         rows.append(normalised)
         mini = _minimal_instruction(normalised)
         if mini is not None:
@@ -272,6 +273,11 @@ def _normalise_instruction(raw: Any, opcode_map: Optional[Mapping[int, str]]) ->
         "C": c_val & 0x1FF,
     }
 
+    if bx_val is not None:
+        info["Bx"] = bx_val & 0x3FFFF
+    if sbx_val is not None:
+        info["sBx"] = int(sbx_val)
+
     mnemonic: Optional[str] = None
     if opcode_map and opcode_num in opcode_map:
         mnemonic = canonicalise_opcode_name(opcode_map[opcode_num])
@@ -281,6 +287,7 @@ def _normalise_instruction(raw: Any, opcode_map: Optional[Mapping[int, str]]) ->
 
     info["mnemonic"] = mnemonic
     info["op"] = mnemonic
+    info["raw"] = raw
 
     return info
 
