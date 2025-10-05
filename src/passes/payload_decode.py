@@ -2481,6 +2481,26 @@ def run(ctx: "Context") -> Dict[str, Any]:
         script_key_missing_forced=bool(getattr(ctx, "script_key_missing_forced", False)),
     )
 
+    forced_missing = bool(getattr(ctx, "script_key_missing_forced", False))
+    if forced_missing and not (isinstance(script_key_value, str) and script_key_value.strip()):
+        warning_text = "script key missing (forced)"
+        warnings_bucket = metadata.setdefault("warnings", [])
+        if not any(
+            isinstance(entry, str) and "script key" in entry.lower() for entry in warnings_bucket
+        ):
+            warnings_bucket.append(warning_text)
+
+        payload_meta = metadata.get("handler_payload_meta")
+        if isinstance(payload_meta, dict):
+            payload_meta.setdefault("script_key_missing_forced", True)
+            payload_meta.setdefault("script_key_provider", "missing_forced")
+
+        report_obj = getattr(ctx, "report", None)
+        if report_obj is not None and not any(
+            "script key" in str(entry).lower() for entry in getattr(report_obj, "warnings", [])
+        ):
+            report_obj.warnings.append(warning_text)
+
     placeholder_blob = _ensure_bootstrap_blob_placeholder(
         getattr(ctx, "bootstrapper_path", None)
     )
