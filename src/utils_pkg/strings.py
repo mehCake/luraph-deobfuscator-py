@@ -132,13 +132,23 @@ def unique_preserving(items: Iterable[bytes]) -> list[bytes]:
     return ordered
 
 
+def normalise_lua_newlines(text: str) -> str:
+    """Return *text* with Windows-friendly ``CRLF`` line endings."""
+
+    if not text:
+        return ""
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalised.replace("\n", "\r\n")
+
+
 def lua_placeholder_function(name_hint: Optional[str], comments: Iterable[str]) -> str:
     """Return a Lua function stub describing a placeholder chunk.
 
     ``name_hint`` is converted into a safe identifier so the generated function
     can be loaded without syntax errors.  ``comments`` is rendered into the
     function body as ``--`` comment lines to preserve diagnostic information
-    about why the chunk could not be decoded.
+    about why the chunk could not be decoded.  Output always uses Windows style
+    line endings so fixtures behave consistently on all platforms.
     """
 
     hint = (name_hint or "chunk").strip()
@@ -158,9 +168,12 @@ def lua_placeholder_function(name_hint: Optional[str], comments: Iterable[str]) 
         if stripped:
             rendered_lines.append(f"  -- {stripped}")
     if not rendered_lines:
-        rendered_lines.append("  -- undecoded chunk")
-    body = "\n".join(rendered_lines)
-    return f"function {function_name}()\n{body}\nend\n"
+        rendered_lines.append("  -- undecoded content (size: 0 bytes)")
+
+    lines = [f"function {function_name}()"]
+    lines.extend(rendered_lines)
+    lines.append("end")
+    return normalise_lua_newlines("\n".join(lines) + "\n")
 
 
 __all__ = [
@@ -174,4 +187,5 @@ __all__ = [
     "sanitise_key_candidate",
     "unique_preserving",
     "lua_placeholder_function",
+    "normalise_lua_newlines",
 ]

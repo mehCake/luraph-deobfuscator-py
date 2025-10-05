@@ -15,7 +15,7 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 
-from src.utils_pkg.strings import lua_placeholder_function
+from src.utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
 
 logger = logging.getLogger("Deobfuscator")
 logger.setLevel(logging.DEBUG)
@@ -166,33 +166,40 @@ class Deobfuscator:
         try:
             if lift_entry is None or devirtualize_entry is None:
                 if b"function" in decoded[:4096]:
-                    return decoded.decode("latin1", errors="ignore")
+                    return normalise_lua_newlines(
+                        decoded.decode("latin1", errors="ignore")
+                    )
                 self.json_report.setdefault("raw_decoded_blobs", []).append({"path": cand.get("path"), "len": len(decoded)})
                 placeholder = lua_placeholder_function(
                     cand.get("path"),
                     [
-                        f"unparsed bytes len={len(decoded)}",
+                        f"undecoded content (size: {len(decoded)} bytes)",
                         f"path={cand.get('path')}",
                     ],
                 )
                 self.json_report.setdefault("warnings", []).append("placeholder_chunk_emitted")
-                return f"-- UNPARSED BYTES (len={len(decoded)}) --\n{placeholder}"
+                return normalise_lua_newlines(
+                    f"-- UNPARSED BYTES (len={len(decoded)}) --\n{placeholder}"
+                )
 
             ir = lift_entry(decoded, self.bootstrapper_metadata)
             lua_text = devirtualize_entry(ir, self.bootstrapper_metadata)
-            return lua_text
+            return normalise_lua_newlines(lua_text)
         except Exception as exc:
             logger.exception("Lifting/devirtualization failed: %s", exc)
             self.json_report["errors"].append(f"lifter_error_{str(exc)}")
             placeholder = lua_placeholder_function(
                 cand.get("path"),
                 [
+                    f"undecoded content (size: {len(decoded)} bytes)",
                     f"lifter failed: {exc}",
                     f"raw decoded len={len(decoded)}",
                 ],
             )
             self.json_report.setdefault("warnings", []).append("placeholder_chunk_emitted")
-            return f"-- LIFTER FAILED: {exc} --\n{placeholder}"
+            return normalise_lua_newlines(
+                f"-- LIFTER FAILED: {exc} --\n{placeholder}"
+            )
 
     def run(self) -> Dict[str, Any]:
         self.json_report["start_time"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"

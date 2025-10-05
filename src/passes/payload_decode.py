@@ -20,7 +20,7 @@ from ..versions.luraph_v14_4_initv4 import (
     decode_blob as initv4_decode_blob,
 )
 from ..utils.luraph_vm import canonicalise_opcode_name
-from ..utils_pkg.strings import lua_placeholder_function
+from ..utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
 from lph_handler import extract_vm_ir
 from opcode_lifter import OpcodeLifter
 
@@ -285,17 +285,29 @@ def _persist_decoded_outputs(
     *,
     chunk_index: int,
 ) -> Optional[Dict[str, str]]:
-    if decoded_text is None:
-        decoded_text = ""
-    sanitized = utils.strip_non_printable(decoded_text)
+    raw_text = decoded_text or ""
+    byte_length = len(raw_text.encode("utf-8", errors="ignore"))
+    sanitized = utils.strip_non_printable(raw_text)
+    if sanitized:
+        sanitized = normalise_lua_newlines(sanitized)
     if not sanitized.strip():
         sanitized = lua_placeholder_function(
             f"chunk_{chunk_index + 1}",
             [
+                f"undecoded content (size: {byte_length} bytes)",
                 "no decoded Lua emitted by initv4 fallback",
                 f"chunk index: {chunk_index}",
             ],
         )
+    elif "function" not in sanitized:
+        placeholder = lua_placeholder_function(
+            f"chunk_{chunk_index + 1}",
+            [f"undecoded content (size: {byte_length} bytes)"],
+        )
+        sanitized_body = sanitized.rstrip("\r\n")
+        joiner = "\r\n\r\n" if sanitized_body else ""
+        sanitized = f"{sanitized_body}{joiner}{placeholder}"
+    sanitized = normalise_lua_newlines(sanitized)
 
     out_dir = Path("out")
     try:
@@ -520,9 +532,28 @@ def _persist_chunk_outputs(ctx: "Context", text: str) -> List[str]:
     if not prefix:
         return []
 
-    sanitized = utils.strip_non_printable(text or "")
+    raw_text = text or ""
+    sanitized = utils.strip_non_printable(raw_text)
+    if sanitized:
+        sanitized = normalise_lua_newlines(sanitized)
+    byte_length = len(raw_text.encode("utf-8", errors="ignore"))
     if not sanitized.strip():
-        sanitized = lua_placeholder_function(prefix, ["empty pipeline output"])
+        sanitized = lua_placeholder_function(
+            prefix,
+            [
+                f"undecoded content (size: {byte_length} bytes)",
+                "empty pipeline output",
+            ],
+        )
+    elif "function" not in sanitized:
+        placeholder = lua_placeholder_function(
+            prefix,
+            [f"undecoded content (size: {byte_length} bytes)"],
+        )
+        sanitized_body = sanitized.rstrip("\r\n")
+        joiner = "\r\n\r\n" if sanitized_body else ""
+        sanitized = f"{sanitized_body}{joiner}{placeholder}"
+    sanitized = normalise_lua_newlines(sanitized)
 
     chunk_lines_value: Optional[int] = None
     options = getattr(ctx, "options", None)
@@ -542,6 +573,7 @@ def _persist_chunk_outputs(ctx: "Context", text: str) -> List[str]:
         chunks: List[str] = []
         for index in range(0, len(lines), chunk_lines_value):
             chunk = "\n".join(lines[index : index + chunk_lines_value])
+            chunk = normalise_lua_newlines(chunk)
             chunks.append(chunk)
         if not chunks:
             chunks = [sanitized]

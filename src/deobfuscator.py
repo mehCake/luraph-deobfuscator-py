@@ -24,7 +24,7 @@ from .passes import Devirtualizer
 from .passes.vm_lift import VMLifter
 from .passes.vm_devirtualize import IRDevirtualizer
 from .utils_pkg import ast as lua_ast
-from .utils_pkg.strings import lua_placeholder_function
+from .utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
 
@@ -1275,20 +1275,17 @@ class LuaDeobfuscator:
             rename_counts.append(rename_count)
             emitted = renamed_chunk or chunk_source or ""
             if not emitted.strip():
-                placeholder_comment = (
-                    f"--[[ undecoded initv4 chunk {index + 1} ({decoded_length} bytes) ]]"
+                placeholder_detail = (
+                    f"undecoded content (size: {decoded_length} bytes)"
                 )
-                chunk_detail["placeholder"] = placeholder_comment
+                chunk_detail["placeholder"] = placeholder_detail
                 placeholder_function = lua_placeholder_function(
                     f"chunk_{index + 1}",
-                    [
-                        f"undecoded initv4 chunk {index + 1}",
-                        f"decoded bytes: {decoded_length}",
-                    ],
+                    [placeholder_detail],
                 )
-                chunk_sources.append(f"{placeholder_comment}\n{placeholder_function}")
+                chunk_sources.append(placeholder_function.strip("\r\n"))
             else:
-                chunk_sources.append(emitted)
+                chunk_sources.append(normalise_lua_newlines(emitted).strip("\r\n"))
 
         meta: Dict[str, Any] = {}
         if discovered_chunks:
@@ -1333,23 +1330,30 @@ class LuaDeobfuscator:
         if combined_script:
             merged_source = combined_script
         else:
-            actual_sources = [
-                text.strip()
-                for text, detail in zip(chunk_sources, chunk_details)
-                if text.strip() and not detail.get("placeholder")
-            ]
+            actual_sources = []
+            for text, detail in zip(chunk_sources, chunk_details):
+                cleaned_text = text.strip("\r\n")
+                if cleaned_text and not detail.get("placeholder"):
+                    actual_sources.append(cleaned_text)
             if actual_sources:
                 merged_source = "\n\n".join(actual_sources)
             else:
-                placeholder_texts = [text.strip() for text in chunk_sources if text.strip()]
+                placeholder_texts = []
+                for text in chunk_sources:
+                    cleaned_text = text.strip("\r\n")
+                    if cleaned_text:
+                        placeholder_texts.append(cleaned_text)
                 if placeholder_texts:
                     placeholder_only = True
                     merged_source = "\n\n".join(placeholder_texts)
 
         analysis: Dict[str, Any] = {}
         if chunk_sources:
-            analysis["sources"] = chunk_sources
+            analysis["sources"] = [
+                normalise_lua_newlines(text) for text in chunk_sources
+            ]
         if merged_source:
+            merged_source = normalise_lua_newlines(merged_source)
             analysis["final_source"] = merged_source
         if placeholder_only:
             analysis["placeholders_only"] = True
