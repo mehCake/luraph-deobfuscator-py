@@ -695,6 +695,13 @@ def _iterative_initv4_decode(
 
     opcode_lifter: Optional[OpcodeLifter] = None
 
+    iteration_count = 0
+    iteration_versions: List[str] = []
+    iteration_changes: List[bool] = []
+    detected_version = getattr(getattr(ctx, "detected_version", None), "name", None)
+    if not isinstance(detected_version, str) or not detected_version:
+        detected_version = "luraph_v14_4_initv4"
+
     initial_artifacts = _persist_decoder_metadata(decoder, chunk_index=0)
     if initial_artifacts.get("alphabet"):
         aggregate_meta.setdefault("alphabet_paths", []).append(
@@ -933,11 +940,23 @@ def _iterative_initv4_decode(
             current_text = current_text.replace(blob, replacement, 1)
             progress = True
 
-        if not progress:
+        if progress:
+            iteration_count += 1
+            iteration_versions.append(detected_version)
+            iteration_changes.append(True)
+        else:
             break
 
     if warnings:
         aggregate_meta["warnings"] = warnings
+
+    if iteration_count:
+        aggregate_meta["payload_iterations"] = iteration_count
+        aggregate_meta["payload_iteration_versions"] = list(iteration_versions)
+        if iteration_changes:
+            aggregate_meta["payload_iteration_changes"] = list(iteration_changes)
+        else:
+            aggregate_meta["payload_iteration_changes"] = [True] * iteration_count
 
     return decoded_chunks, current_text, aggregate_meta
 
@@ -1234,6 +1253,27 @@ def _merge_payload_meta(target: Dict[str, Any], meta: Any) -> None:
         return
 
     for key, value in meta.items():
+        if key == "payload_iterations" and isinstance(value, int):
+            existing = target.get("payload_iterations")
+            if isinstance(existing, int):
+                target["payload_iterations"] = max(existing, value)
+            else:
+                target["payload_iterations"] = value
+            continue
+        if key == "payload_iteration_versions" and isinstance(value, list):
+            existing_versions = target.setdefault("payload_iteration_versions", [])
+            for item in value:
+                if item:
+                    existing_versions.append(str(item))
+            continue
+        if key == "payload_iteration_changes" and isinstance(value, list):
+            existing_changes = target.setdefault("payload_iteration_changes", [])
+            for item in value:
+                if isinstance(item, bool):
+                    existing_changes.append(item)
+                elif isinstance(item, int):
+                    existing_changes.append(bool(item))
+            continue
         if key in {"chunk_count", "chunk_success_count"} and isinstance(value, int):
             target[key] = target.get(key, 0) + max(value, 0)
             continue
