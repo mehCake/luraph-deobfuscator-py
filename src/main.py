@@ -30,6 +30,7 @@ _SCRIPT_KEY_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"getgenv\(\)\.script_key\s*=\s*['\"]([^'\"]+)['\"]"),
     re.compile(r"script_key\s*=\s*['\"]([^'\"]+)['\"]"),
 )
+_SCRIPT_KEY_REQUIRED_RE = re.compile(r"script_key\s*=\s*script_key\s*or", re.IGNORECASE)
 
 
 def _detect_script_key(text: Optional[str]) -> Optional[str]:
@@ -69,6 +70,19 @@ def _detect_script_key(text: Optional[str]) -> Optional[str]:
         return None
 
     return _extract(payload)
+
+
+def _requires_script_key(text: Optional[str]) -> bool:
+    """Return ``True`` when *text* likely needs a script key to decode."""
+
+    if not text:
+        return False
+    if _SCRIPT_KEY_REQUIRED_RE.search(text):
+        return True
+    lowered = text.lower()
+    if "initv4" in lowered and "payload =" in lowered:
+        return True
+    return False
 
 
 class _ColourFormatter(logging.Formatter):
@@ -540,16 +554,36 @@ def _summarise_bootstrap_metadata(
         }
 
     if include_raw:
-        raw_matches: Dict[str, Any] = {}
-        existing_raw = meta.get("raw_matches")
-        if isinstance(existing_raw, Mapping):
-            raw_matches.update(existing_raw)
+        raw_matches_section = meta.get("raw_matches")
+        container: Dict[str, Any]
+        if isinstance(raw_matches_section, Mapping):
+            container = dict(raw_matches_section)
+        else:
+            container = {}
         fallback_raw = fallback.get("raw_matches") if isinstance(fallback, Mapping) else None
         if isinstance(fallback_raw, Mapping):
-            raw_matches.update({k: v for k, v in fallback_raw.items() if k not in raw_matches})
-        raw_matches.setdefault("blobs", [])
-        raw_matches.setdefault("decoder_functions", [])
-        summary["raw_matches"] = raw_matches
+            for key, value in fallback_raw.items():
+                container.setdefault(key, value)
+
+        def _ensure_bucket(bucket: Mapping[str, Any] | None) -> Dict[str, Any]:
+            data = dict(bucket) if isinstance(bucket, Mapping) else {}
+            data.setdefault("blobs", [])
+            data.setdefault("decoder_functions", [])
+            return data
+
+        if "bootstrap_decoder" in container:
+            bucket = _ensure_bucket(container.get("bootstrap_decoder"))
+            container["bootstrap_decoder"] = bucket
+            summary["raw_matches"] = container
+        else:
+            bucket = _ensure_bucket(container or None)
+            summary["raw_matches"] = {"bootstrap_decoder": bucket}
+        bootstrap_decoder = summary["raw_matches"].get("bootstrap_decoder")
+        if isinstance(bootstrap_decoder, dict):
+            if not bootstrap_decoder.get("blobs"):
+                bootstrap_decoder["blobs"] = ["<no blobs captured>"]
+            if not bootstrap_decoder.get("decoder_functions"):
+                bootstrap_decoder["decoder_functions"] = ["<no decoder functions>"]
 
     fallback_attempted = bool(
         meta.get("fallback_attempted") or fallback.get("fallback_attempted")
@@ -614,7 +648,9 @@ def _build_json_payload(
             combined_meta, include_raw=include_raw, fallback=handler_meta
         )
     elif include_raw:
-        bootstrap_summary = {"raw_matches": {"blobs": [], "decoder_functions": []}}
+        bootstrap_summary = {
+            "raw_matches": {"bootstrap_decoder": {"blobs": [], "decoder_functions": []}}
+        }
     if getattr(ctx, "result", None):
         payload.update(ctx.result)
     existing = payload.get("bootstrapper_metadata")
@@ -625,6 +661,21 @@ def _build_json_payload(
             combined_existing, include_raw=include_raw, fallback=handler_meta
         )
     if bootstrap_summary:
+        manual_alphabet_value = ctx.options.get("manual_alphabet")
+        manual_opcode_map_option = ctx.options.get("manual_opcode_map")
+        if manual_alphabet_value or manual_opcode_map_option:
+            manual_info = bootstrap_summary.setdefault("manual_override", {})
+            if manual_alphabet_value:
+                manual_info["alphabet"] = True
+                bootstrap_summary["alphabet_len"] = len(manual_alphabet_value)
+                preview = manual_alphabet_value[:32]
+                if len(manual_alphabet_value) > 32:
+                    preview += "..."
+                bootstrap_summary.setdefault("alphabet_preview", preview)
+            if manual_opcode_map_option:
+                manual_info["opcode_map"] = True
+                bootstrap_summary["opcode_map_count"] = len(manual_opcode_map_option)
+            bootstrap_summary["extraction_method"] = "manual_override"
         if isinstance(meta, Mapping):
             artifacts = meta.get("artifact_paths")
             if isinstance(artifacts, Mapping):
@@ -635,7 +686,21 @@ def _build_json_payload(
             if include_raw and "raw_matches" in meta:
                 raw_section = meta.get("raw_matches")
                 if isinstance(raw_section, Mapping):
-                    bootstrap_summary.setdefault("raw_matches", raw_section)
+                    if "bootstrap_decoder" in raw_section:
+                        bootstrap_summary.setdefault("raw_matches", raw_section)
+                    else:
+                        bootstrap_summary.setdefault(
+                            "raw_matches", {"bootstrap_decoder": dict(raw_section)}
+                        )
+        if getattr(ctx, "debug_bootstrap", False):
+            debug_log_path = None
+            if getattr(ctx, "deobfuscator", None):
+                debug_log_path = getattr(ctx.deobfuscator, "_bootstrap_debug_log", None)
+            if debug_log_path:
+                artifact_paths = bootstrap_summary.setdefault("artifact_paths", {})
+                artifact_paths.setdefault("debug_log_path", str(debug_log_path))
+                if not bootstrap_summary.get("extraction_log"):
+                    bootstrap_summary["extraction_log"] = str(debug_log_path)
         if "artifact_paths" not in bootstrap_summary:
             bootstrap_info = {}
             if isinstance(payload_passes, Mapping):
@@ -754,9 +819,14 @@ def _build_json_payload(
                         debug_payload = json.load(fh)
                 except Exception:
                     debug_payload = {}
+                opcode_count = bootstrap_summary.get("opcode_map_count", 0)
+                if not opcode_count:
+                    sample = bootstrap_summary.get("opcode_map_sample")
+                    if isinstance(sample, list):
+                        opcode_count = len(sample)
                 preview = {
                     "alphabet_len": bootstrap_summary.get("alphabet_len", 0),
-                    "opcode_map_count": bootstrap_summary.get("opcode_map_count", 0),
+                    "opcode_map_count": opcode_count,
                     "constants_count": len(bootstrap_summary.get("constants", {})),
                 }
                 debug_payload["metadata_preview"] = preview
@@ -1081,11 +1151,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         script_key_value = args.script_key.strip() if args.script_key else None
         script_key_available = bool(script_key_value)
         inline_script_key = None
+        script_key_source: Optional[str] = None
+        if script_key_value:
+            if args.script_key:
+                script_key_source = "override"
+            elif inline_script_key:
+                script_key_source = "literal"
         if not script_key_available:
             inline_script_key = _detect_script_key(content)
             if inline_script_key:
                 script_key_available = True
                 script_key_value = inline_script_key
+                if script_key_source is None:
+                    script_key_source = "literal"
         deob = LuaDeobfuscator(
             vm_trace=args.vm_trace,
             script_key=script_key_value,
@@ -1143,7 +1221,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         final_ctx: Optional[pipeline.Context] = None
         final_timings: List[tuple[str, float]] = []
         script_key_missing_forced = False
-        if not script_key_available:
+        script_key_required = _requires_script_key(previous)
+        if not script_key_available and script_key_required:
             if args.force:
                 script_key_missing_forced = True
                 warning_text = (
@@ -1205,6 +1284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "artifact_only": args.artifact_only,
                         "chunk_lines": max(1, args.chunk_lines),
                         "render_chunk_lines": max(1, args.chunk_lines),
+                        "script_key_source": script_key_source,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()

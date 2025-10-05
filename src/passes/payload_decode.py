@@ -1531,6 +1531,15 @@ def _populate_payload_summary(
 
     # Script key bookkeeping -------------------------------------------------
     provider = payload_meta.get("script_key_provider")
+    options = getattr(ctx, "options", {}) if ctx else {}
+    provider_hint: Optional[str] = None
+    if isinstance(options, Mapping):
+        hint = options.get("script_key_source")
+        if isinstance(hint, str) and hint:
+            provider_hint = hint
+            if hint == "literal":
+                script_key_override = False
+                metadata["script_key_override"] = False
     literal_key = _detect_literal_script_key(
         getattr(ctx, "original_text", None),
         getattr(ctx, "raw_input", None),
@@ -1541,7 +1550,13 @@ def _populate_payload_summary(
         script_key_value = literal_key
 
     if provider is None:
-        if script_key_override:
+        if provider_hint == "literal":
+            provider = "literal"
+        elif provider_hint == "override":
+            provider = "override"
+        elif provider_hint == "bootstrap":
+            provider = "bootstrap"
+        elif script_key_override:
             provider = "override"
         elif literal_key:
             provider = "literal"
@@ -1569,7 +1584,7 @@ def _populate_payload_summary(
             if getattr(ctx, "manual_alphabet", None):
                 alphabet_source = "manual_override"
             elif getattr(ctx, "bootstrapper_path", None):
-                alphabet_source = "bootstrap"
+                alphabet_source = "bootstrapper"
             else:
                 alphabet_source = "default"
         payload_meta["alphabet_source"] = alphabet_source
@@ -1579,7 +1594,7 @@ def _populate_payload_summary(
         if getattr(ctx, "manual_opcode_map", None):
             opcode_source = "manual_override"
         elif getattr(ctx, "bootstrapper_path", None):
-            opcode_source = "bootstrap"
+            opcode_source = "bootstrapper"
         else:
             opcode_source = "default"
         payload_meta["opcode_source"] = opcode_source

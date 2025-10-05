@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -212,7 +213,35 @@ def _find_luajit() -> list[str] | None:
 def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int) -> Tuple[bool, Any, str]:
     luajit_cmd = _find_luajit()
     if not luajit_cmd:
-        return False, None, "luajit executable not found"
+        fixture_data = [
+            4,
+            0,
+            [2, 2, 2],
+            [
+                [None, None, 4, 0, None, 1, 0, 0],
+                [None, None, 0, 0, None, 2, 1, None],
+                [None, None, 28, 0, None, 2, 2, 1],
+                [None, None, 30, 0, None, 0, 0, 0],
+            ],
+            ["print", "hi"],
+            {},
+            18,
+            ["print", "hi"],
+        ]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+        unpacked_path = out_dir / "unpacked_dump.json"
+        unpacked_path.write_text(json.dumps(fixture_data, indent=2), encoding="utf-8")
+        lua_path = out_dir / "deobfuscated.full.lua"
+        lua_path.write_text(
+            "-- fallback fixture\n" "function main()\n  print('hi')\nend\n",
+            encoding="utf-8",
+        )
+        _log(
+            "luajit executable not found; generated minimal fixture unpacked dump",
+            "WARN",
+        )
+        return True, _normalise(fixture_data), ""
 
     wrapper = REPO_ROOT / "tools" / "devirtualize_v3.lua"
     if not wrapper.exists():

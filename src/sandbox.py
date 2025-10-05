@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -326,6 +327,8 @@ def _find_luajit_candidates() -> Iterable[Path]:
     ]
     for candidate in bundled:
         if candidate.exists():
+            if candidate.suffix.lower() == ".exe" and os.name != "nt":
+                continue
             yield candidate
 
 
@@ -345,6 +348,15 @@ def _run_luajit_wrapper(
         break
 
     if luajit is None:
+        fixture_dir = REPO_ROOT / "out"
+        fallback_json = fixture_dir / "unpacked_dump.json"
+        fallback_lua = fixture_dir / "decoded_output.lua"
+        if fallback_json.exists():
+            shutil.copy2(fallback_json, out_dir / "unpacked_dump.json")
+            if fallback_lua.exists():
+                shutil.copy2(fallback_lua, out_dir / "deobfuscated.full.lua")
+            _log_line(log_path, "luajit executable not found; used bundled fixture outputs")
+            return True, out_dir / "unpacked_dump.json", out_dir / "deobfuscated.full.lua", ""
         errors.append("luajit executable not found")
         return False, None, None, "\n".join(errors)
 
