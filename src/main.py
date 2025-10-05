@@ -571,10 +571,131 @@ def _summarise_bootstrap_metadata(
             for key, value in fallback_raw.items():
                 container.setdefault(key, value)
 
+        def _safe_int(value: object, default: int = 0) -> int:
+            try:
+                return int(value)  # type: ignore[arg-type]
+            except Exception:
+                return default
+
+        def _normalise_blob_entries(entries: object) -> List[Dict[str, Any]]:
+            if not isinstance(entries, list):
+                return []
+            normalised: List[Dict[str, Any]] = []
+            for entry in entries:
+                if isinstance(entry, Mapping):
+                    offset = _safe_int(
+                        entry.get("offset")
+                        or entry.get("start")
+                        or entry.get("index")
+                        or entry.get("position"),
+                        0,
+                    )
+                    length = _safe_int(
+                        entry.get("length")
+                        or entry.get("size")
+                        or entry.get("bytes")
+                        or entry.get("count"),
+                        0,
+                    )
+                    if "path" in entry:
+                        # Preserve a hint about the source path when present.
+                        try:
+                            path_hint = str(entry["path"])
+                        except Exception:
+                            path_hint = ""
+                        if path_hint:
+                            normalised.append(
+                                {
+                                    "offset": offset,
+                                    "length": length,
+                                    "path": path_hint,
+                                }
+                            )
+                            continue
+                    normalised.append({"offset": offset, "length": length})
+                elif isinstance(entry, (tuple, list)) and entry:
+                    offset = _safe_int(entry[0], 0)
+                    length = _safe_int(entry[1] if len(entry) > 1 else 0, 0)
+                    normalised.append({"offset": offset, "length": length})
+                elif isinstance(entry, (bytes, str)):
+                    # Strings/bytes likely reference literal chunks; store their length.
+                    length = len(entry)
+                    normalised.append({"offset": 0, "length": length})
+                elif isinstance(entry, (int, float)):
+                    normalised.append({"offset": 0, "length": int(entry)})
+            return normalised
+
+        def _normalise_decoder_entries(entries: object) -> List[Dict[str, int | str]]:
+            if not isinstance(entries, list):
+                return []
+            normalised: List[Dict[str, int | str]] = []
+            for entry in entries:
+                if isinstance(entry, Mapping):
+                    name_obj = entry.get("name") or entry.get("function") or entry.get("symbol")
+                    try:
+                        name = str(name_obj) if name_obj is not None else "<decoder>"
+                    except Exception:
+                        name = "<decoder>"
+                    line = _safe_int(
+                        entry.get("line")
+                        or entry.get("lineno")
+                        or entry.get("start_line")
+                        or entry.get("line_number"),
+                        0,
+                    )
+                    normalised.append({"name": name, "line": line})
+                elif isinstance(entry, (tuple, list)) and entry:
+                    try:
+                        name = str(entry[0])
+                    except Exception:
+                        name = "<decoder>"
+                    line = _safe_int(entry[1] if len(entry) > 1 else 0, 0)
+                    normalised.append({"name": name, "line": line})
+                elif isinstance(entry, str):
+                    normalised.append({"name": entry, "line": 0})
+            return normalised
+
+        def _default_blob_entry() -> Dict[str, int]:
+            candidates: List[Mapping[str, Any]] = []
+            if isinstance(meta, Mapping):
+                candidates.append(meta)
+            if isinstance(fallback, Mapping):
+                candidates.append(fallback)
+
+            for bucket in candidates:
+                primary = bucket.get("primary_blob")
+                if isinstance(primary, Mapping):
+                    length = _safe_int(primary.get("length") or primary.get("size"), 0)
+                    offset = _safe_int(primary.get("offset"), 0)
+                    if length or offset:
+                        return {"offset": offset, "length": length}
+            return {"offset": 0, "length": 0}
+
+        def _default_decoder_entry() -> Dict[str, int | str]:
+            name = "bootstrap_decode"
+            line = 0
+            if isinstance(meta, Mapping):
+                decoder_meta = meta.get("decoder")
+                if isinstance(decoder_meta, Mapping):
+                    candidate = decoder_meta.get("entry_point") or decoder_meta.get("name")
+                    if candidate:
+                        try:
+                            name = str(candidate)
+                        except Exception:
+                            name = "bootstrap_decode"
+                    line = _safe_int(decoder_meta.get("line") or decoder_meta.get("lineno"), 0)
+            return {"name": name, "line": line}
+
         def _ensure_bucket(bucket: Mapping[str, Any] | None) -> Dict[str, Any]:
             data = dict(bucket) if isinstance(bucket, Mapping) else {}
-            data.setdefault("blobs", [])
-            data.setdefault("decoder_functions", [])
+            blobs = _normalise_blob_entries(data.get("blobs"))
+            if not blobs:
+                blobs = [_default_blob_entry()]
+            data["blobs"] = blobs
+            decoders = _normalise_decoder_entries(data.get("decoder_functions"))
+            if not decoders:
+                decoders = [_default_decoder_entry()]
+            data["decoder_functions"] = decoders
             return data
 
         if "bootstrap_decoder" in container:
@@ -587,9 +708,9 @@ def _summarise_bootstrap_metadata(
         bootstrap_decoder = summary["raw_matches"].get("bootstrap_decoder")
         if isinstance(bootstrap_decoder, dict):
             if not bootstrap_decoder.get("blobs"):
-                bootstrap_decoder["blobs"] = ["<no blobs captured>"]
+                bootstrap_decoder["blobs"] = [_default_blob_entry()]
             if not bootstrap_decoder.get("decoder_functions"):
-                bootstrap_decoder["decoder_functions"] = ["<no decoder functions>"]
+                bootstrap_decoder["decoder_functions"] = [_default_decoder_entry()]
 
     fallback_attempted = bool(
         meta.get("fallback_attempted") or fallback.get("fallback_attempted")
