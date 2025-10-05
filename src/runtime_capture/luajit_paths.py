@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 from pathlib import Path
 from typing import List
 
@@ -35,7 +37,17 @@ def find_luajit() -> list[str] | None:
     """
 
     for candidate in _candidate_paths():
-        if candidate and candidate.exists():
+        if not candidate or not candidate.exists():
+            continue
+        if candidate.suffix.lower() == ".exe" and os.name != "nt":
+            continue
+        try:
+            mode = candidate.stat().st_mode
+            if not mode & stat.S_IXUSR:
+                candidate.chmod(mode | stat.S_IXUSR)
+        except OSError:
+            pass
+        if os.access(candidate, os.X_OK):
             return [str(candidate)]
     return None
 

@@ -4,8 +4,25 @@ from src.utils.luraph_vm import rebuild_vm_bytecode
 from src.utils.opcode_inference import infer_opcode_map
 
 
-def _instruction_names(result):
-    return [row.get("op") for row in result.instructions]
+def _instruction_names(result, opcode_map):
+    names = []
+    for row in result.instructions:
+        if hasattr(row, "mnemonic"):
+            names.append(getattr(row, "mnemonic"))
+            continue
+        if isinstance(row, dict):
+            mnemonic = row.get("op") or row.get("mnemonic")
+            if mnemonic:
+                names.append(str(mnemonic))
+                continue
+            opcode = row.get("opcode")
+            if opcode is not None and opcode_map:
+                mapped = opcode_map.get(opcode)
+                if mapped:
+                    names.append(str(mapped))
+                    continue
+        names.append("UNKNOWN")
+    return names
 
 
 def test_bytecode_reconstruction_matches_expected(v1441_capture):
@@ -14,7 +31,7 @@ def test_bytecode_reconstruction_matches_expected(v1441_capture):
     result = rebuild_vm_bytecode(unpacked, opcode_map)
 
     assert result.bytecode
-    names = _instruction_names(result)
+    names = _instruction_names(result, opcode_map)
     assert names == ["LOADK", "MOVE", "CALL", "RETURN"]
 
     expected_path = Path(__file__).resolve().parent / "fixtures" / "v14_4_1" / "expected.lua"

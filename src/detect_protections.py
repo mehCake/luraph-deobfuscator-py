@@ -508,7 +508,7 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
 
     for path in paths:
         try:
-            data = path.read_text(encoding="utf-8", errors="ignore")
+            data = path.read_text(encoding="utf-8-sig", errors="ignore")
         except OSError:
             continue
         path_list.append(path.as_posix())

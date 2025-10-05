@@ -19,7 +19,7 @@ LOG = logging.getLogger(__name__)
 def flatten_json_to_lua(path: Union[str, Path]) -> str:
     """Flatten nested JSON arrays of strings stored in ``path``."""
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         obj = json.load(f)
     return _flatten_json_object(obj)
 

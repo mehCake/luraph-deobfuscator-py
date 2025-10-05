@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import networkx as nx
+from src import simple_graph as nx
 
 from src.ir import VMFunction, VMInstruction
 from src.lua_ast import (
