@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 __all__ = [
     "VMRebuildResult",
+    "MinimalVMInstruction",
     "rebuild_vm_bytecode",
     "looks_like_vm_bytecode",
+    "canonicalise_opcode_name",
 ]
 
 
@@ -25,15 +27,49 @@ _SBX_BIAS = 131071  # 2^17 - 1
 
 
 @dataclass
+class MinimalVMInstruction:
+    """Very small representation of an instruction for smoke tests."""
+
+    opcode: int
+    mnemonic: str
+    a: int
+    b: int
+    c: int
+    pc: int
+
+
+@dataclass
 class VMRebuildResult:
     """Container returned by :func:`rebuild_vm_bytecode`."""
 
     bytecode: bytes
     instructions: List[Dict[str, Any]]
     constants: List[Any]
+    micro_instructions: List[MinimalVMInstruction] = field(default_factory=list)
 
 
-def looks_like_vm_bytecode(blob: Sequence[int] | bytes) -> bool:
+_CANONICAL_OPCODE_ALIASES: Mapping[str, str] = {
+    "LOADB": "LOADBOOL",
+    "PUSHK": "LOADK",
+}
+
+
+def canonicalise_opcode_name(name: Optional[str]) -> Optional[str]:
+    """Normalise bootstrap mnemonics to canonical Lua 5.1 names."""
+
+    if not name:
+        return None
+    upper = str(name).strip().upper()
+    if not upper:
+        return None
+    return _CANONICAL_OPCODE_ALIASES.get(upper, upper)
+
+
+def looks_like_vm_bytecode(
+    blob: Sequence[int] | bytes,
+    *,
+    opcode_map: Optional[Mapping[int, Any]] = None,
+) -> bool:
     """Quick heuristic to decide whether ``blob`` resembles Lua bytecode."""
 
     if not blob:
@@ -47,8 +83,22 @@ def looks_like_vm_bytecode(blob: Sequence[int] | bytes) -> bool:
     if printable > len(data) // 2:
         return False
 
-    unique = {data[index] for index in range(0, len(data), 4)}
-    return len(unique) >= 4
+    raw_opcodes = [data[index] for index in range(0, len(data), 4)]
+    if len({value for value in raw_opcodes}) < 4:
+        return False
+
+    unique = {value & 0x3F for value in raw_opcodes}
+
+    if opcode_map:
+        try:
+            probe = {int(key, 0) if isinstance(key, str) else int(key) for key in opcode_map.keys()}
+        except Exception:
+            probe = set()
+        if probe:
+            overlap = len(unique & {value & 0x3F for value in probe})
+            return overlap >= max(3, len(probe) // 8)
+
+    return True
 
 
 def rebuild_vm_bytecode(
@@ -67,6 +117,7 @@ def rebuild_vm_bytecode(
 
     encoded = bytearray()
     rows: List[Dict[str, Any]] = []
+    micro_rows: List[MinimalVMInstruction] = []
 
     for index, raw in enumerate(instructions):
         if raw is None:
@@ -77,8 +128,16 @@ def rebuild_vm_bytecode(
         encoded.extend(_encode_instruction(normalised))
         normalised.setdefault("pc", index * 4)
         rows.append(normalised)
+        mini = _minimal_instruction(normalised)
+        if mini is not None:
+            micro_rows.append(mini)
 
-    return VMRebuildResult(bytecode=bytes(encoded), instructions=rows, constants=constants)
+    return VMRebuildResult(
+        bytecode=bytes(encoded),
+        instructions=rows,
+        constants=constants,
+        micro_instructions=micro_rows,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -204,16 +263,24 @@ def _normalise_instruction(raw: Any, opcode_map: Optional[Mapping[int, str]]) ->
     b_val = 0 if b_val is None else b_val
     c_val = 0 if c_val is None else c_val
 
+    opcode_num = opcode & 0x3F
+
     info = {
-        "opcode": opcode & 0x3F,
-        "mnemonic": None,
+        "opcode": opcode_num,
         "A": a_val & 0xFF,
         "B": b_val & 0x1FF,
         "C": c_val & 0x1FF,
     }
 
-    if opcode_map and info["opcode"] in opcode_map:
-        info["mnemonic"] = opcode_map[info["opcode"]]
+    mnemonic: Optional[str] = None
+    if opcode_map and opcode_num in opcode_map:
+        mnemonic = canonicalise_opcode_name(opcode_map[opcode_num])
+
+    if not mnemonic:
+        mnemonic = f"OP_{opcode_num:02X}"
+
+    info["mnemonic"] = mnemonic
+    info["op"] = mnemonic
 
     return info
 
@@ -264,4 +331,32 @@ def _normalise_opcode_map(mapping: Optional[Mapping[Any, Any]]) -> Dict[int, str
             continue
         normalised[opcode & 0x3F] = str(value)
     return normalised
+
+
+_MINI_LIFT_OPS = {"LOADK", "MOVE", "CALL", "RETURN"}
+
+
+def _minimal_instruction(data: Mapping[str, Any]) -> Optional[MinimalVMInstruction]:
+    mnemonic = data.get("op") or data.get("mnemonic")
+    if not mnemonic:
+        return None
+    name = str(mnemonic).upper()
+    if name not in _MINI_LIFT_OPS:
+        return None
+    try:
+        opcode = int(data.get("opcode", 0)) & 0x3F
+        a_val = int(data.get("A", 0)) & 0xFF
+        b_val = int(data.get("B", 0)) & 0x1FF
+        c_val = int(data.get("C", 0)) & 0x1FF
+        pc_val = int(data.get("pc", 0))
+    except Exception:
+        return None
+    return MinimalVMInstruction(
+        opcode=opcode,
+        mnemonic=name,
+        a=a_val,
+        b=b_val,
+        c=c_val,
+        pc=pc_val,
+    )
 

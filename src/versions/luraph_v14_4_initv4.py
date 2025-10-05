@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import string
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -43,6 +44,10 @@ _DEFAULT_BASE = len(DEFAULT_ALPHABET)
 
 _PRINTABLE = re.escape(DEFAULT_ALPHABET)
 _PAYLOAD_RE = re.compile(rf'(["\'])([{_PRINTABLE}]{{32,}})\1')
+_SCRIPT_KEY_LITERAL_RE = re.compile(
+    r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
 
 
 def _is_alphabet(candidate: str) -> bool:
@@ -181,6 +186,7 @@ class InitV4Decoder:
     bootstrap: Optional[InitV4Bootstrap] = None
 
     def __post_init__(self) -> None:
+        self.extracted_script_key: Optional[str] = None
         self._manual_override_alphabet = False
         self._manual_override_opcode_map = False
         self._alphabet: Optional[str] = None
@@ -223,6 +229,12 @@ class InitV4Decoder:
 
         if self._alphabet is None:
             self._alphabet = DEFAULT_ALPHABET
+
+        if not self._script_key_bytes and self.extracted_script_key:
+            try:
+                self._script_key_bytes = self.extracted_script_key.encode("utf-8")
+            except Exception:  # pragma: no cover - defensive
+                self._script_key_bytes = b""
 
     # ------------------------------------------------------------------
     @property
@@ -284,9 +296,18 @@ class InitV4Decoder:
 
         self._bootstrap_summary = dict(summary)
 
+        literal_key = self._extract_script_key_literal(bootstrap.text)
+        if literal_key:
+            self.extracted_script_key = literal_key
+            self._bootstrap_summary.setdefault("script_key_literal", literal_key)
+            self._bootstrap_summary.setdefault("script_key_length", len(literal_key))
+            meta.setdefault("script_key_literal", literal_key)
+            meta.setdefault("script_key_length", len(literal_key))
+            meta.setdefault("script_key_source", "bootstrap")
+
         if not self._manual_override_alphabet and alphabet:
             self._alphabet = alphabet
-            self._alphabet_source = "bootstrapper"
+            self._alphabet_source = "bootstrap"
 
         table_map = {opcode: spec.mnemonic for opcode, spec in table.items()}
         if table_map:
@@ -323,6 +344,16 @@ class InitV4Decoder:
         if self.opcode_map:
             meta.setdefault("opcode_map_count", len(self.opcode_map))
             meta.setdefault("opcode_map", dict(self.opcode_map))
+        if (
+            self._alphabet is DEFAULT_ALPHABET
+            and self.bootstrap is not None
+            and "alphabet_length" not in meta
+        ):
+            fallback_alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits
+            meta.setdefault("alphabet_length", len(fallback_alphabet))
+            meta.setdefault("alphabet_preview", fallback_alphabet[:32] + ("..." if len(fallback_alphabet) > 32 else ""))
+            meta.setdefault("alphabet_source", "bootstrap")
+            meta.setdefault("alphabet_fallback", fallback_alphabet)
         if meta:
             existing = getattr(self.ctx, "bootstrapper_metadata", None)
             if isinstance(existing, Mapping):
@@ -331,6 +362,23 @@ class InitV4Decoder:
                 setattr(self.ctx, "bootstrapper_metadata", combined)
             else:
                 setattr(self.ctx, "bootstrapper_metadata", dict(meta))
+
+        if literal_key:
+            try:
+                setattr(self.ctx, "extracted_script_key", literal_key)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_script_key_literal(text: str) -> Optional[str]:
+        if not text:
+            return None
+        match = _SCRIPT_KEY_LITERAL_RE.search(text)
+        if not match:
+            return None
+        candidate = match.group(1).strip()
+        return candidate or None
 
 
 # ---------------------------------------------------------------------------

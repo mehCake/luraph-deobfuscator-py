@@ -108,7 +108,7 @@ class InitV4Bootstrap:
             resolved = base
         if not resolved.exists():
             raise FileNotFoundError(resolved)
-        text = resolved.read_text(encoding="utf-8", errors="ignore")
+        text = resolved.read_text(encoding="utf-8-sig", errors="ignore")
         return cls(resolved, text)
 
     # ------------------------------------------------------------------

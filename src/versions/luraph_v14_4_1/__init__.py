@@ -178,7 +178,6 @@ HANDLER = InitV4_2Handler()
 
 def looks_like_vm_bytecode(
     blob: Sequence[int] | bytes,
-    opcode_probe: Mapping[int, Any] | None = None,
     *,
     opcode_map: Mapping[int, Any] | None = None,
 ) -> bool:
@@ -207,9 +206,7 @@ def looks_like_vm_bytecode(
     if printable > len(data) // 2:
         return False
 
-    probe = opcode_probe
-    if probe is None and opcode_map:
-        probe = opcode_map
+    probe = opcode_map
 
     if probe:
         try:

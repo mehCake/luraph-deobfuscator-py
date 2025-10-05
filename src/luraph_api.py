@@ -33,7 +33,7 @@ class LuraphAPI:
         cache_path = self._cache_path(endpoint)
         if cache_path.exists():
             try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
+                return json.loads(cache_path.read_text(encoding="utf-8-sig"))
             except json.JSONDecodeError:
                 cache_path.unlink(missing_ok=True)
         request = Request(url, headers={"Authorization": f"Bearer {self.api_key}"})

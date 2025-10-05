@@ -24,6 +24,7 @@ from .passes import Devirtualizer
 from .passes.vm_lift import VMLifter
 from .passes.vm_devirtualize import IRDevirtualizer
 from .utils_pkg import ast as lua_ast
+from .utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
 from .vm import LuraphVM
 from .exceptions import VMEmulationError
 
@@ -691,8 +692,14 @@ class LuaDeobfuscator:
             r"chunk_\d+\s*=\s*(?:local\s+)?([\"'])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]+)\1",
         )
         matches = list(chunk_re.finditer(text))
+        simple_match: re.Match[str] | None = None
         if not matches:
-            return None
+            simple_match = re.search(
+                r"local\s+payload\s*=\s*([\"'])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]{32,})\1",
+                text,
+            )
+            if simple_match is None:
+                return None
 
         script_key = self._script_key
         if not script_key:
@@ -712,13 +719,20 @@ class LuaDeobfuscator:
 
         key_bytes = script_key.encode("utf-8", "ignore")
         combined = bytearray()
-        for match in matches:
-            blob = match.group("blob")
+        if matches:
+            for match in matches:
+                blob = match.group("blob")
+                try:
+                    chunk = decode_blob(blob, key_bytes=key_bytes)
+                except Exception:
+                    return None
+                combined.extend(chunk)
+        elif simple_match:
+            blob = simple_match.group("blob")
             try:
-                chunk = decode_blob(blob, key_bytes=key_bytes)
+                combined.extend(decode_blob(blob, key_bytes=key_bytes))
             except Exception:
                 return None
-            combined.extend(chunk)
 
         if not combined:
             return None
@@ -1134,7 +1148,10 @@ class LuaDeobfuscator:
 
             opcode_probe: Optional[Mapping[int, object]]
             opcode_probe = opcode_table if opcode_table else None
-            is_vm_like = looks_like_vm_bytecode(chunk_bytes, opcode_probe)
+            is_vm_like = looks_like_vm_bytecode(
+                chunk_bytes,
+                opcode_map=opcode_probe,
+            )
             suspicious_chunk = not is_vm_like
             chunk_suspicious_flags.append(suspicious_chunk)
 
@@ -1261,13 +1278,17 @@ class LuaDeobfuscator:
             rename_counts.append(rename_count)
             emitted = renamed_chunk or chunk_source or ""
             if not emitted.strip():
-                placeholder = (
-                    f"--[[ undecoded initv4 chunk {index + 1} ({decoded_length} bytes) ]]"
+                placeholder_detail = (
+                    f"undecoded content (size: {decoded_length} bytes)"
                 )
-                chunk_detail["placeholder"] = placeholder
-                chunk_sources.append(placeholder)
+                chunk_detail["placeholder"] = placeholder_detail
+                placeholder_function = lua_placeholder_function(
+                    f"chunk_{index + 1}",
+                    [placeholder_detail],
+                )
+                chunk_sources.append(placeholder_function.strip("\r\n"))
             else:
-                chunk_sources.append(emitted)
+                chunk_sources.append(normalise_lua_newlines(emitted).strip("\r\n"))
 
         meta: Dict[str, Any] = {}
         if discovered_chunks:
@@ -1301,6 +1322,7 @@ class LuaDeobfuscator:
         merged_source = ""
         placeholder_only = False
         combined_script = ""
+        actual_sources: List[str] = []
         if decoded_parts:
             combined_bytes = b"".join(decoded_parts)
             mapping, _, _ = self._decode_payload_mapping(combined_bytes)
@@ -1312,23 +1334,56 @@ class LuaDeobfuscator:
         if combined_script:
             merged_source = combined_script
         else:
-            actual_sources = [
-                text.strip()
-                for text, detail in zip(chunk_sources, chunk_details)
-                if text.strip() and not detail.get("placeholder")
-            ]
+            for text, detail in zip(chunk_sources, chunk_details):
+                cleaned_text = text.strip("\r\n")
+                if cleaned_text and not detail.get("placeholder"):
+                    actual_sources.append(cleaned_text)
             if actual_sources:
                 merged_source = "\n\n".join(actual_sources)
             else:
-                placeholder_texts = [text.strip() for text in chunk_sources if text.strip()]
+                placeholder_texts = []
+                for text in chunk_sources:
+                    cleaned_text = text.strip("\r\n")
+                    if cleaned_text:
+                        placeholder_texts.append(cleaned_text)
                 if placeholder_texts:
                     placeholder_only = True
                     merged_source = "\n\n".join(placeholder_texts)
 
+        total_decoded = sum(decoded_lengths) if decoded_lengths else 0
+        iteration_hint = discovered_chunks or len(decoded_parts)
+        merged_lower = merged_source.lower() if merged_source else ""
+        needs_placeholder = False
+        if not merged_lower.strip():
+            needs_placeholder = True
+        elif "function" not in merged_lower:
+            if placeholder_only or (not combined_script and not actual_sources):
+                needs_placeholder = True
+            elif merged_lower.startswith("--[[") or "undecoded" in merged_lower:
+                needs_placeholder = True
+        if needs_placeholder:
+            comments = ["failed to decode initv4 chunks", f"size: {total_decoded} bytes"]
+            if iteration_hint:
+                comments.append(f"iterations: {iteration_hint}")
+            placeholder_text = lua_placeholder_function(
+                "__deob_initv4_placeholder__",
+                comments,
+                newline="\n",
+            )
+            placeholder_stub = placeholder_text.strip()
+            if merged_source.strip():
+                merged_source = "\n\n".join([merged_source.strip(), placeholder_stub])
+            else:
+                merged_source = placeholder_stub
+            placeholder_only = placeholder_only or not actual_sources
+
         analysis: Dict[str, Any] = {}
         if chunk_sources:
-            analysis["sources"] = chunk_sources
+            analysis["sources"] = [
+                normalise_lua_newlines(text) for text in chunk_sources
+            ]
         if merged_source:
+            merged_source = normalise_lua_newlines(merged_source)
             analysis["final_source"] = merged_source
         if placeholder_only:
             analysis["placeholders_only"] = True

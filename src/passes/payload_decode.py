@@ -19,6 +19,8 @@ from ..versions.luraph_v14_4_initv4 import (
     DEFAULT_ALPHABET as INITV4_DEFAULT_ALPHABET,
     decode_blob as initv4_decode_blob,
 )
+from ..utils.luraph_vm import canonicalise_opcode_name
+from ..utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
 from lph_handler import extract_vm_ir
 from opcode_lifter import OpcodeLifter
 
@@ -38,11 +40,20 @@ _LOADSTRING_CALL_RE = re.compile(
     r"(?P<prefix>\breturn\s+)?(?:loadstring|load)\s*\(\s*(?P<payload>.+?)\s*\)\s*\(\s*\)",
     re.DOTALL,
 )
+
+_SCRIPT_KEY_LITERAL_RE = re.compile(
+    r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
 _TOP_LEVEL_LITERAL_RE = re.compile(
     r"^\s*(?:return\s+)?(?P<quote>['\"])(?P<body>.*)(?P=quote)\s*;?\s*$",
     re.DOTALL,
 )
 _STUB_HINT_RE = re.compile(r"init_fn\s*\(")
+_INITV4_PAYLOAD_RE = re.compile(
+    r"local\s+payload\s*=\s*(?P<quote>['\"])(?P<blob>[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_`{|}~]{32,})(?P=quote)",
+    re.IGNORECASE,
+)
 
 
 def _detect_jump_table(constants: Iterable[Any]) -> Optional[Dict[str, Any]]:
@@ -194,6 +205,420 @@ def _strip_json_quotes_and_escapes(blob: str) -> str:
     return stripped
 
 
+def _persist_bootstrap_blob(
+    ctx: "Context", decoded: bytes, *, chunk_index: int
+) -> Optional[Dict[str, str]]:
+    """Write ``decoded`` bytes to disk and return artefact paths."""
+
+    if not decoded:
+        return None
+
+    bootstrap_path = getattr(ctx, "bootstrapper_path", None)
+    candidate: Optional[str]
+    if bootstrap_path:
+        candidate = str(bootstrap_path)
+    else:
+        input_path = getattr(ctx, "input_path", None)
+        candidate = str(input_path) if input_path else None
+
+    base_name = "bootstrap"
+    if candidate:
+        base_path = Path(candidate)
+        if base_path.is_dir():
+            for name in ("initv4.lua", "init.lua", "bootstrap.lua", "init.lua.txt"):
+                guess = base_path / name
+                if guess.exists():
+                    base_path = guess
+                    break
+        stem = base_path.stem or base_path.name
+        if stem:
+            base_name = stem
+
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]", "_", base_name)[:60] or "bootstrap"
+    logs_dir = Path("out") / "logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    suffix = "" if chunk_index == 0 else f"_{chunk_index:02d}"
+    decoded_path = logs_dir / f"bootstrap_decoded_{sanitized}{suffix}.bin"
+    try:
+        decoded_path.write_bytes(decoded)
+    except OSError:
+        return None
+
+    out_dir = Path("out")
+    try:
+        utils.ensure_directory(out_dir)
+    except Exception:
+        base64_path = None
+    else:
+        base_suffix = "" if chunk_index == 0 else f".part{chunk_index + 1:02d}"
+        candidate_path = out_dir / f"bootstrap_blob{base_suffix}.b64.txt"
+        encoded = base64.b64encode(decoded).decode("ascii") if decoded else ""
+        if utils.safe_write_file(str(candidate_path), encoded):
+            base64_path = candidate_path
+        else:
+            base64_path = None
+
+    result: Dict[str, str] = {"binary": str(decoded_path)}
+    if base64_path is not None:
+        result["base64"] = str(base64_path)
+    return result
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_compatible(item) for item in value]
+    return str(value)
+
+
+def _persist_decoded_outputs(
+    ctx: "Context",
+    decoded_text: Optional[str],
+    payload_mapping: Optional[Mapping[str, Any]],
+    *,
+    chunk_index: int,
+) -> Optional[Dict[str, str]]:
+    raw_text = decoded_text or ""
+    byte_length = len(raw_text.encode("utf-8", errors="ignore"))
+    sanitized = utils.strip_non_printable(raw_text)
+    if sanitized:
+        sanitized = normalise_lua_newlines(sanitized)
+    stripped = sanitized.strip() if sanitized else ""
+    if not stripped:
+        sanitized = lua_placeholder_function(
+            f"chunk_{chunk_index + 1}",
+            [
+                f"undecoded content (size: {byte_length} bytes)",
+                "no decoded Lua emitted by initv4 fallback",
+                f"chunk index: {chunk_index}",
+            ],
+        )
+    else:
+        lower = stripped.lower()
+        needs_stub = (
+            "function" not in sanitized
+            and (
+                "undecoded" in lower
+                or lower.startswith("--[[")
+                or lower.startswith("-- placeholder")
+            )
+        )
+        if needs_stub:
+            placeholder = lua_placeholder_function(
+                f"chunk_{chunk_index + 1}",
+                [f"undecoded content (size: {byte_length} bytes)"],
+            )
+            sanitized_body = sanitized.rstrip("\r\n")
+            joiner = "\r\n\r\n" if sanitized_body else ""
+            sanitized = f"{sanitized_body}{joiner}{placeholder}"
+    sanitized = normalise_lua_newlines(sanitized)
+
+    out_dir = Path("out")
+    try:
+        utils.ensure_directory(out_dir)
+    except Exception:
+        return None
+
+    suffix = "" if chunk_index == 0 else f".part{chunk_index + 1:02d}"
+    lua_path = out_dir / f"decoded_output{suffix}.lua"
+    json_path = out_dir / f"unpacked_dump{suffix}.json"
+
+    lua_written = utils.safe_write_file(str(lua_path), sanitized, encoding="utf-8")
+
+    payload_obj: Mapping[str, Any]
+    if isinstance(payload_mapping, Mapping) and payload_mapping:
+        payload_obj = {k: _json_compatible(v) for k, v in payload_mapping.items()}
+    else:
+        payload_obj = {"script": sanitized}
+    try:
+        json_text = json.dumps(payload_obj, ensure_ascii=False, indent=2)
+    except TypeError:
+        payload_obj = {key: _json_compatible(value) for key, value in payload_obj.items()}
+        json_text = json.dumps(payload_obj, ensure_ascii=False, indent=2)
+    json_written = utils.safe_write_file(str(json_path), json_text, encoding="utf-8")
+
+    if lua_written:
+        try:
+            if lua_path.stat().st_size <= 0:
+                lua_written = False
+        except OSError:
+            lua_written = False
+    if json_written:
+        try:
+            if json_path.stat().st_size <= 0:
+                json_written = False
+        except OSError:
+            json_written = False
+
+    if chunk_index == 0:
+        summary_path = out_dir / "unpacked.json"
+        if not summary_path.exists():
+            utils.safe_write_file(str(summary_path), json_text, encoding="utf-8")
+
+    if not lua_written or not json_written:
+        if lua_written:
+            try:
+                lua_path.unlink()
+            except OSError:
+                pass
+        if json_written:
+            try:
+                json_path.unlink()
+            except OSError:
+                pass
+        return None
+
+    ctx.result.setdefault("artifacts", {})
+    artifacts = ctx.result["artifacts"]
+    if isinstance(artifacts, dict):
+        decoded_bucket = artifacts.setdefault("decoded_output", [])
+        if isinstance(decoded_bucket, list):
+            decoded_bucket.append(str(lua_path))
+        else:
+            artifacts["decoded_output"] = [str(lua_path)]
+        unpacked_bucket = artifacts.setdefault("unpacked_dump", [])
+        if isinstance(unpacked_bucket, list):
+            unpacked_bucket.append(str(json_path))
+        else:
+            artifacts["unpacked_dump"] = [str(json_path)]
+
+    return {"lua": str(lua_path), "json": str(json_path)}
+
+
+def _ensure_bootstrap_blob_placeholder(source: Optional[str | Path]) -> Optional[str]:
+    """Ensure the canonical bootstrap blob artefact exists for the CLI."""
+
+    out_dir = Path("out")
+    try:
+        utils.ensure_directory(out_dir)
+    except Exception:
+        return None
+
+    target = out_dir / "bootstrap_blob.b64.txt"
+
+    raw_bytes: bytes = b""
+    if isinstance(source, (bytes, bytearray)):
+        raw_bytes = bytes(source)
+    elif isinstance(source, str):
+        try:
+            source_path = Path(source)
+        except TypeError:
+            source_path = None
+        else:
+            if source_path.exists() and source_path.is_file():
+                try:
+                    raw_bytes = source_path.read_bytes()
+                except OSError:
+                    raw_bytes = b""
+            else:
+                raw_bytes = source.encode("utf-8", errors="ignore")
+    elif isinstance(source, Path):
+        try:
+            raw_bytes = source.read_bytes()
+        except OSError:
+            raw_bytes = b""
+
+    encoded = base64.b64encode(raw_bytes).decode("ascii") if raw_bytes else ""
+    if utils.safe_write_file(str(target), encoded):
+        return str(target)
+    return None
+
+
+def _ensure_summary_artifacts(
+    metadata: Mapping[str, Any],
+) -> Dict[str, str]:
+    artifacts: Dict[str, str] = {}
+    out_dir = Path("out")
+    try:
+        utils.ensure_directory(out_dir)
+    except Exception:
+        return artifacts
+
+    payload_meta = metadata.get("handler_payload_meta")
+    if isinstance(payload_meta, Mapping):
+        payload_data = _json_compatible(payload_meta)
+    else:
+        payload_data = {}
+
+    bootstrap_meta = metadata.get("bootstrapper_metadata")
+    if isinstance(bootstrap_meta, Mapping):
+        bootstrap_data = _json_compatible(bootstrap_meta)
+    else:
+        bootstrap_data = {}
+
+    summary = {
+        "handler_payload_meta": payload_data,
+        "bootstrapper_metadata": bootstrap_data,
+    }
+
+    target = out_dir / "unpacked.json"
+    if not target.exists():
+        try:
+            json_text = json.dumps(summary, ensure_ascii=False, indent=2)
+        except TypeError:
+            json_text = json.dumps(_json_compatible(summary), ensure_ascii=False, indent=2)
+        if utils.safe_write_file(str(target), json_text, encoding="utf-8"):
+            artifacts["unpacked_json"] = str(target)
+
+    return artifacts
+
+
+def _persist_decoder_metadata(
+    decoder: Any,
+    *,
+    chunk_index: int,
+) -> Dict[str, str]:
+    artifacts: Dict[str, str] = {}
+    out_dir = Path("out")
+    try:
+        utils.ensure_directory(out_dir)
+    except Exception:
+        return artifacts
+
+    suffix = "" if chunk_index == 0 else f".part{chunk_index + 1:02d}"
+
+    alphabet = getattr(decoder, "alphabet", None)
+    if isinstance(alphabet, str) and alphabet:
+        target = out_dir / f"alphabet{suffix}.txt"
+        if not target.exists() and utils.safe_write_file(str(target), alphabet, encoding="utf-8"):
+            artifacts["alphabet"] = str(target)
+
+    opcode_map: Optional[Mapping[Any, Any]] = None
+    if hasattr(decoder, "opcode_table"):
+        try:
+            table_candidate = decoder.opcode_table()
+        except Exception:
+            table_candidate = None
+        if isinstance(table_candidate, Mapping) and table_candidate:
+            opcode_map = table_candidate
+    if opcode_map is None:
+        candidate = getattr(decoder, "opcode_map", None)
+        if isinstance(candidate, Mapping) and candidate:
+            opcode_map = candidate
+
+    if isinstance(opcode_map, Mapping) and opcode_map:
+        lines: List[str] = []
+        try:
+            iterator = sorted(opcode_map.items())
+        except Exception:
+            iterator = opcode_map.items()
+        for key, value in iterator:
+            try:
+                opcode_int = int(key)
+            except Exception:
+                continue
+            mnemonic = str(value)
+            lines.append(f"0x{opcode_int:02X} {mnemonic}")
+        if lines:
+            target = out_dir / f"opcode_map{suffix}.txt"
+            text = "\n".join(lines)
+            if not target.exists() and utils.safe_write_file(str(target), text, encoding="utf-8"):
+                artifacts["opcode_map"] = str(target)
+
+    return artifacts
+
+
+def _canonical_opcode_map(mapping: Mapping[Any, Any]) -> Dict[int, str]:
+    result: Dict[int, str] = {}
+    for key, name in mapping.items():
+        opcode: Optional[int] = None
+        if isinstance(key, int):
+            opcode = key
+        elif isinstance(key, str):
+            try:
+                opcode = int(key, 0)
+            except (TypeError, ValueError):
+                opcode = None
+        if opcode is None:
+            continue
+        canonical = canonicalise_opcode_name(name)
+        if not canonical:
+            continue
+        opcode &= 0x3F
+        result.setdefault(opcode, canonical)
+    return result
+
+
+def _persist_chunk_outputs(ctx: "Context", text: str) -> List[str]:
+    prefix = getattr(ctx, "output_prefix", None)
+    if not prefix:
+        return []
+
+    raw_text = text or ""
+    sanitized = utils.strip_non_printable(raw_text)
+    if sanitized:
+        sanitized = normalise_lua_newlines(sanitized)
+    byte_length = len(raw_text.encode("utf-8", errors="ignore"))
+    stripped = sanitized.strip() if sanitized else ""
+    if not stripped:
+        sanitized = lua_placeholder_function(
+            prefix,
+            [
+                f"undecoded content (size: {byte_length} bytes)",
+                "empty pipeline output",
+            ],
+        )
+    else:
+        lower = stripped.lower()
+        needs_stub = (
+            "function" not in sanitized
+            and (
+                "undecoded" in lower
+                or lower.startswith("--[[")
+                or lower.startswith("-- placeholder")
+            )
+        )
+        if needs_stub:
+            placeholder = lua_placeholder_function(
+                prefix,
+                [f"undecoded content (size: {byte_length} bytes)"],
+            )
+            sanitized_body = sanitized.rstrip("\r\n")
+            joiner = "\r\n\r\n" if sanitized_body else ""
+            sanitized = f"{sanitized_body}{joiner}{placeholder}"
+    sanitized = normalise_lua_newlines(sanitized)
+
+    chunk_lines_value: Optional[int] = None
+    options = getattr(ctx, "options", None)
+    if isinstance(options, dict):
+        raw_chunk_lines = options.get("chunk_lines")
+        if isinstance(raw_chunk_lines, int) and raw_chunk_lines > 0:
+            chunk_lines_value = raw_chunk_lines
+
+    out_dir = Path("out")
+    try:
+        utils.ensure_directory(out_dir)
+    except Exception:
+        return []
+
+    if chunk_lines_value:
+        lines = sanitized.splitlines()
+        chunks: List[str] = []
+        for index in range(0, len(lines), chunk_lines_value):
+            chunk = "\n".join(lines[index : index + chunk_lines_value])
+            chunk = normalise_lua_newlines(chunk)
+            chunks.append(chunk)
+        if not chunks:
+            chunks = [sanitized]
+    else:
+        chunks = [sanitized]
+
+    paths: List[str] = []
+    for index, chunk_text in enumerate(chunks):
+        suffix = "" if len(chunks) == 1 or index == 0 else f".part{index + 1:02d}"
+        target = out_dir / f"{prefix}{suffix}.lua"
+        if utils.safe_write_file(str(target), chunk_text, encoding="utf-8"):
+            paths.append(str(target))
+    return paths
+
+
 def _attempt_simple_fallback_bytes(candidate: str) -> bytes:
     """Decode ``candidate`` using lightweight heuristics.
 
@@ -221,6 +646,40 @@ def _attempt_simple_fallback_bytes(candidate: str) -> bytes:
             pass
 
     return b""
+
+
+def _decode_simple_bootstrap(text: str, script_key: Optional[str]) -> Optional[str]:
+    match = _INITV4_PAYLOAD_RE.search(text)
+    if not match:
+        return None
+    key = script_key
+    if not key:
+        key_match = re.search(
+            r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
+            text,
+        )
+        if key_match:
+            key = key_match.group(1).strip()
+    if not key:
+        return None
+    try:
+        decoded = initv4_decode_blob(match.group("blob"), key_bytes=key.encode("utf-8"))
+    except Exception:
+        return None
+    try:
+        decoded_text = decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    cleaned = utils.strip_non_printable(decoded_text)
+    if not cleaned:
+        return None
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("script"), str):
+        return utils.strip_non_printable(payload["script"])
+    return cleaned
 
 
 def _mask_script_key(script_key: Optional[str]) -> Optional[str]:
@@ -289,19 +748,22 @@ def _iterative_initv4_decode(
     can feed the reporting layer.
     """
 
-    if not script_key:
-        return [], source, {}
-
     try:
         from ..versions.luraph_v14_4_initv4 import InitV4Decoder
     except Exception:  # pragma: no cover - optional helper may fail to load
         return [], source, {}
 
+    script_key_value: Optional[str] = None
+    if isinstance(script_key, str):
+        candidate = script_key.strip()
+        if candidate:
+            script_key_value = candidate
+
     existing_meta = getattr(ctx, "bootstrapper_metadata", None)
     base_meta: Dict[str, Any] = dict(existing_meta) if isinstance(existing_meta, dict) else {}
 
     ctx_proxy = SimpleNamespace(
-        script_key=script_key,
+        script_key=script_key_value,
         bootstrapper_path=getattr(ctx, "bootstrapper_path", None),
         debug_bootstrap=bool(getattr(ctx, "debug_bootstrap", False)),
         bootstrap_debug_log=getattr(ctx, "deobfuscator", None)
@@ -321,6 +783,41 @@ def _iterative_initv4_decode(
         LOG.debug("initv4 decoder bootstrap failed: %s", exc)
         return [], source, {"warnings": [str(exc)]}
 
+    extracted_key = getattr(decoder, "extracted_script_key", None)
+    adopted_from_bootstrap = False
+    if (not script_key_value or not script_key_value.strip()) and isinstance(
+        extracted_key, str
+    ):
+        cleaned_key = extracted_key.strip()
+        if cleaned_key:
+            script_key_value = cleaned_key
+            adopted_from_bootstrap = True
+            ctx_proxy.script_key = cleaned_key
+            if not isinstance(getattr(ctx, "script_key", None), str) or not getattr(
+                ctx, "script_key"
+            ):
+                try:
+                    ctx.script_key = cleaned_key
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            options = getattr(ctx, "options", None)
+            if isinstance(options, dict) and not options.get("script_key"):
+                options["script_key"] = cleaned_key
+            report_obj = getattr(ctx, "report", None)
+            if report_obj is not None and not getattr(report_obj, "script_key_used", None):
+                try:
+                    report_obj.script_key_used = cleaned_key
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+    if not script_key_value:
+        return [], source, {}
+
+    try:
+        ctx_proxy.script_key = script_key_value
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     proxy_meta = getattr(ctx_proxy, "bootstrapper_metadata", None)
     if isinstance(proxy_meta, dict) and proxy_meta:
         try:
@@ -328,7 +825,17 @@ def _iterative_initv4_decode(
         except Exception:  # pragma: no cover - defensive
             pass
 
-    masked_key = _mask_script_key(script_key)
+    decoder_opcode_map = getattr(decoder, "opcode_map", None)
+    if isinstance(decoder_opcode_map, Mapping) and decoder_opcode_map:
+        existing_vm_map = ctx.vm_metadata.get("opcode_map")
+        combined_vm_map: Dict[int, str] = {}
+        if isinstance(existing_vm_map, Mapping):
+            combined_vm_map.update(_canonical_opcode_map(existing_vm_map))
+        combined_vm_map.update(_canonical_opcode_map(decoder_opcode_map))
+        if combined_vm_map:
+            ctx.vm_metadata["opcode_map"] = combined_vm_map
+
+    masked_key = _mask_script_key(script_key_value)
     aggregate_meta: Dict[str, Any] = {
         "chunk_count": 0,
         "chunk_decoded_bytes": [],
@@ -336,12 +843,35 @@ def _iterative_initv4_decode(
         "chunk_details": [],
         "chunk_success_count": 0,
     }
+    if script_key_value:
+        payload_meta = aggregate_meta.setdefault("handler_payload_meta", {})
+        payload_meta.setdefault("script_key", script_key_value)
+        payload_meta.setdefault("script_key_length", len(script_key_value))
+        if adopted_from_bootstrap:
+            payload_meta["script_key_provider"] = "bootstrap"
     warnings: List[str] = []
     decoded_chunks: List[Dict[str, Any]] = []
     current_text = source
-    key_bytes = script_key.encode("utf-8")
+    key_bytes = script_key_value.encode("utf-8")
 
     opcode_lifter: Optional[OpcodeLifter] = None
+
+    iteration_count = 0
+    iteration_versions: List[str] = []
+    iteration_changes: List[bool] = []
+    detected_version = getattr(getattr(ctx, "detected_version", None), "name", None)
+    if not isinstance(detected_version, str) or not detected_version:
+        detected_version = "luraph_v14_4_initv4"
+
+    initial_artifacts = _persist_decoder_metadata(decoder, chunk_index=0)
+    if initial_artifacts.get("alphabet"):
+        aggregate_meta.setdefault("alphabet_paths", []).append(
+            initial_artifacts["alphabet"]
+        )
+    if initial_artifacts.get("opcode_map"):
+        aggregate_meta.setdefault("opcode_map_paths", []).append(
+            initial_artifacts["opcode_map"]
+        )
 
     for _iteration in range(max(1, max_iterations)):
         try:
@@ -355,6 +885,7 @@ def _iterative_initv4_decode(
             break
 
         progress = False
+        processed_chunks = 0
         for blob in payloads:
             if not isinstance(blob, str):
                 continue
@@ -429,12 +960,48 @@ def _iterative_initv4_decode(
             else:
                 chunk_record = {}
 
+            chunk_index = len(decoded_chunks)
+            decoder_artifacts = _persist_decoder_metadata(
+                decoder,
+                chunk_index=chunk_index,
+            )
+            if decoder_artifacts.get("alphabet"):
+                aggregate_meta.setdefault("alphabet_paths", []).append(
+                    decoder_artifacts["alphabet"]
+                )
+                chunk_record["alphabet_path"] = decoder_artifacts["alphabet"]
+            if decoder_artifacts.get("opcode_map"):
+                aggregate_meta.setdefault("opcode_map_paths", []).append(
+                    decoder_artifacts["opcode_map"]
+                )
+                chunk_record["opcode_map_path"] = decoder_artifacts["opcode_map"]
+
+            artifact_info = _persist_bootstrap_blob(
+                ctx,
+                decoded_bytes,
+                chunk_index=chunk_index,
+            )
+            if artifact_info:
+                decoded_blob_path = artifact_info.get("binary")
+                if decoded_blob_path:
+                    aggregate_meta.setdefault(
+                        "bootstrapper_decoded_blobs", []
+                    ).append(decoded_blob_path)
+                    blob_paths = list(blob_paths)
+                    blob_paths.append(decoded_blob_path)
+                    chunk_record["bootstrap_blob_binary"] = decoded_blob_path
+                base64_path = artifact_info.get("base64")
+                if base64_path:
+                    aggregate_meta.setdefault(
+                        "bootstrapper_decoded_blobs_b64", []
+                    ).append(base64_path)
+                    chunk_record["bootstrap_blob_b64"] = base64_path
+
             aggregate_meta["chunk_count"] += 1
             aggregate_meta["chunk_decoded_bytes"].append(len(decoded_bytes))
             aggregate_meta["chunk_encoded_lengths"].append(encoded_length)
-            aggregate_meta["chunk_success_count"] += 1 if decoded_bytes else 0
+            chunk_success = bool(decoded_bytes)
 
-            chunk_index = len(decoded_chunks)
             chunk_record.update(
                 {
                     "index": chunk_index,
@@ -443,7 +1010,7 @@ def _iterative_initv4_decode(
                     "used_key_masked": masked_key,
                 }
             )
-            alphabet_source = "bootstrapper" if decoder.alphabet else "default"
+            alphabet_source = "bootstrap" if decoder.alphabet else "heuristic"
             if manual_alphabet_override and decoder.alphabet:
                 alphabet_source = "manual_override"
             chunk_record["alphabet_source"] = alphabet_source
@@ -453,16 +1020,18 @@ def _iterative_initv4_decode(
             if blob_paths:
                 chunk_record["bootstrapper_decoded_blobs"] = list(blob_paths)
 
+            decoded_text: Optional[str]
+            try:
+                decoded_text = decoded_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                decoded_text = None
+
+            payload_mapping: Optional[Dict[str, Any]] = None
+
             if not suspicious:
                 chunk_record["vm_lift_skipped"] = False
                 vm_summary: Dict[str, Any] = {}
-                decoded_text: Optional[str]
-                try:
-                    decoded_text = decoded_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    decoded_text = None
 
-                payload_mapping: Optional[Dict[str, Any]] = None
                 if decoded_text:
                     payload_mapping = extract_vm_ir(decoded_text)
 
@@ -507,8 +1076,31 @@ def _iterative_initv4_decode(
             elif "vm_lift_skipped" not in chunk_record:
                 chunk_record["vm_lift_skipped"] = True
 
+            persisted = _persist_decoded_outputs(
+                ctx,
+                decoded_text,
+                payload_mapping,
+                chunk_index=chunk_index,
+            )
+            if persisted:
+                chunk_record["decoded_output_path"] = persisted["lua"]
+                chunk_record["unpacked_dump_path"] = persisted["json"]
+                aggregate_meta.setdefault("decoded_output_paths", []).append(
+                    persisted["lua"]
+                )
+                aggregate_meta.setdefault("unpacked_dump_paths", []).append(
+                    persisted["json"]
+                )
+                if not chunk_success:
+                    chunk_success = True
+
+            chunk_record["chunk_success"] = chunk_success
+
             decoded_chunks.append(chunk_record)
             aggregate_meta["chunk_details"].append(dict(chunk_record))
+
+            if chunk_success:
+                aggregate_meta["chunk_success_count"] += 1
 
             placeholder = f"<decoded_chunk_{chunk_index + 1}>"
             replacement = (
@@ -516,12 +1108,26 @@ def _iterative_initv4_decode(
             )
             current_text = current_text.replace(blob, replacement, 1)
             progress = True
+            processed_chunks += 1
 
-        if not progress:
+        if progress:
+            increment = processed_chunks or 1
+            iteration_count += increment
+            iteration_versions.extend([detected_version] * increment)
+            iteration_changes.extend([True] * increment)
+        else:
             break
 
     if warnings:
         aggregate_meta["warnings"] = warnings
+
+    if iteration_count:
+        aggregate_meta["payload_iterations"] = iteration_count
+        aggregate_meta["payload_iteration_versions"] = list(iteration_versions)
+        if iteration_changes:
+            aggregate_meta["payload_iteration_changes"] = list(iteration_changes)
+        else:
+            aggregate_meta["payload_iteration_changes"] = [True] * iteration_count
 
     return decoded_chunks, current_text, aggregate_meta
 
@@ -818,6 +1424,27 @@ def _merge_payload_meta(target: Dict[str, Any], meta: Any) -> None:
         return
 
     for key, value in meta.items():
+        if key == "payload_iterations" and isinstance(value, int):
+            existing = target.get("payload_iterations")
+            if isinstance(existing, int):
+                target["payload_iterations"] = max(existing, value)
+            else:
+                target["payload_iterations"] = value
+            continue
+        if key == "payload_iteration_versions" and isinstance(value, list):
+            existing_versions = target.setdefault("payload_iteration_versions", [])
+            for item in value:
+                if item:
+                    existing_versions.append(str(item))
+            continue
+        if key == "payload_iteration_changes" and isinstance(value, list):
+            existing_changes = target.setdefault("payload_iteration_changes", [])
+            for item in value:
+                if isinstance(item, bool):
+                    existing_changes.append(item)
+                elif isinstance(item, int):
+                    existing_changes.append(bool(item))
+            continue
         if key in {"chunk_count", "chunk_success_count"} and isinstance(value, int):
             target[key] = target.get(key, 0) + max(value, 0)
             continue
@@ -985,6 +1612,411 @@ def _merge_iteration_metadata(
             aggregate[key] = value
 
 
+def _detect_literal_script_key(*candidates: Optional[str]) -> Optional[str]:
+    for text in candidates:
+        if not isinstance(text, str) or not text:
+            continue
+        match = _SCRIPT_KEY_LITERAL_RE.search(text)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def _ensure_payload_meta_dict(payload_meta: Any) -> Dict[str, Any]:
+    if isinstance(payload_meta, dict):
+        return payload_meta
+    return {}
+
+
+def _populate_payload_summary(
+    ctx: "Context",
+    metadata: Dict[str, Any],
+    *,
+    script_key_value: Optional[str],
+    script_key_override: bool,
+    script_key_missing_forced: bool = False,
+) -> None:
+    payload_meta = _ensure_payload_meta_dict(metadata.get("handler_payload_meta"))
+
+    if payload_meta is not metadata.get("handler_payload_meta"):
+        metadata["handler_payload_meta"] = payload_meta
+
+    # Script key bookkeeping -------------------------------------------------
+    options = getattr(ctx, "options", {}) if ctx else {}
+
+    def _normalise_provider_label(label: Optional[str]) -> Optional[str]:
+        if not label:
+            return None
+        lowered = label.strip().lower()
+        mapping = {
+            "bootstrapper": "bootstrap",
+            "bootstrap": "bootstrap",
+            "override": "override",
+            "manual": "override",
+            "literal": "literal",
+            "missing_forced": "missing_forced",
+            "forced_missing": "missing_forced",
+            "heuristic": "heuristic",
+        }
+        return mapping.get(lowered, lowered)
+
+    provider = _normalise_provider_label(payload_meta.get("script_key_provider"))
+    provider_hint: Optional[str] = None
+    if isinstance(options, Mapping):
+        hint = options.get("script_key_source")
+        if isinstance(hint, str) and hint:
+            provider_hint = hint
+            if hint == "literal":
+                script_key_override = False
+                metadata["script_key_override"] = False
+    literal_key = _detect_literal_script_key(
+        getattr(ctx, "original_text", None),
+        getattr(ctx, "raw_input", None),
+        getattr(ctx, "stage_output", None),
+    )
+
+    if script_key_value is None and literal_key:
+        script_key_value = literal_key
+
+    hint_label = _normalise_provider_label(provider_hint)
+    forced_flag = bool(script_key_missing_forced)
+    if not forced_flag:
+        forced_flag = bool(metadata.get("script_key_missing_forced"))
+    existing_flag = payload_meta.get("script_key_missing_forced")
+    if isinstance(existing_flag, bool):
+        forced_flag = forced_flag or existing_flag
+    if forced_flag:
+        payload_meta["script_key_missing_forced"] = True
+        metadata["script_key_missing_forced"] = True
+    else:
+        payload_meta.pop("script_key_missing_forced", None)
+
+    provider_candidate = provider
+    if forced_flag:
+        provider_candidate = "missing_forced"
+    elif script_key_override:
+        provider_candidate = "override"
+    elif hint_label:
+        provider_candidate = hint_label
+    elif provider_candidate:
+        provider_candidate = provider_candidate
+    elif literal_key:
+        provider_candidate = "literal"
+    elif getattr(ctx, "bootstrapper_path", None) and script_key_value:
+        provider_candidate = "bootstrap"
+    elif script_key_value and provider_candidate is None:
+        provider_candidate = "heuristic"
+
+    if provider_candidate:
+        payload_meta["script_key_provider"] = provider_candidate
+
+    if script_key_value:
+        payload_meta.setdefault("script_key", script_key_value)
+        payload_meta.setdefault("script_key_length", len(script_key_value))
+
+    # Alphabet/opcode provenance --------------------------------------------
+    def _normalise_source_label(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        lowered = value.strip().lower()
+        mapping = {
+            "bootstrapper": "bootstrap",
+            "bootstrap": "bootstrap",
+            "manual_override": "manual_override",
+            "override": "manual_override",
+            "manual": "manual_override",
+            "default": "heuristic",
+            "auto": "heuristic",
+            "heuristic": "heuristic",
+        }
+        return mapping.get(lowered, lowered)
+
+    alphabet_source = _normalise_source_label(payload_meta.get("alphabet_source"))
+    if alphabet_source is None:
+        sources = metadata.get("chunk_alphabet_sources")
+        if isinstance(sources, list):
+            for candidate in reversed(sources):
+                if isinstance(candidate, str) and candidate.strip():
+                    alphabet_source = _normalise_source_label(candidate)
+                    if alphabet_source:
+                        break
+        manual_alphabet = getattr(ctx, "manual_alphabet", None)
+        if alphabet_source is None:
+            if isinstance(manual_alphabet, str) and manual_alphabet.strip():
+                alphabet_source = "manual_override"
+            elif getattr(ctx, "bootstrapper_path", None):
+                alphabet_source = "bootstrap"
+            else:
+                alphabet_source = "heuristic"
+        payload_meta["alphabet_source"] = alphabet_source
+    else:
+        payload_meta["alphabet_source"] = alphabet_source
+
+    opcode_source = _normalise_source_label(payload_meta.get("opcode_source"))
+    if opcode_source is None:
+        manual_opcode = getattr(ctx, "manual_opcode_map", None)
+        if isinstance(manual_opcode, Mapping) and manual_opcode:
+            opcode_source = "manual_override"
+        elif getattr(ctx, "bootstrapper_path", None):
+            opcode_source = "bootstrap"
+        else:
+            opcode_source = "heuristic"
+        payload_meta["opcode_source"] = opcode_source
+    else:
+        payload_meta["opcode_source"] = opcode_source
+
+    # Chunk statistics -------------------------------------------------------
+    chunk_count = metadata.get("chunk_count")
+    if not isinstance(chunk_count, int) or chunk_count <= 0:
+        chunk_count = metadata.get("handler_payload_chunks")
+    if isinstance(chunk_count, int) and chunk_count >= 0:
+        payload_meta.setdefault("chunk_count", chunk_count)
+
+    encoded_lengths = metadata.get("chunk_encoded_lengths")
+    if not isinstance(encoded_lengths, list):
+        encoded_lengths = metadata.get("handler_chunk_encoded_lengths")
+    if isinstance(encoded_lengths, list):
+        payload_meta.setdefault(
+            "chunk_encoded_lengths",
+            [int(value) for value in encoded_lengths if isinstance(value, int)],
+        )
+        payload_meta.setdefault("chunk_lengths", payload_meta.get("chunk_encoded_lengths", []))
+
+    decoded_lengths = metadata.get("chunk_decoded_bytes")
+    if not isinstance(decoded_lengths, list):
+        decoded_lengths = metadata.get("handler_chunk_decoded_bytes")
+    if isinstance(decoded_lengths, list):
+        payload_meta.setdefault(
+            "chunk_decoded_bytes",
+            [int(value) for value in decoded_lengths if isinstance(value, int)],
+        )
+
+    chunk_success = metadata.get("chunk_success_count")
+    if not isinstance(chunk_success, int):
+        chunk_success = metadata.get("handler_chunk_success_count")
+    if isinstance(chunk_success, int) and chunk_success >= 0:
+        payload_meta.setdefault("chunk_success_count", chunk_success)
+
+    # Decode metadata --------------------------------------------------------
+    decode_method = payload_meta.get("decode_method") or metadata.get("decode_method")
+    if decode_method:
+        payload_meta["decode_method"] = decode_method
+    elif metadata.get("chunk_count") or payload_meta.get("chunk_count"):
+        payload_meta.setdefault("decode_method", "base91")
+
+    if "index_xor" not in payload_meta:
+        payload_meta["index_xor"] = bool(script_key_value or metadata.get("chunk_count"))
+
+    # Bootstrapper provenance -------------------------------------------------
+    bootstrap_info = {}
+    if isinstance(payload_meta.get("bootstrapper"), dict):
+        bootstrap_info.update(payload_meta["bootstrapper"])
+
+    bootstrap_meta = metadata.get("bootstrapper")
+    if isinstance(bootstrap_meta, dict):
+        bootstrap_info.update({str(k): v for k, v in bootstrap_meta.items()})
+
+    path_value = bootstrap_info.get("path") or bootstrap_info.get("source")
+    if not path_value and getattr(ctx, "bootstrapper_path", None):
+        path_value = str(ctx.bootstrapper_path)
+    if path_value:
+        path_obj = Path(path_value)
+        if path_obj.is_dir():
+            for candidate_name in ("initv4.lua", "init.lua", "bootstrap.lua"):
+                candidate = path_obj / candidate_name
+                if candidate.exists():
+                    path_value = str(candidate)
+                    break
+        bootstrap_info["path"] = path_value
+
+    ctx_bootstrap_meta = getattr(ctx, "bootstrapper_metadata", None)
+    alphabet_length: Optional[int] = None
+    alphabet_preview: Optional[str] = None
+    opcode_entries: Optional[int] = None
+    opcode_sample: List[Dict[str, str]] = []
+    opcode_map_data: Optional[Dict[str, str]] = None
+
+    def _process_opcode_mapping(mapping: Mapping[Any, Any]) -> None:
+        nonlocal opcode_sample, opcode_map_data
+        converted: Dict[str, str] = {}
+        entries: List[Tuple[int, str]] = []
+        for raw_key, raw_value in mapping.items():
+            opcode_int: Optional[int] = None
+            name: Optional[str] = None
+
+            if isinstance(raw_key, (int, str)):
+                try:
+                    opcode_int = int(raw_key, 0) if isinstance(raw_key, str) else int(raw_key)
+                except (TypeError, ValueError):
+                    opcode_int = None
+                else:
+                    name = str(raw_value)
+
+            if opcode_int is None and isinstance(raw_value, (int, str)):
+                try:
+                    opcode_int = int(raw_value, 0) if isinstance(raw_value, str) else int(raw_value)
+                except (TypeError, ValueError):
+                    opcode_int = None
+                else:
+                    name = str(raw_key)
+
+            if opcode_int is None or name is None:
+                continue
+
+            entries.append((opcode_int, name))
+            key_hex = f"0x{opcode_int:02X}"
+            converted.setdefault(key_hex, name)
+        if not entries:
+            return
+        entries.sort(key=lambda item: item[0])
+        if not opcode_sample:
+            formatted: List[Dict[str, str]] = []
+            for opcode_int, name in entries[:10]:
+                formatted.append({f"0x{opcode_int:02X}": name})
+            opcode_sample = formatted
+        if opcode_map_data is None and converted:
+            opcode_map_data = converted
+
+    if isinstance(ctx_bootstrap_meta, Mapping):
+        for key in ("alphabet_length", "alphabet_len"):
+            raw = ctx_bootstrap_meta.get(key)
+            if isinstance(raw, int) and raw > 0:
+                alphabet_length = raw
+                break
+        preview_value = ctx_bootstrap_meta.get("alphabet_preview")
+        if isinstance(preview_value, str) and preview_value:
+            alphabet_preview = preview_value
+        map_block = ctx_bootstrap_meta.get("opcode_map")
+        if isinstance(map_block, Mapping) and map_block:
+            _process_opcode_mapping(map_block)
+            if opcode_entries is None:
+                opcode_entries = len(map_block)
+        sample_block = ctx_bootstrap_meta.get("opcode_map_sample")
+        if not opcode_sample and isinstance(sample_block, list):
+            formatted: List[Dict[str, str]] = []
+            for entry in sample_block:
+                if isinstance(entry, Mapping):
+                    formatted.append({str(k): str(v) for k, v in entry.items()})
+            if formatted:
+                opcode_sample = formatted
+        if alphabet_length is None:
+            alphabet_block = ctx_bootstrap_meta.get("alphabet")
+            if isinstance(alphabet_block, Mapping):
+                length_value = alphabet_block.get("length")
+                if isinstance(length_value, int) and length_value > 0:
+                    alphabet_length = length_value
+                else:
+                    value = alphabet_block.get("value")
+                    if isinstance(value, str) and value:
+                        alphabet_length = len(value)
+                        alphabet_preview = value[:32] + ("..." if len(value) > 32 else "")
+
+        dispatch = ctx_bootstrap_meta.get("opcode_dispatch")
+        if isinstance(dispatch, Mapping):
+            count = dispatch.get("count")
+            if isinstance(count, int) and count >= 0:
+                opcode_entries = count
+            mapping = dispatch.get("mapping")
+            if opcode_entries is None and isinstance(mapping, Mapping):
+                opcode_entries = len(mapping)
+            if isinstance(mapping, Mapping):
+                _process_opcode_mapping(mapping)
+
+    if (alphabet_length is None or opcode_entries is None) and path_value:
+        try:
+            from ..versions.initv4 import InitV4Bootstrap, _BASE_OPCODE_SPECS  # type: ignore
+        except Exception:  # pragma: no cover - optional dependency
+            pass
+        else:
+            try:
+                bootstrap = InitV4Bootstrap.load(path_value)
+            except Exception:  # pragma: no cover - best effort
+                bootstrap = None
+            if bootstrap is not None:
+                try:
+                    alphabet_candidate = bootstrap.alphabet()
+                except Exception:  # pragma: no cover - best effort
+                    alphabet_candidate = None
+                if alphabet_length is None:
+                    meta_length = bootstrap.metadata.get("alphabet_length")
+                    if isinstance(meta_length, int) and meta_length > 0:
+                        alphabet_length = meta_length
+                        alphabet_value = bootstrap.metadata.get("alphabet")
+                        if isinstance(alphabet_value, Mapping):
+                            value_text = alphabet_value.get("value")
+                            if isinstance(value_text, str) and value_text:
+                                alphabet_preview = value_text[:32] + ("..." if len(value_text) > 32 else "")
+                        if alphabet_preview is None and isinstance(alphabet_candidate, str) and alphabet_candidate:
+                            alphabet_preview = alphabet_candidate[:32] + ("..." if len(alphabet_candidate) > 32 else "")
+                    elif isinstance(alphabet_candidate, str) and alphabet_candidate:
+                        alphabet_length = len(alphabet_candidate)
+                        alphabet_preview = alphabet_candidate[:32] + ("..." if len(alphabet_candidate) > 32 else "")
+                if opcode_entries is None:
+                    try:
+                        mapping = bootstrap.opcode_mapping(_BASE_OPCODE_SPECS)
+                    except Exception:  # pragma: no cover - best effort
+                        mapping = None
+                    if isinstance(mapping, Mapping) and mapping:
+                        opcode_entries = len(mapping)
+                        _process_opcode_mapping(mapping)
+                    else:
+                        meta_count = bootstrap.metadata.get("opcode_map_entries")
+                        if isinstance(meta_count, int) and meta_count > 0:
+                            opcode_entries = meta_count
+                            mapping_meta = bootstrap.metadata.get("opcode_dispatch")
+                            if isinstance(mapping_meta, Mapping):
+                                mapping_value = mapping_meta.get("mapping")
+                                if isinstance(mapping_value, Mapping):
+                                    _process_opcode_mapping(mapping_value)
+
+    if alphabet_length:
+        bootstrap_info.setdefault("alphabet_length", alphabet_length)
+        if alphabet_preview:
+            bootstrap_info.setdefault("alphabet_preview", alphabet_preview)
+    if opcode_entries:
+        bootstrap_info.setdefault("opcode_map_entries", opcode_entries)
+    if opcode_sample and "opcode_map_sample" not in bootstrap_info:
+        bootstrap_info["opcode_map_sample"] = opcode_sample
+    if opcode_map_data and "opcode_map" not in bootstrap_info:
+        bootstrap_info["opcode_map"] = opcode_map_data
+
+    if bootstrap_info:
+        payload_meta["bootstrapper"] = bootstrap_info
+
+    if alphabet_length or opcode_entries:
+        existing_bootstrap_meta = metadata.get("bootstrapper_metadata")
+        if isinstance(existing_bootstrap_meta, Mapping):
+            bootstrap_meta = dict(existing_bootstrap_meta)
+        else:
+            bootstrap_meta = {}
+        if alphabet_length and "alphabet_len" not in bootstrap_meta:
+            bootstrap_meta["alphabet_len"] = alphabet_length
+        if alphabet_length and "alphabet_length" not in bootstrap_meta:
+            bootstrap_meta["alphabet_length"] = alphabet_length
+        if alphabet_preview and "alphabet_preview" not in bootstrap_meta:
+            bootstrap_meta["alphabet_preview"] = alphabet_preview
+        if opcode_entries and "opcode_map_count" not in bootstrap_meta:
+            bootstrap_meta["opcode_map_count"] = opcode_entries
+        if opcode_sample and "opcode_map_sample" not in bootstrap_meta:
+            bootstrap_meta["opcode_map_sample"] = opcode_sample
+        if opcode_map_data and "opcode_map" not in bootstrap_meta:
+            bootstrap_meta["opcode_map"] = opcode_map_data
+        if bootstrap_meta:
+            metadata["bootstrapper_metadata"] = bootstrap_meta
+            try:
+                current_ctx_meta = getattr(ctx, "bootstrapper_metadata")
+            except AttributeError:
+                current_ctx_meta = None
+            if isinstance(current_ctx_meta, Mapping):
+                merged_ctx_meta = dict(current_ctx_meta)
+                merged_ctx_meta.update(bootstrap_meta)
+                setattr(ctx, "bootstrapper_metadata", merged_ctx_meta)
+            else:
+                setattr(ctx, "bootstrapper_metadata", dict(bootstrap_meta))
+
+
 def _unique_ordered(values: Iterable[Any]) -> List[Any]:
     seen: Set[Any] = set()
     ordered: List[Any] = []
@@ -1004,9 +2036,28 @@ def _finalise_metadata(
     last_meta: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if not aggregate:
-        return dict(last_meta or {})
+        final = dict(last_meta or {})
+        if "handler_payload_meta" in final:
+            payload_meta = final.get("handler_payload_meta")
+            if not isinstance(payload_meta, dict):
+                final["handler_payload_meta"] = {}
+        return final
 
     final = dict(aggregate)
+
+    if "handler_payload_meta" in final or (
+        isinstance(last_meta, dict) and "handler_payload_meta" in last_meta
+    ):
+        payload_meta: Dict[str, Any] = {}
+        current_meta = final.get("handler_payload_meta")
+        if isinstance(current_meta, dict):
+            payload_meta.update(current_meta)
+        if isinstance(last_meta, dict):
+            previous_meta = last_meta.get("handler_payload_meta")
+            if isinstance(previous_meta, dict):
+                for key, value in previous_meta.items():
+                    payload_meta.setdefault(key, value)
+        final["handler_payload_meta"] = payload_meta
 
     if last_meta:
         if last_meta.get("script_payload"):
@@ -1074,6 +2125,12 @@ def _has_remaining_payload(text: str, version: Any) -> bool:
         LOG.debug("failed to probe payload for %s: %s", version_name, exc)
         return False
     if payload is None:
+        if (
+            isinstance(version_name, str)
+            and "initv4" in version_name.lower()
+            and _INITV4_PAYLOAD_RE.search(text)
+        ):
+            return True
         return False
     if isinstance(payload.data, (dict, list)):
         return True
@@ -1107,6 +2164,22 @@ def run(ctx: "Context") -> Dict[str, Any]:
     if not isinstance(script_key, str) and isinstance(ctx.options, dict):
         script_key = ctx.options.get("script_key")
 
+    if isinstance(script_key, str):
+        script_key = script_key.strip()
+        if not script_key:
+            script_key = None
+    if isinstance(script_key, str) and script_key:
+        try:
+            ctx.script_key = script_key
+        except Exception:  # pragma: no cover - defensive
+            pass
+        report_obj = getattr(ctx, "report", None)
+        if report_obj is not None and not getattr(report_obj, "script_key_used", None):
+            try:
+                report_obj.script_key_used = script_key
+            except Exception:  # pragma: no cover - defensive
+                pass
+
     force_mode = bool(getattr(ctx, "force", False))
     if isinstance(ctx.options, dict):
         force_mode = bool(ctx.options.get("force")) or force_mode
@@ -1134,6 +2207,28 @@ def run(ctx: "Context") -> Dict[str, Any]:
             warnings = chunk_meta.get("warnings")
             if warnings:
                 aggregated.setdefault("warnings", []).extend(str(msg) for msg in warnings)
+            payload_meta_hint = chunk_meta.get("handler_payload_meta")
+            if (not isinstance(script_key, str) or not script_key) and isinstance(
+                payload_meta_hint, Mapping
+            ):
+                auto_key = payload_meta_hint.get("script_key")
+                if isinstance(auto_key, str) and auto_key.strip():
+                    script_key = auto_key.strip()
+                    try:
+                        ctx.script_key = script_key
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    options = getattr(ctx, "options", None)
+                    if isinstance(options, dict) and not options.get("script_key"):
+                        options["script_key"] = script_key
+                    report_obj = getattr(ctx, "report", None)
+                    if report_obj is not None and not getattr(
+                        report_obj, "script_key_used", None
+                    ):
+                        try:
+                            report_obj.script_key_used = script_key
+                        except Exception:  # pragma: no cover - defensive
+                            pass
 
     for iteration in range(iteration_limit):
         current_source = final_output
@@ -1161,6 +2256,33 @@ def run(ctx: "Context") -> Dict[str, Any]:
         if changed:
             final_output = output_text
         ctx.stage_output = final_output
+
+        if (
+            isinstance(current_version.name, str)
+            and current_version.name.startswith("luraph_v14_4")
+        ):
+            post_chunks, post_text, post_meta = _iterative_initv4_decode(
+                ctx,
+                final_output,
+                script_key=script_key if isinstance(script_key, str) else None,
+                max_iterations=1,
+                force=force_mode,
+            )
+            if post_chunks:
+                aggregated.setdefault("decoded_chunks", []).extend(post_chunks)
+            if post_meta:
+                _merge_payload_meta(aggregated, post_meta)
+                warnings = post_meta.get("warnings")
+                if warnings:
+                    aggregated.setdefault("warnings", []).extend(
+                        str(message) for message in warnings
+                    )
+            if post_text != final_output and post_text:
+                final_output = post_text
+                ctx.stage_output = final_output
+                if not ctx.decoded_payloads or ctx.decoded_payloads[-1] != final_output:
+                    ctx.decoded_payloads.append(final_output)
+                changed = True
 
         iteration_metadata: Dict[str, Any] = dict(result.metadata)
         vm_ir = iteration_metadata.pop("vm_ir", None)
@@ -1302,6 +2424,91 @@ def run(ctx: "Context") -> Dict[str, Any]:
             if not ctx.decoded_payloads or ctx.decoded_payloads[-1] != final_output:
                 ctx.decoded_payloads.append(final_output)
 
+    decoded_simple = _decode_simple_bootstrap(final_output, script_key_value)
+    if decoded_simple and decoded_simple != final_output:
+        final_output = decoded_simple
+        ctx.stage_output = final_output
+        ctx.working_text = final_output
+        metadata["script_payload"] = True
+        metadata.setdefault("decode_method", "base91")
+        if not ctx.decoded_payloads or ctx.decoded_payloads[-1] != final_output:
+            ctx.decoded_payloads.append(final_output)
+        if ctx.report is not None:
+            ctx.report.blob_count = max(ctx.report.blob_count, len(ctx.decoded_payloads))
+            if final_output:
+                ctx.report.decoded_bytes = max(
+                    ctx.report.decoded_bytes,
+                    sum(len(entry.encode("utf-8")) for entry in ctx.decoded_payloads),
+                )
+
+    chunk_outputs = _persist_chunk_outputs(ctx, final_output)
+    if chunk_outputs:
+        metadata.setdefault("chunk_output_paths", list(chunk_outputs))
+        ctx.result.setdefault("artifacts", {})
+        artifacts = ctx.result["artifacts"]
+        if isinstance(artifacts, dict):
+            chunk_bucket = artifacts.setdefault("chunk_outputs", [])
+            if isinstance(chunk_bucket, list):
+                for path in chunk_outputs:
+                    if path not in chunk_bucket:
+                        chunk_bucket.append(path)
+            else:
+                artifacts["chunk_outputs"] = list(chunk_outputs)
+
+    decoded_output_paths = metadata.get("decoded_output_paths")
+    if not (
+        isinstance(decoded_output_paths, list) and any(decoded_output_paths)
+    ):
+        persisted_final = _persist_decoded_outputs(
+            ctx,
+            final_output,
+            None,
+            chunk_index=0,
+        )
+        if persisted_final:
+            lua_path = persisted_final.get("lua")
+            json_path = persisted_final.get("json")
+            if lua_path:
+                metadata.setdefault("decoded_output_paths", []).append(lua_path)
+            if json_path:
+                metadata.setdefault("unpacked_dump_paths", []).append(json_path)
+
+    _populate_payload_summary(
+        ctx,
+        metadata,
+        script_key_value=script_key_value,
+        script_key_override=bool(metadata.get("script_key_override")),
+        script_key_missing_forced=bool(getattr(ctx, "script_key_missing_forced", False)),
+    )
+
+    placeholder_blob = _ensure_bootstrap_blob_placeholder(
+        getattr(ctx, "bootstrapper_path", None)
+    )
+    if placeholder_blob:
+        metadata.setdefault("bootstrapper_blob_b64", placeholder_blob)
+        ctx.result.setdefault("artifacts", {})
+        artifacts = ctx.result["artifacts"]
+        if isinstance(artifacts, dict):
+            blob_bucket = artifacts.setdefault("bootstrap_blob_b64", [])
+            if isinstance(blob_bucket, list):
+                if placeholder_blob not in blob_bucket:
+                    blob_bucket.append(placeholder_blob)
+            else:
+                artifacts["bootstrap_blob_b64"] = [placeholder_blob]
+
+    summary_artifacts = _ensure_summary_artifacts(metadata)
+    if summary_artifacts.get("unpacked_json"):
+        metadata.setdefault("unpacked_json_path", summary_artifacts["unpacked_json"])
+        ctx.result.setdefault("artifacts", {})
+        artifacts = ctx.result["artifacts"]
+        if isinstance(artifacts, dict):
+            unpacked_bucket = artifacts.setdefault("unpacked_json", [])
+            if isinstance(unpacked_bucket, list):
+                if summary_artifacts["unpacked_json"] not in unpacked_bucket:
+                    unpacked_bucket.append(summary_artifacts["unpacked_json"])
+            else:
+                artifacts["unpacked_json"] = [summary_artifacts["unpacked_json"]]
+
     const_pool = ctx.vm.const_pool or []
     if const_pool:
         jump_meta = _detect_jump_table(const_pool)
@@ -1348,9 +2555,18 @@ def run(ctx: "Context") -> Dict[str, Any]:
                 value for value in chunk_encoded_raw if isinstance(value, int) and value >= 0
             ]
 
+        chunk_success: Optional[int] = metadata.get("handler_chunk_success_count")
+        if not isinstance(chunk_success, int) or chunk_success < 0:
+            chunk_success = None
+            payload_meta_snapshot = metadata.get("handler_payload_meta")
+            if isinstance(payload_meta_snapshot, Mapping):
+                success_candidate = payload_meta_snapshot.get("chunk_success_count")
+                if isinstance(success_candidate, int) and success_candidate >= 0:
+                    chunk_success = success_candidate
+
         chunk_count = metadata.get("handler_payload_chunks")
         if isinstance(chunk_count, int) and chunk_count > 0:
-            report.blob_count = chunk_count
+            report.blob_count = chunk_success if chunk_success is not None else chunk_count
             if chunk_decoded:
                 report.decoded_bytes = sum(chunk_decoded)
                 decoded_warning = "Decoded chunk sizes (bytes): " + ", ".join(
@@ -1364,7 +2580,9 @@ def run(ctx: "Context") -> Dict[str, Any]:
                 report.decoded_bytes = sum(chunk_encoded)
         else:
             if chunk_decoded:
-                report.blob_count = len(chunk_decoded)
+                report.blob_count = chunk_success if chunk_success is not None else len(
+                    chunk_decoded
+                )
                 report.decoded_bytes = sum(chunk_decoded)
                 decoded_warning = "Decoded chunk sizes (bytes): " + ", ".join(
                     str(value) for value in chunk_decoded
@@ -1372,12 +2590,59 @@ def run(ctx: "Context") -> Dict[str, Any]:
                 if decoded_warning not in report.warnings:
                     report.warnings.append(decoded_warning)
             elif lengths:
-                report.blob_count = len(lengths)
+                report.blob_count = chunk_success if chunk_success is not None else len(
+                    lengths
+                )
                 report.decoded_bytes = sum(lengths)
+            elif chunk_success is not None:
+                report.blob_count = chunk_success
 
         warnings = metadata.get("warnings")
         if isinstance(warnings, list):
             report.warnings.extend(str(item) for item in warnings if item)
+
+    chunk_count_value = metadata.get("handler_payload_chunks")
+    if not isinstance(chunk_count_value, int) or chunk_count_value <= 0:
+        payload_meta_snapshot = metadata.get("handler_payload_meta")
+        if isinstance(payload_meta_snapshot, Mapping):
+            raw_count = payload_meta_snapshot.get("chunk_count")
+            if isinstance(raw_count, int) and raw_count > 0:
+                chunk_count_value = raw_count
+
+    chunk_success_value: Optional[int] = metadata.get("handler_chunk_success_count")
+    if not isinstance(chunk_success_value, int) or chunk_success_value < 0:
+        chunk_success_value = None
+        payload_meta_snapshot = metadata.get("handler_payload_meta")
+        if isinstance(payload_meta_snapshot, Mapping):
+            raw_success = payload_meta_snapshot.get("chunk_success_count")
+            if isinstance(raw_success, int) and raw_success >= 0:
+                chunk_success_value = raw_success
+
+    if isinstance(chunk_count_value, int) and chunk_count_value > 0:
+        metadata["payload_iterations"] = max(
+            metadata.get("payload_iterations", 1), chunk_count_value
+        )
+        if ctx.report is not None:
+            effective_blob_count = (
+                chunk_success_value
+                if isinstance(chunk_success_value, int) and chunk_success_value >= 0
+                else chunk_count_value
+            )
+            ctx.report.blob_count = max(ctx.report.blob_count, effective_blob_count)
+
+    if ctx.decoded_payloads:
+        metadata["payload_iterations"] = max(
+            metadata.get("payload_iterations", 1), len(ctx.decoded_payloads)
+        )
+        if ctx.report is not None:
+            ctx.report.blob_count = max(ctx.report.blob_count, len(ctx.decoded_payloads))
+
+    if "handler_payload_meta" in metadata:
+        payload_meta_final = metadata.get("handler_payload_meta")
+        if isinstance(payload_meta_final, dict):
+            metadata["handler_payload_meta"] = dict(payload_meta_final)
+        else:
+            metadata["handler_payload_meta"] = {}
 
     return metadata
 

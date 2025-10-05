@@ -54,9 +54,9 @@ def _prepare_environment(out_dir: Path) -> dict:
     env = os.environ.copy()
     lua_path = env.get("LUA_PATH", "")
     shim_paths = [
-        str(REPO_ROOT / "tools" / "?.lua"),
-        str(REPO_ROOT / "tools" / "?/init.lua"),
-        str(REPO_ROOT / "tools" / "shims" / "?.lua"),
+        os.path.join(str(REPO_ROOT), "tools", "?.lua"),
+        os.path.join(str(REPO_ROOT), "tools", "?", "init.lua"),
+        os.path.join(str(REPO_ROOT), "tools", "shims", "?.lua"),
     ]
     path_sep = ";" if os.name == "nt" else ":"
     lua_path = path_sep.join(shim_paths + ([lua_path] if lua_path else []))
