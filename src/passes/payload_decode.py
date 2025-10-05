@@ -1129,6 +1129,24 @@ def _iterative_initv4_decode(
         else:
             aggregate_meta["payload_iteration_changes"] = [True] * iteration_count
 
+        payload_meta = aggregate_meta.setdefault("handler_payload_meta", {})
+        existing_iterations = payload_meta.get("payload_iterations")
+        if isinstance(existing_iterations, int):
+            payload_meta["payload_iterations"] = max(existing_iterations, iteration_count)
+        else:
+            payload_meta["payload_iterations"] = iteration_count
+
+        if iteration_versions:
+            version_bucket = payload_meta.setdefault("payload_iteration_versions", [])
+            for version_name in iteration_versions:
+                if version_name:
+                    version_bucket.append(version_name)
+
+        if iteration_changes:
+            change_bucket = payload_meta.setdefault("payload_iteration_changes", [])
+            for change in iteration_changes:
+                change_bucket.append(bool(change))
+
     return decoded_chunks, current_text, aggregate_meta
 
 
