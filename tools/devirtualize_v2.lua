@@ -95,6 +95,35 @@ local function write_file(name, data)
   f:close()
 end
 
+local function normalise_newlines(text)
+  if type(text) ~= "string" then
+    return ""
+  end
+  text = text:gsub("\r\n", "\n")
+  if not text:match("\n$") then
+    text = text .. "\n"
+  end
+  return text
+end
+
+local function placeholder_lua(unpacked)
+  local instr_count = 0
+  if type(unpacked) == "table" then
+    local instrs = unpacked[4]
+    if type(instrs) == "table" then
+      instr_count = #instrs
+    end
+  end
+  local lines = {
+    "function __deob_initv4_placeholder__()",
+    string.format("  -- failed to decode initv4 chunk; instructions=%d", instr_count or 0),
+    "end",
+    "",
+    "return __deob_initv4_placeholder__",
+  }
+  return table.concat(lines, "\n")
+end
+
 local has_cjson, cjson = pcall(require, "cjson")
 
 local JSON_NULL = {}
@@ -259,8 +288,21 @@ arg = arg or {}
 arg[1] = arg[1] or SCRIPT_KEY
 arg[2] = arg[2] or "Obfuscated.json"
 
--- 0) Load bootstrap (many initv4 auto-run the VM)
-dofile("initv4.lua")
+local bootstrap_result = dofile("initv4.lua")
+
+local decoded_text = nil
+if type(bootstrap_result) == "string" and #bootstrap_result > 0 then
+  decoded_text = bootstrap_result
+end
+if not decoded_text and type(_G.decoded_output) == "string" and #_G.decoded_output > 0 then
+  decoded_text = _G.decoded_output
+end
+if not decoded_text and type(getgenv) == "function" then
+  local env = getgenv()
+  if type(env) == "table" and type(env.decoded_output) == "string" and #env.decoded_output > 0 then
+    decoded_text = env.decoded_output
+  end
+end
 
 -- A) Direct call path if available (most robust)
 local unpack_fn = rawget(_G, "LPH_UnpackData")
@@ -338,3 +380,11 @@ if lifter and lifter.lift then
     print("[ok] wrote lift_ir.lua, lift_report.txt, lift_inferred.lua")
   end
 end
+
+local final_lua = decoded_text
+if type(final_lua) ~= "string" or #final_lua == 0 then
+  final_lua = placeholder_lua(captured_unpacked)
+end
+
+write_file("decoded_output.lua", normalise_newlines(final_lua))
+print("[ok] wrote decoded_output.lua")
