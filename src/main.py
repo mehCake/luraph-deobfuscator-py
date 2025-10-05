@@ -1340,6 +1340,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("\n=== Deobfuscation Report ===")
             print(report.to_text())
 
+        if not args.detect_only:
+            blob_count = 0
+            decoded_total = 0
+            if report is not None:
+                blob_count = max(blob_count, report.blob_count)
+                decoded_total = max(decoded_total, report.decoded_bytes)
+
+            payload_summary = final_ctx.pass_metadata.get("payload_decode")
+            if isinstance(payload_summary, Mapping):
+                handler_meta = payload_summary.get("handler_payload_meta")
+                if isinstance(handler_meta, Mapping):
+                    chunk_count = handler_meta.get("chunk_count")
+                    if isinstance(chunk_count, int) and chunk_count >= 0:
+                        blob_count = max(blob_count, chunk_count)
+                    decoded_lengths = handler_meta.get("chunk_decoded_bytes")
+                    if isinstance(decoded_lengths, list):
+                        lengths = [
+                            int(value)
+                            for value in decoded_lengths
+                            if isinstance(value, (int, float))
+                        ]
+                        if lengths:
+                            decoded_total = max(decoded_total, int(sum(lengths)))
+
+            if not blob_count and final_ctx.decoded_payloads:
+                blob_count = max(blob_count, len(final_ctx.decoded_payloads))
+
+            message = f"Decoded {blob_count} blobs"
+            if decoded_total > 0:
+                message += f", total {decoded_total} bytes"
+            print(message)
+
         if dump_ir_target and final_ctx:
             if dump_ir_is_directory:
                 ir_path = dump_ir_target / f"{item.source.stem}.ir"

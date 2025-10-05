@@ -779,6 +779,7 @@ def _iterative_initv4_decode(
             break
 
         progress = False
+        processed_chunks = 0
         for blob in payloads:
             if not isinstance(blob, str):
                 continue
@@ -994,11 +995,13 @@ def _iterative_initv4_decode(
             )
             current_text = current_text.replace(blob, replacement, 1)
             progress = True
+            processed_chunks += 1
 
         if progress:
-            iteration_count += 1
-            iteration_versions.append(detected_version)
-            iteration_changes.append(True)
+            increment = processed_chunks or 1
+            iteration_count += increment
+            iteration_versions.extend([detected_version] * increment)
+            iteration_changes.extend([True] * increment)
         else:
             break
 
@@ -2231,6 +2234,24 @@ def run(ctx: "Context") -> Dict[str, Any]:
             else:
                 artifacts["chunk_outputs"] = list(chunk_outputs)
 
+    decoded_output_paths = metadata.get("decoded_output_paths")
+    if not (
+        isinstance(decoded_output_paths, list) and any(decoded_output_paths)
+    ):
+        persisted_final = _persist_decoded_outputs(
+            ctx,
+            final_output,
+            None,
+            chunk_index=0,
+        )
+        if persisted_final:
+            lua_path = persisted_final.get("lua")
+            json_path = persisted_final.get("json")
+            if lua_path:
+                metadata.setdefault("decoded_output_paths", []).append(lua_path)
+            if json_path:
+                metadata.setdefault("unpacked_dump_paths", []).append(json_path)
+
     _populate_payload_summary(
         ctx,
         metadata,
@@ -2342,6 +2363,20 @@ def run(ctx: "Context") -> Dict[str, Any]:
         warnings = metadata.get("warnings")
         if isinstance(warnings, list):
             report.warnings.extend(str(item) for item in warnings if item)
+
+    chunk_count_value = metadata.get("handler_payload_chunks")
+    if not isinstance(chunk_count_value, int) or chunk_count_value <= 0:
+        payload_meta_snapshot = metadata.get("handler_payload_meta")
+        if isinstance(payload_meta_snapshot, Mapping):
+            raw_count = payload_meta_snapshot.get("chunk_count")
+            if isinstance(raw_count, int) and raw_count > 0:
+                chunk_count_value = raw_count
+    if isinstance(chunk_count_value, int) and chunk_count_value > 0:
+        metadata["payload_iterations"] = max(
+            metadata.get("payload_iterations", 1), chunk_count_value
+        )
+        if ctx.report is not None:
+            ctx.report.blob_count = max(ctx.report.blob_count, chunk_count_value)
 
     if ctx.decoded_payloads:
         metadata["payload_iterations"] = max(
