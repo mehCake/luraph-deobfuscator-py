@@ -13,6 +13,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TYP
 
 from .. import utils
 from ..utils import write_text
+from ..lifter.encfunc import (
+    coerce_bytes as encfunc_coerce_bytes,
+    coerce_key_bytes as encfunc_coerce_key_bytes,
+    extract_encfunc_blob,
+    rehydrate_encfunc,
+)
 from ..deobfuscator import VMIR
 from ..versions import PayloadInfo, VersionHandler, get_handler
 from ..versions.luraph_v14_4_1 import looks_like_vm_bytecode
@@ -210,6 +216,71 @@ def _prepare_lua_artifact(
         newline=newline,
         extra_comments=extra_comments,
     )
+
+
+def _rehydrate_vm_prototypes(
+    payload_mapping: Mapping[str, Any],
+    *,
+    key_bytes: bytes,
+    decryptor_spec: Any,
+) -> List[Dict[str, Any]]:
+    prototypes = payload_mapping.get("prototypes")
+    if not isinstance(prototypes, list):
+        return []
+
+    recovered: List[Dict[str, Any]] = []
+
+    def _process(proto_list: List[Any], ancestry: Tuple[int, ...]) -> None:
+        for index, proto in enumerate(list(proto_list)):
+            blob = extract_encfunc_blob(proto)
+            if blob:
+                data_bytes = encfunc_coerce_bytes(blob.get("data"))
+                if data_bytes is None:
+                    continue
+                blob_key = encfunc_coerce_key_bytes(blob.get("key")) or key_bytes
+                header = blob.get("header") if isinstance(blob.get("header"), Mapping) else {}
+                spec_candidates: List[Any] = []
+                if decryptor_spec:
+                    spec_candidates.append(decryptor_spec)
+                method = blob.get("method")
+                if method:
+                    spec_candidates.append(method)
+                if header:
+                    for hint in ("method", "cipher", "type"):
+                        value = header.get(hint)
+                        if value:
+                            spec_candidates.append(value)
+                result = rehydrate_encfunc(data_bytes, blob_key, spec_candidates)
+                detail: Dict[str, Any] = {
+                    "index": index,
+                    "recovery_method": result.recovery_method,
+                    "confidence": result.confidence,
+                }
+                decoded_with = result.metadata.get("decoded_with")
+                if decoded_with:
+                    detail["decoded_with"] = decoded_with
+                if ancestry:
+                    detail["path"] = list(ancestry)
+                recovered.append(detail)
+                if result.proto:
+                    proto_list[index] = result.proto
+                    nested = result.proto.get("prototypes") if isinstance(result.proto, Mapping) else None
+                    if isinstance(nested, list):
+                        _process(nested, (*ancestry, index))
+                elif result.lua_source:
+                    proto_list[index] = {"lua_source": result.lua_source}
+                elif result.raw_bytes is not None:
+                    proto_list[index] = {
+                        "raw_bytes_b64": base64.b64encode(result.raw_bytes).decode("ascii")
+                    }
+                continue
+            if isinstance(proto, Mapping):
+                nested = proto.get("prototypes")
+                if isinstance(nested, list):
+                    _process(nested, (*ancestry, index))
+
+    _process(prototypes, ())
+    return recovered
 
 
 def _detect_jump_table(constants: Iterable[Any]) -> Optional[Dict[str, Any]]:
@@ -1157,6 +1228,38 @@ def _iterative_initv4_decode(
                         vm_summary["bytecode"] = len(bytecode_listing)
                     if isinstance(prototypes, list):
                         vm_summary["prototypes"] = len(prototypes)
+
+                    encfunc_spec: Any = None
+                    bootstrap_meta_ctx = getattr(ctx, "bootstrapper_metadata", None)
+                    if isinstance(bootstrap_meta_ctx, Mapping):
+                        for key in (
+                            "encfunc_decryptor",
+                            "encfunc_decryptors",
+                            "encfunc",
+                            "encfunc_method",
+                        ):
+                            if bootstrap_meta_ctx.get(key) is not None:
+                                encfunc_spec = bootstrap_meta_ctx.get(key)
+                                break
+
+                    rehydrated_details = _rehydrate_vm_prototypes(
+                        payload_mapping,
+                        key_bytes=key_bytes,
+                        decryptor_spec=encfunc_spec,
+                    )
+                    if rehydrated_details:
+                        chunk_record.setdefault("rehydrated_functions", 0)
+                        chunk_record["rehydrated_functions"] += len(rehydrated_details)
+                        chunk_record.setdefault("rehydrated_details", []).extend(rehydrated_details)
+                        metadata_bucket = payload_mapping.get("metadata")
+                        if not isinstance(metadata_bucket, Mapping):
+                            metadata_bucket = {}
+                        else:
+                            metadata_bucket = dict(metadata_bucket)
+                        encfunc_meta = metadata_bucket.setdefault("encfunc", {})
+                        details_bucket = encfunc_meta.setdefault("rehydrated_details", [])
+                        details_bucket.extend(rehydrated_details)
+                        payload_mapping["metadata"] = metadata_bucket
 
                     try:
                         if opcode_lifter is None:
