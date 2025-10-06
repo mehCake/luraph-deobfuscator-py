@@ -14,7 +14,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from lua_literal_parser import LuaTable, parse_lua_expression
 
 from src.utils.luraph_vm import canonicalise_opcode_name
-from src.lifter.cfg import CFGBuilder, StructuredEmitter
+from src.lifter.cfg import CFGBuilder
+from src.lifter.emit_structured import StructuredEmitter
 from src.lifter.emulator import VMEmulator
 
 LOG = logging.getLogger(__name__)
@@ -774,7 +775,6 @@ class _LiftContext(VMEmulator):
         emitter = StructuredEmitter(
             cfg,
             translations,
-            instruction_records,
         )
         structured_lines, instruction_lua = emitter.emit()
 
