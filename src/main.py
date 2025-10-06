@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline, utils
+from .cli import reporting as cli_reporting
+from .utils import write_text
 from .deobfuscator import LuaDeobfuscator
 from .lph_reader import read_lph_blob
 from .passes.preprocess import flatten_json_to_lua
@@ -928,7 +930,7 @@ def _build_json_payload(
                     trace_path_obj.parent.mkdir(parents=True, exist_ok=True)
                     if not trace_path_obj.exists():
                         try:
-                            trace_path_obj.write_text("", encoding="utf-8")
+                            write_text(trace_path_obj, "")
                         except OSError:
                             pass
                 bootstrap_summary["artifact_paths"] = artifact_paths
@@ -1135,6 +1137,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--artifact-only",
         action="store_true",
         help="generate intermediate artifacts without running the full reconstruction",
+    )
+    parser.add_argument(
+        "--run-lifter",
+        action="store_true",
+        help="run the VM lifter and emit reconstructed Lua artifacts",
+    )
+    parser.add_argument(
+        "--lifter-mode",
+        choices=("fast", "accurate"),
+        default="accurate",
+        help="select the lifter backend (fast: micro-IR, accurate: emulator)",
+    )
+    parser.add_argument(
+        "--lifter-debug",
+        action="store_true",
+        help="write lifter debug artifacts to out/debug/<input_name>/",
     )
     parser.add_argument(
         "--step-limit",
@@ -1414,6 +1432,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "chunk_lines": max(1, args.chunk_lines),
                         "render_chunk_lines": max(1, args.chunk_lines),
                         "script_key_source": script_key_source,
+                        "run_lifter": bool(args.run_lifter),
+                        "lifter_mode": args.lifter_mode,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()
@@ -1460,6 +1480,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             bucket_value = final_ctx.vm_metadata.get(bucket_name)
             if not isinstance(bucket_value, dict):
                 final_ctx.vm_metadata[bucket_name] = {}
+        lifter_summary: Dict[str, Any] = {}
+        if args.run_lifter:
+            lifter_summary = cli_reporting.run_lifter_for_cli(
+                final_ctx,
+                source_path=item.source,
+                output_path=item.destination,
+                mode=args.lifter_mode,
+                debug=args.lifter_debug,
+            )
+            metadata = lifter_summary.get("metadata", {})
+            lifter_meta = final_ctx.vm_metadata.setdefault("lifter", {})
+            if isinstance(metadata, Mapping):
+                lifter_meta.update(metadata)
+            else:
+                lifter_meta.setdefault("mode", args.lifter_mode)
+            artifacts = lifter_summary.get("artifacts")
+            if isinstance(artifacts, Mapping) and artifacts:
+                lifter_meta["artifacts"] = dict(artifacts)
+                final_ctx.result.setdefault("artifacts", {})["lifter"] = dict(artifacts)
+            lift_meta_payload = lifter_summary.get("lift_metadata")
+            if isinstance(lift_meta_payload, Mapping):
+                final_ctx.result["lift_metadata"] = dict(lift_meta_payload)
+            stack_entries = lifter_summary.get("stack_trace")
+            if isinstance(stack_entries, Sequence):
+                entry_count = len(stack_entries)
+                lifter_meta["stack_entries"] = entry_count
+                final_ctx.result["lift_stack_entries"] = entry_count
         if not isinstance(final_ctx.pass_metadata, dict):
             final_ctx.pass_metadata = {}
         payload_bucket = final_ctx.pass_metadata.get("payload_decode")

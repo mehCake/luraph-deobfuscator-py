@@ -24,7 +24,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from src import detect_protections, protections
 from src.runtime_capture import trace_to_unpacked
-from src.runtime_capture.luajit_paths import find_luajit
+from src.runtime_capture.luajit_paths import build_luajit_command, find_luajit
+from src.utils import write_json, write_text
 
 
 def _log(message: str, level: str = "INFO") -> None:
@@ -59,7 +60,7 @@ def _write_failure(out_dir: Path, message: str, details: str = "") -> None:
     if details:
         contents.append("")
         contents.append(details)
-    failure_path.write_text("\n".join(contents) + "\n", encoding="utf-8")
+    write_text(failure_path, "\n".join(contents) + "\n")
     _log(f"Failure report written to {failure_path}", "ERROR")
 
 
@@ -82,7 +83,7 @@ def _copy_bootstrap_blob(json_path: Path, out_dir: Path) -> None:
         return
     encoded = base64.b64encode(raw).decode("ascii")
     target = out_dir / "bootstrap_blob.b64.txt"
-    target.write_text(encoded, encoding="utf-8")
+    write_text(target, encoded)
     _log(f"Wrote bootstrap blob to {target}")
 
 
@@ -151,8 +152,8 @@ def _to_lua_literal(py: Any) -> str:
 def _write_unpacked_outputs(out_dir: Path, data: Any) -> None:
     json_path = out_dir / "unpacked_dump.json"
     lua_path = out_dir / "unpacked_dump.lua"
-    json_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    lua_path.write_text("return " + _to_lua_literal(data), encoding="utf-8")
+    write_json(json_path, data)
+    write_text(lua_path, "return " + _to_lua_literal(data))
     _log(f"Wrote unpacked dump to {json_path} and {lua_path}")
 
 
@@ -204,15 +205,15 @@ def _validate_unpacked(data: Any) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def _find_luajit() -> list[str] | None:
+def _find_luajit() -> Path | None:
     """Compatibility wrapper for legacy imports."""
 
     return find_luajit()
 
 
 def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int) -> Tuple[bool, Any, str]:
-    luajit_cmd = _find_luajit()
-    if not luajit_cmd:
+    luajit_exe = _find_luajit()
+    if not luajit_exe:
         fixture_data = {
             "array": [
                 4,
@@ -235,11 +236,11 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "logs").mkdir(parents=True, exist_ok=True)
         unpacked_path = out_dir / "unpacked_dump.json"
-        unpacked_path.write_text(json.dumps(fixture_data, indent=2), encoding="utf-8")
+        write_json(unpacked_path, fixture_data)
         lua_path = out_dir / "deobfuscated.full.lua"
-        lua_path.write_text(
+        write_text(
+            lua_path,
             "-- fallback fixture\n" "function main()\n  print('hi')\nend\n",
-            encoding="utf-8",
         )
         _log(
             "luajit executable not found; generated minimal fixture unpacked dump",
@@ -253,7 +254,7 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
 
     env = os.environ.copy()
     env["SCRIPT_KEY"] = script_key
-    cmd = luajit_cmd + [str(wrapper), script_key, str(json_path), str(out_dir)]
+    cmd = build_luajit_command(luajit_exe, str(wrapper), script_key, str(json_path), str(out_dir))
     _log(f"Running Lua wrapper: {subprocess.list2cmdline(cmd)}")
     start = time.time()
     try:
@@ -300,7 +301,7 @@ def _run_detection(init_path: Path, out_dir: Path, *, write_report: bool, api_ke
     report = detect_protections.scan_files(candidates, api_key=api_key)
     if write_report:
         report_path = out_dir / "protection_report.json"
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        write_json(report_path, report)
         _log(f"Protection report written to {report_path}")
     macros = report.get("macros", [])
     if macros:
@@ -374,8 +375,14 @@ def _run_python_sandbox(init_path: Path, json_path: Path, script_key: str) -> Tu
     except ImportError as exc:  # pragma: no cover - defensive
         return False, None, f"failed to import src.sandbox: {exc}"
 
+    log_path = LOG_PATH
     try:
-        raw = sandbox.capture_unpacked(str(init_path), script_key=script_key, json_path=str(json_path))
+        raw = sandbox.capture_unpacked(
+            str(init_path),
+            script_key=script_key,
+            json_path=str(json_path),
+            log_path=str(log_path) if log_path else None,
+        )
     except Exception as exc:  # pragma: no cover - propagate for diagnostics
         return False, None, f"capture_unpacked raised: {exc}"
 
@@ -399,7 +406,7 @@ def _load_fixture(out_dir: Path) -> Tuple[bool, Any, str]:
 
 def _write_summary(out_dir: Path, summary: Dict[str, Any]) -> None:
     path = out_dir / "summary.json"
-    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_json(path, summary)
     _log(f"Summary written to {path}")
 
 

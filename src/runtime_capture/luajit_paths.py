@@ -8,6 +8,8 @@ import stat
 from pathlib import Path
 from typing import List
 
+import subprocess
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -27,14 +29,8 @@ def _candidate_paths() -> List[Path]:
     return candidates
 
 
-def find_luajit() -> list[str] | None:
-    """Locate a LuaJIT executable and return the command to invoke it.
-
-    The function searches the repository ``bin`` folder first and then falls
-    back to ``shutil.which``.  It returns the command as a single-element list
-    so callers can append script arguments without worrying about platform
-    quoting.
-    """
+def find_luajit() -> Path | None:
+    """Locate a LuaJIT executable if one is available."""
 
     for candidate in _candidate_paths():
         if not candidate or not candidate.exists():
@@ -48,9 +44,27 @@ def find_luajit() -> list[str] | None:
         except OSError:
             pass
         if os.access(candidate, os.X_OK):
-            return [str(candidate)]
+            return candidate
     return None
 
 
-__all__ = ["find_luajit"]
+def build_luajit_command(executable: Path, *args: str) -> List[str]:
+    """Return a subprocess-ready command for invoking ``luajit``.
+
+    The helper wraps paths using :func:`subprocess.list2cmdline` on Windows so
+    that bundled binaries in directories with spaces are handled correctly.
+    On POSIX systems the command is returned as ``[luajit, arg1, arg2, ...]``.
+    """
+
+    flattened: List[str] = [str(executable)]
+    flattened.extend(str(part) for part in args)
+
+    if os.name == "nt":
+        command = subprocess.list2cmdline(flattened)
+        shell = os.environ.get("COMSPEC", "cmd.exe")
+        return [shell, "/c", command]
+    return flattened
+
+
+__all__ = ["find_luajit", "build_luajit_command"]
 

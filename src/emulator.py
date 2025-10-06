@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Tuple
 
 from .opcode_emulator import ExecutionContext, Instruction, OpcodeEmulator
+from .utils import write_json
 
 
 @dataclass
@@ -240,10 +241,7 @@ def run_verification(
             confidence = successes / attempts
             if sample_results:
                 out_file = evidence_dir / f"op_{opnum}_{candidate.lower()}.json"
-                out_file.write_text(
-                    json.dumps([item.as_dict() for item in sample_results], indent=2),
-                    encoding="utf-8",
-                )
+                write_json(out_file, [item.as_dict() for item in sample_results])
 
             if confidence > best_confidence:
                 best_confidence = confidence
@@ -275,10 +273,7 @@ def run_verification(
             results[opnum]["notes"] = failure_notes
 
     payload = {str(k): v for k, v in sorted(results.items())}
-    (out_path / "opcode_map.v14_4_1.verified.json").write_text(
-        json.dumps(payload, indent=2),
-        encoding="utf-8",
-    )
+    write_json(out_path / "opcode_map.v14_4_1.verified.json", payload)
 
     report_path = out_path / "lift_report.txt"
     with report_path.open("a", encoding="utf-8") as handle:
@@ -293,7 +288,7 @@ def run_verification(
         "verified": len(results),
         "high_confidence": high_conf,
     }
-    (out_path / "emulator_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_json(out_path / "emulator_summary.json", summary)
     return summary
 
 

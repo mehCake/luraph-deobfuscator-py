@@ -9,7 +9,11 @@ import shutil
 import subprocess
 import time
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar, cast
@@ -19,6 +23,12 @@ from .vm import LuraphVM
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+
+class OperationTimeout(RuntimeError):
+    """Raised when an operation does not complete within the allotted time."""
+
+    pass
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -113,6 +123,34 @@ def get_user_input(prompt: str) -> str:
         return input(prompt)
     except EOFError:
         return ""
+
+
+def run_with_timeout(
+    func: Callable[..., R],
+    timeout: Optional[float],
+    *args: Any,
+    **kwargs: Any,
+) -> R:
+    """Execute *func* while enforcing *timeout* seconds.
+
+    The callable is executed on a worker thread so long-running operations can
+    be cancelled without blocking the caller.  If *timeout* is ``None`` or
+    non-positive the function executes normally without enforcement.  When the
+    timeout expires an :class:`OperationTimeout` is raised.
+    """
+
+    if timeout is None or timeout <= 0:
+        return func(*args, **kwargs)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError as exc:
+            future.cancel()
+            raise OperationTimeout(
+                f"operation timed out after {timeout:.2f} seconds"
+            ) from exc
 
 
 # Simple decoding helpers used across the deobfuscator

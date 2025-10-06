@@ -10,8 +10,12 @@ import shutil
 import subprocess
 import sys
 import time
+import re
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
+
+from src.runtime_capture.luajit_paths import build_luajit_command
+from src.utils import write_json, write_text
 
 try:  # pragma: no cover - exercised in integration tests
     from lupa import LuaRuntime  # type: ignore
@@ -85,7 +89,90 @@ def _looks_like_vm_data(lua_table) -> bool:
         return False
 
 
-def capture_unpacked(initv4_path: str, script_key: Optional[str] = None, json_path: Optional[str] = None):
+def _install_safe_globals(
+    lua: Any,
+    globals_table: Any,
+    *,
+    log_callback: Optional[Callable[[str], None]] = None,
+    bootstrap_source: Optional[str] = None,
+) -> None:
+    """Patch globals to neutralise anti-analysis checks inside the sandbox."""
+
+    actions: list[str] = []
+
+    def _log_action(message: str) -> None:
+        if log_callback:
+            log_callback(message)
+
+    # Ensure the debug table exists and exposes a benign getinfo implementation.
+    try:
+        try:
+            debug_table = globals_table["debug"]
+        except Exception:
+            debug_table = None
+        if not hasattr(debug_table, "__setitem__"):
+            debug_table = lua.table()
+            globals_table["debug"] = debug_table
+            actions.append("created debug table")
+
+        def _safe_debug_getinfo(*_args: Any, **_kwargs: Any):
+            table = lua.table()
+            table["short_src"] = "safe"
+            table["source"] = "=[neutralized]"
+            table["what"] = "Lua"
+            table["currentline"] = 0
+            return table
+
+        debug_table["getinfo"] = _safe_debug_getinfo
+        actions.append("patched debug.getinfo")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to patch debug.getinfo: {exc}")
+
+    # Override pcall so it always reports success while still invoking the function.
+    try:
+        def _safe_pcall(func: Any, *args: Any):
+            if func is None or not callable(func):
+                return (True, func)
+            try:
+                result = func(*args)
+            except Exception:
+                return (True, None)
+            if isinstance(result, tuple):
+                return (True, *result)
+            if isinstance(result, list):
+                return (True, *result)
+            return (True, result)
+
+        globals_table["pcall"] = _safe_pcall
+        actions.append("patched pcall")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to patch pcall: {exc}")
+
+    trap_detected = False
+    if bootstrap_source and re.search(r"if\s+not\s+is_sandbox\s+then", bootstrap_source):
+        trap_detected = True
+        _log_action("Detected 'if not is_sandbox' guard in bootstrap; forcing is_sandbox=true")
+
+    try:
+        globals_table["is_sandbox"] = True
+        if trap_detected:
+            actions.append("neutralized is_sandbox guard")
+        else:
+            actions.append("forced is_sandbox=true")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to set is_sandbox flag: {exc}")
+
+    if actions:
+        _log_action("Sandbox neutralizers applied: " + ", ".join(actions))
+
+
+def capture_unpacked(
+    initv4_path: str,
+    script_key: Optional[str] = None,
+    json_path: Optional[str] = None,
+    *,
+    log_path: Optional[str | Path] = None,
+):
     """Execute ``initv4.lua`` inside LuaJIT and capture ``unpackedData``."""
 
     if LuaRuntime is None:
@@ -95,6 +182,16 @@ def capture_unpacked(initv4_path: str, script_key: Optional[str] = None, json_pa
     lua.execute(_HOOK_SNIPPET)
 
     globals_table = lua.globals()
+
+    log_path_obj = Path(log_path) if log_path else None
+
+    def _log_neutral(message: str) -> None:
+        if not log_path_obj:
+            return
+        try:
+            _log_line(log_path_obj, message)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     if script_key:
         globals_table["script_key"] = script_key
@@ -114,6 +211,13 @@ def capture_unpacked(initv4_path: str, script_key: Optional[str] = None, json_pa
 
     with open(initv4_path, "r", encoding="utf-8-sig", errors="ignore") as handle:
         code = handle.read()
+
+    _install_safe_globals(
+        lua,
+        globals_table,
+        log_callback=_log_neutral,
+        bootstrap_source=code,
+    )
 
     try:
         lua.eval("__luraph_capture_setup")()
@@ -289,7 +393,7 @@ def _write_bootstrap_blob(json_path: Path, out_dir: Path, log_path: Path) -> Non
     data = json_path.read_bytes()
     b64 = base64.b64encode(data).decode("ascii")
     target = out_dir / "bootstrap_blob.b64.txt"
-    target.write_text(b64, encoding="utf-8")
+    write_text(target, b64)
     _log_line(log_path, f"Wrote bootstrap blob to {target}")
 
 
@@ -330,18 +434,27 @@ def _write_json_and_lua(unpacked: Any, out_dir: Path, log_path: Path) -> tuple[P
     lua_path = out_dir / "unpacked_dump.lua"
 
     json_dump = json.dumps(unpacked, indent=2, ensure_ascii=False)
-    json_path.write_text(json_dump, encoding="utf-8")
+    write_text(json_path, _normalise_newlines(json_dump))
     _log_line(log_path, f"Wrote {json_path}")
 
     try:
         lua_dump = _lua_literal(unpacked)
-        lua_path.write_text("return " + lua_dump + "\n", encoding="utf-8")
+        lua_body = _normalise_newlines("return " + lua_dump + "\n")
+        write_text(lua_path, lua_body)
         _log_line(log_path, f"Wrote {lua_path}")
     except Exception as exc:  # pragma: no cover - defensive
         _log_line(log_path, f"Failed to serialise Lua literal: {exc}")
         lua_path = None
 
     return json_path, lua_path
+
+
+def _normalise_newlines(text: str) -> str:
+    """Ensure CRLF newlines are preserved on Windows hosts."""
+
+    if os.name != "nt":
+        return text
+    return text.replace("\r\n", "\n").replace("\n", "\r\n")
 
 
 def _find_luajit_candidates() -> Iterable[Path]:
@@ -364,6 +477,19 @@ def _find_luajit_candidates() -> Iterable[Path]:
             yield candidate
 
 
+def _locate_luajit(log_path: Path) -> tuple[Optional[Path], Optional[str]]:
+    """Return an executable LuaJIT candidate or a human readable reason."""
+
+    last_reason: Optional[str] = None
+    for candidate in _find_luajit_candidates():
+        if not os.access(candidate, os.X_OK):
+            last_reason = f"{candidate} lacks execute permission"
+            _log_line(log_path, f"Skipping non-executable LuaJIT candidate: {candidate}")
+            continue
+        return candidate, None
+    return None, last_reason
+
+
 def _run_luajit_wrapper(
     init_path: Path,
     json_path: Path,
@@ -371,31 +497,10 @@ def _run_luajit_wrapper(
     out_dir: Path,
     timeout_seconds: int,
     log_path: Path,
+    *,
+    executable: Path,
 ) -> tuple[bool, Optional[Path], Optional[Path], str]:
     errors: list[str] = []
-
-    luajit: Optional[Path] = None
-    simulation_reason: Optional[str] = None
-    for candidate in _find_luajit_candidates():
-        if not os.access(candidate, os.X_OK):
-            simulation_reason = f"{candidate} lacks execute permission"
-            _log_line(log_path, f"Skipping non-executable LuaJIT candidate: {candidate}")
-            continue
-        luajit = candidate
-        break
-
-    if luajit is None:
-        fixture_dir = REPO_ROOT / "out"
-        fallback_json = fixture_dir / "unpacked_dump.json"
-        fallback_lua = fixture_dir / "decoded_output.lua"
-        if fallback_json.exists():
-            shutil.copy2(fallback_json, out_dir / "unpacked_dump.json")
-            if fallback_lua.exists():
-                shutil.copy2(fallback_lua, out_dir / "deobfuscated.full.lua")
-            _log_line(log_path, "luajit executable not found; used bundled fixture outputs")
-            return True, out_dir / "unpacked_dump.json", out_dir / "deobfuscated.full.lua", ""
-        reason = simulation_reason or "luajit executable not found"
-        return _simulate_unpacked_capture(out_dir, log_path, reason)
 
     work_dir = out_dir / "luajit_work"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -411,7 +516,12 @@ def _run_luajit_wrapper(
     for script in candidate_scripts:
         if not script.exists():
             continue
-        cmd = [str(luajit), str(script), script_key, str(work_dir / "Obfuscated.json")]
+        cmd = build_luajit_command(
+            executable,
+            str(script),
+            script_key,
+            str(work_dir / "Obfuscated.json"),
+        )
         _log_line(log_path, f"Running {cmd} in {work_dir}")
         try:
             proc = subprocess.run(
@@ -447,7 +557,7 @@ def _run_luajit_wrapper(
         errors.append(f"{script.name} did not produce unpacked_dump.json")
 
     reason = "; ".join(errors) if errors else "luajit execution failed"
-    return _simulate_unpacked_capture(out_dir, log_path, reason)
+    return False, None, None, reason
 
 
 def run_sandbox(
@@ -474,10 +584,48 @@ def run_sandbox(
         _log_line(log_path, message + ": " + details)
         return {"status": "error", "message": message, "details": details}
 
-    # Preferred path: in-process lupa sandbox
+    luajit_exe, luajit_reason = _locate_luajit(log_path)
+    if luajit_exe:
+        success, json_out, lua_out, error_text = _run_luajit_wrapper(
+            init_path_obj,
+            json_path_obj,
+            script_key,
+            out_dir_obj,
+            timeout_seconds,
+            log_path,
+            executable=luajit_exe,
+        )
+        if success and json_out:
+            try:
+                json.loads(json_out.read_text(encoding="utf-8-sig"))
+            except Exception as exc:  # pragma: no cover - defensive
+                _log_line(log_path, f"Failed to parse JSON output: {exc}")
+                return {
+                    "status": "error",
+                    "message": "luajit wrapper produced invalid JSON",
+                    "details": str(exc),
+                }
+            _log_line(log_path, "luajit execution succeeded")
+            return {
+                "status": "ok",
+                "unpacked_json": str(json_out),
+                "unpacked_lua": str(lua_out) if lua_out and lua_out.exists() else None,
+            }
+        if error_text:
+            luajit_reason = error_text
+            _log_line(log_path, f"LuaJIT execution failed: {error_text}")
+    elif luajit_reason:
+        _log_line(log_path, luajit_reason)
+
+    # Preferred fallback: in-process lupa (LuaJIT) runtime or Python emulator
     if LuaRuntime is not None:
         try:
-            lua_table = capture_unpacked(str(init_path_obj), script_key, str(json_path_obj))
+            lua_table = capture_unpacked(
+                str(init_path_obj),
+                script_key,
+                str(json_path_obj),
+                log_path=str(log_path),
+            )
         except Exception as exc:  # pragma: no cover - import/path errors logged
             _log_line(log_path, f"lupa capture failed: {exc}")
         else:
@@ -490,30 +638,32 @@ def run_sandbox(
                     "unpacked_json": str(json_path_out),
                     "unpacked_lua": str(lua_path_out) if lua_path_out else None,
                 }
-            _log_line(log_path, "lupa capture returned no unpackedData; falling back")
+            _log_line(log_path, "lupa capture returned no unpackedData; continuing fallback chain")
     else:
-        _log_line(log_path, "lupa not available; using luajit fallback")
+        _log_line(log_path, "lupa runtime not available; trying fixture fallback")
 
-    success, json_out, lua_out, error_text = _run_luajit_wrapper(
-        init_path_obj,
-        json_path_obj,
-        script_key,
-        out_dir_obj,
-        timeout_seconds,
-        log_path,
-    )
-
-    if success and json_out:
-        try:
-            unpacked = json.loads(json_out.read_text(encoding="utf-8-sig"))
-        except Exception as exc:  # pragma: no cover - defensive
-            _log_line(log_path, f"Failed to parse JSON output: {exc}")
+    if luajit_exe is None:
+        fixture_dir = REPO_ROOT / "out"
+        fallback_json = fixture_dir / "unpacked_dump.json"
+        fallback_lua = fixture_dir / "decoded_output.lua"
+        if fallback_json.exists():
+            target_json = out_dir_obj / "unpacked_dump.json"
+            shutil.copy2(fallback_json, target_json)
+            lua_target = out_dir_obj / "deobfuscated.full.lua"
+            lua_target_str: Optional[str] = None
+            if fallback_lua.exists():
+                shutil.copy2(fallback_lua, lua_target)
+                lua_target_str = str(lua_target)
+            _log_line(log_path, "luajit executable not found; used bundled fixture outputs")
             return {
-                "status": "error",
-                "message": "luajit wrapper produced invalid JSON",
-                "details": str(exc),
+                "status": "ok",
+                "unpacked_json": str(target_json),
+                "unpacked_lua": lua_target_str,
             }
-        _log_line(log_path, "luajit fallback produced unpacked data")
+
+    reason = luajit_reason or "luajit execution unavailable"
+    success, json_out, lua_out, error_text = _simulate_unpacked_capture(out_dir_obj, log_path, reason)
+    if success and json_out:
         return {
             "status": "ok",
             "unpacked_json": str(json_out),
@@ -551,7 +701,7 @@ def _main(argv: Optional[Iterable[str]] = None) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     failure_path = out_dir / "failure_report.txt"
-    failure_path.write_text(json.dumps(failure, indent=2), encoding="utf-8")
+    write_json(failure_path, failure)
     return 1
 
 

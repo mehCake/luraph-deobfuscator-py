@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
+
+from src.utils import write_json
 
 DEFAULT_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "tools" / "frida-scripts" / "luraph_hook.js"
 
@@ -153,9 +154,9 @@ def capture_with_frida(
         raise RuntimeError("frida hook completed without producing dumps")
 
     manifest_path = output_dir / f"frida_capture_{int(start)}.json"
-    manifest_path.write_text(
-        json.dumps({"dumps": [d.as_posix() for d in dumps], "metadata": metadata}, indent=2),
-        encoding="utf-8",
+    write_json(
+        manifest_path,
+        {"dumps": [d.as_posix() for d in dumps], "metadata": metadata},
     )
     metadata["manifest"] = manifest_path.as_posix()
     return CaptureResult("frida", dumps, metadata)

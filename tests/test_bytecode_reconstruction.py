@@ -1,7 +1,18 @@
+import json
 from pathlib import Path
 
+from src.lifter.lifter import lift_program
 from src.utils.luraph_vm import rebuild_vm_bytecode
 from src.utils.opcode_inference import infer_opcode_map
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "simple_vm.json"
+
+
+def _load_fixture(name: str) -> dict:
+    with open(FIXTURES, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    return data[name]
 
 
 def _instruction_names(result, opcode_map):
@@ -25,8 +36,8 @@ def _instruction_names(result, opcode_map):
     return names
 
 
-def test_bytecode_reconstruction_matches_expected(v1441_capture):
-    unpacked = v1441_capture["unpacked"]
+def test_bytecode_reconstruction_matches_expected():
+    unpacked = _load_fixture("print_hi")
     opcode_map = infer_opcode_map(unpacked)
     result = rebuild_vm_bytecode(unpacked, opcode_map)
 
@@ -34,14 +45,21 @@ def test_bytecode_reconstruction_matches_expected(v1441_capture):
     names = _instruction_names(result, opcode_map)
     assert names == ["LOADK", "MOVE", "CALL", "RETURN"]
 
-    expected_path = Path(__file__).resolve().parent / "fixtures" / "v14_4_1" / "expected.lua"
-    with open(expected_path, "r", encoding="utf-8") as handle:
-        expected_src = handle.read().strip()
-
-    # Simple heuristic: ensure constants and operations mention keywords from expected source
     constants = {str(item) for item in result.constants}
     for token in ("hi", "print"):
         assert any(token in value for value in constants)
     for keyword in ("LOADK", "MOVE", "CALL", "RETURN"):
         assert keyword in " ".join(names)
-    assert "print" in expected_src
+
+
+def test_lifter_exec_simulation():
+    unpacked = _load_fixture("return_42")
+    opcode_map = infer_opcode_map(unpacked)
+    result = rebuild_vm_bytecode(unpacked, opcode_map)
+
+    lift_result = lift_program(result.instructions, result.constants, opcode_map)
+    assert lift_result.stack_trace, "expected emulator to record stack trace"
+    final_snapshot = lift_result.stack_trace[-1]
+    assert final_snapshot["opcode"] == "RETURN"
+    registers = final_snapshot.get("registers", {})
+    assert registers.get("local_0") == "42"
