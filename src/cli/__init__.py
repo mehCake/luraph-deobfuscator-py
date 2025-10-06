@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from . import sandbox_runner
+from .. import sandbox_runner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,4 +58,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover - CLI wrapper
     raise SystemExit(main())
-

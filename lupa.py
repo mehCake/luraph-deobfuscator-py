@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 class LuaError(RuntimeError):
@@ -56,6 +56,113 @@ class LuaTable:
             yield index, self.values[index - 1]
         for key, value in self.mapping.items():
             yield key, value
+
+
+def _mask32(value: int) -> int:
+    return value & 0xFFFFFFFF
+
+
+def _sign32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _rotate(value: int, shift: int, *, width: int = 32, direction: str = "left") -> int:
+    mask = (1 << width) - 1
+    value &= mask
+    shift &= width - 1
+    if direction == "left":
+        rotated = ((value << shift) & mask) | (value >> (width - shift))
+    else:
+        rotated = (value >> shift) | ((value << (width - shift)) & mask)
+    return rotated & mask
+
+
+def _bit32_table() -> Dict[str, Any]:
+    def _reduce(func, first: int, rest: Tuple[int, ...]) -> int:
+        result = _mask32(first)
+        for value in rest:
+            result = func(result, _mask32(int(value)))
+        return _mask32(result)
+
+    def band(first: int, *rest: int) -> int:
+        return _reduce(lambda a, b: a & b, int(first), rest)
+
+    def bor(first: int, *rest: int) -> int:
+        return _reduce(lambda a, b: a | b, int(first), rest)
+
+    def bxor(first: int, *rest: int) -> int:
+        return _reduce(lambda a, b: a ^ b, int(first), rest)
+
+    def bnot(value: int) -> int:
+        return _mask32(~int(value))
+
+    def lshift(value: int, disp: int) -> int:
+        return _mask32(int(value) << (int(disp) & 31))
+
+    def rshift(value: int, disp: int) -> int:
+        return (_mask32(int(value)) >> (int(disp) & 31)) & 0xFFFFFFFF
+
+    def arshift(value: int, disp: int) -> int:
+        return _mask32(_sign32(int(value)) >> (int(disp) & 31))
+
+    def lrotate(value: int, disp: int) -> int:
+        return _rotate(int(value), int(disp), direction="left")
+
+    def rrotate(value: int, disp: int) -> int:
+        return _rotate(int(value), int(disp), direction="right")
+
+    def extract(value: int, field: int, width: int = 1) -> int:
+        width = max(1, int(width))
+        mask = (1 << width) - 1
+        return (_mask32(int(value)) >> int(field)) & mask
+
+    def replace(value: int, repl: int, field: int, width: int = 1) -> int:
+        width = max(1, int(width))
+        mask = ((1 << width) - 1) << int(field)
+        base = _mask32(int(value)) & ~mask
+        return _mask32(base | ((int(repl) << int(field)) & mask))
+
+    def countlz(value: int) -> int:
+        masked = _mask32(int(value))
+        if masked == 0:
+            return 32
+        count = 0
+        for bit in range(31, -1, -1):
+            if masked & (1 << bit):
+                break
+            count += 1
+        return count
+
+    def countrz(value: int) -> int:
+        masked = _mask32(int(value))
+        if masked == 0:
+            return 32
+        count = 0
+        while masked & 1 == 0:
+            masked >>= 1
+            count += 1
+        return count
+
+    def tobit(value: int) -> int:
+        return _mask32(int(value))
+
+    return {
+        "band": band,
+        "bor": bor,
+        "bxor": bxor,
+        "bnot": bnot,
+        "lshift": lshift,
+        "rshift": rshift,
+        "arshift": arshift,
+        "lrotate": lrotate,
+        "rrotate": rrotate,
+        "extract": extract,
+        "replace": replace,
+        "countlz": countlz,
+        "countrz": countrz,
+        "tobit": tobit,
+    }
 
 
 def _translate_table_literal(source: str) -> str:
@@ -152,11 +259,23 @@ class LuaRuntime:
 
     def __init__(self, *_, **__):
         self._globals: Dict[str, Any] = {}
-        self._globals["package"] = {"path": "", "config": "\n"}
+        self._globals["package"] = {"path": "", "config": "\n", "loaded": {}}
         self._globals["table"] = {"unpack": lambda seq: list(seq)}
         self._globals["_G"] = self._globals
         self._shim_stub: Optional[_InitV4ShimStub] = None
         self.is_fallback = True
+        self._bit32 = _bit32_table()
+        self._globals["bit32"] = self._bit32
+        self._globals["bit"] = self._bit32
+        self._globals["require"] = self._require
+        self._globals["pcall"] = self._pcall
+        self._globals["xpcall"] = self._xpcall
+        self._globals["debug"] = {
+            "traceback": lambda *args, **kwargs: "",
+            "getinfo": lambda *args, **kwargs: {"what": "Lua", "currentline": 0},
+            "sethook": lambda *args, **kwargs: None,
+            "gethook": lambda *args, **kwargs: None,
+        }
 
     def _lua_to_python(self, source: str) -> str:
         cleaned = re.sub(r"\blocal\s+", "", source)
@@ -222,6 +341,54 @@ class LuaRuntime:
                 raise LuaError("initv4 shim not installed")
             return self._shim_stub.capture()
         raise LuaError(f"unsupported dofile target: {target}")
+
+    def _pcall(self, func: Any, *args: Any) -> Tuple[Any, ...]:
+        if not callable(func):
+            return (False, "attempt to call a non-function")
+        try:
+            result = func(*args)
+        except Exception as exc:  # pragma: no cover - defensive
+            return (False, exc)
+        if isinstance(result, tuple):
+            return (True, *result)
+        if isinstance(result, list):
+            return (True, *result)
+        if result is None:
+            return (True,)
+        return (True, result)
+
+    def _xpcall(self, func: Any, err_handler: Any, *args: Any) -> Tuple[Any, ...]:
+        if not callable(func):
+            return (False, "attempt to call a non-function")
+        try:
+            result = func(*args)
+        except Exception as exc:  # pragma: no cover - defensive
+            if callable(err_handler):
+                handled = err_handler(exc)
+                if isinstance(handled, tuple):
+                    return (False, *handled)
+                if isinstance(handled, list):
+                    return (False, *handled)
+                if handled is None:
+                    return (False,)
+                return (False, handled)
+            return (False, exc)
+        if isinstance(result, tuple):
+            return (True, *result)
+        if isinstance(result, list):
+            return (True, *result)
+        if result is None:
+            return (True,)
+        return (True, result)
+
+    def _require(self, name: str) -> Any:
+        loaded = self._globals.setdefault("package", {}).setdefault("loaded", {})
+        if name in loaded:
+            return loaded[name]
+        if name in {"bit32", "bit"}:
+            loaded[name] = self._bit32
+            return self._bit32
+        raise LuaError(f"module '{name}' not found")
 
     def _execute_statement(self, statement: str) -> None:
         stmt = statement.strip()

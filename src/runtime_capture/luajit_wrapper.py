@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Sequence
 
-from .luajit_paths import find_luajit
+from .luajit_paths import build_luajit_command, find_luajit
 from .trace_to_unpacked import convert_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,8 +70,8 @@ def _prepare_environment(out_dir: Path) -> dict:
 def run_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int = 10) -> LuajitCapture:
     """Execute the LuaJIT bootstrap wrapper with the initv4 shim preloaded."""
 
-    luajit_cmd = find_luajit()
-    if not luajit_cmd:
+    executable = find_luajit()
+    if not executable:
         raise RuntimeError("luajit executable not found; cannot perform wrapper capture")
     if not WRAPPER_PATH.exists():
         raise RuntimeError("tools/devirtualize_v3.lua missing")
@@ -80,7 +80,7 @@ def run_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int = 
     env = _prepare_environment(out_dir)
     env["SCRIPT_KEY"] = script_key
 
-    command = list(luajit_cmd) + [str(WRAPPER_PATH), script_key, str(json_path), str(out_dir)]
+    command = build_luajit_command(executable, str(WRAPPER_PATH), script_key, str(json_path), str(out_dir))
 
     try:
         proc = subprocess.run(

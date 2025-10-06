@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from lua_literal_parser import LuaTable, parse_lua_expression
 from .luraph_api import LuraphAPI
+from .utils import write_json, write_text
 
 # Regular expression patterns for each protection type. Patterns are compiled lazily at
 # module import so unit tests pay a fixed cost.
@@ -547,7 +548,7 @@ def dump_report(paths: Iterable[Path], output: Path, *, api_key: str | None = No
     """Write detection results to ``output`` as JSON."""
 
     report = scan_files(paths, api_key=api_key)
-    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    write_json(output, report)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -565,7 +566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     text = json.dumps(report, indent=2)
     print(text)
     if args.output:
-        Path(args.output).write_text(text, encoding="utf-8")
+        write_text(Path(args.output), text)
     return 0
 
 

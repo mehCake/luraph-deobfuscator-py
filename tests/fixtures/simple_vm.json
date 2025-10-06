@@ -1,0 +1,72 @@
+{
+  "print_hi": {
+    "array": [
+      null,
+      null,
+      null,
+      [
+        {
+          "opcode": 1,
+          "A": 0,
+          "Bx": 1
+        },
+        {
+          "opcode": 0,
+          "A": 1,
+          "B": 0
+        },
+        {
+          "opcode": 2,
+          "A": 0,
+          "B": 2,
+          "C": 2
+        },
+        {
+          "opcode": 3,
+          "A": 0,
+          "B": 1
+        }
+      ],
+      [
+        "print",
+        "hi"
+      ]
+    ],
+    "map": {
+      "opcode_map": {
+        "0": "MOVE",
+        "1": "LOADK",
+        "2": "CALL",
+        "3": "RETURN"
+      }
+    }
+  },
+  "return_42": {
+    "array": [
+      null,
+      null,
+      null,
+      [
+        {
+          "opcode": 1,
+          "A": 0,
+          "Bx": 1
+        },
+        {
+          "opcode": 3,
+          "A": 0,
+          "B": 2
+        }
+      ],
+      [
+        42
+      ]
+    ],
+    "map": {
+      "opcode_map": {
+        "1": "LOADK",
+        "3": "RETURN"
+      }
+    }
+  }
+}

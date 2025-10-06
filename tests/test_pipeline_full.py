@@ -75,3 +75,14 @@ def test_pipeline_full(tmp_path):
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary.get("status") == "ok"
 
+    metadata_path = out_dir / "lift_metadata.json"
+    assert metadata_path.exists()
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata.get("function_count", 0) >= 1
+    coverage = metadata.get("opcode_coverage", {})
+    assert isinstance(coverage, dict)
+    seen = coverage.get("seen", [])
+    assert metadata.get("distinct_opcodes", 0) == len(seen)
+    if "missing" in coverage:
+        assert not coverage["missing"]
+

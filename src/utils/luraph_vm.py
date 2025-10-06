@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+from src.vm.opcode_utils import normalize_mnemonic, normalize_operand_model
+
 __all__ = [
     "VMRebuildResult",
     "MinimalVMInstruction",
@@ -57,12 +59,10 @@ _CANONICAL_OPCODE_ALIASES: Mapping[str, str] = {
 def canonicalise_opcode_name(name: Optional[str]) -> Optional[str]:
     """Normalise bootstrap mnemonics to canonical Lua 5.1 names."""
 
-    if not name:
+    canonical = normalize_mnemonic(name)
+    if not canonical:
         return None
-    upper = str(name).strip().upper()
-    if not upper:
-        return None
-    return _CANONICAL_OPCODE_ALIASES.get(upper, upper)
+    return _CANONICAL_OPCODE_ALIASES.get(canonical, canonical)
 
 
 def looks_like_vm_bytecode(
@@ -103,7 +103,7 @@ def looks_like_vm_bytecode(
 
 def rebuild_vm_bytecode(
     unpacked: Mapping[Any, Any] | Sequence[Any],
-    opcode_map: Optional[Mapping[int, str]] = None,
+    opcode_map: Optional[Mapping[int, Any]] = None,
 ) -> VMRebuildResult:
     """Return a :class:`VMRebuildResult` built from an ``unpackedData`` table."""
 
@@ -209,7 +209,9 @@ def _maybe_index(key: Any) -> Optional[int]:
     return None
 
 
-def _normalise_instruction(raw: Any, opcode_map: Optional[Mapping[int, str]]) -> Optional[Dict[str, Any]]:
+def _normalise_instruction(
+    raw: Any, opcode_map: Optional[Mapping[int, Mapping[str, Any]]]
+) -> Optional[Dict[str, Any]]:
     if raw is None:
         return None
 
@@ -273,21 +275,54 @@ def _normalise_instruction(raw: Any, opcode_map: Optional[Mapping[int, str]]) ->
         "C": c_val & 0x1FF,
     }
 
+    entry = opcode_map.get(opcode_num, {}) if opcode_map else {}
+    operand_model = entry.get("operands") if isinstance(entry, Mapping) else ""
+    operand_model = normalize_operand_model(operand_model) if operand_model else ""
+    operands = operand_model.split() if operand_model else []
+
+    if sbx_val is not None or (operands and "sBx" in operands):
+        if bx_val is None:
+            bx_val = ((b_val & 0x1FF) << 9) | (c_val & 0x1FF)
+        sbx_val = sbx_val if sbx_val is not None else bx_val - _SBX_BIAS
+    if bx_val is None and operands and ("Bx" in operands or "sBx" in operands):
+        bx_val = ((b_val & 0x1FF) << 9) | (c_val & 0x1FF)
+
+    info["A"] = info["a"] = a_val & 0xFF
+    info["B"] = info["b"] = b_val & 0x1FF
+    info["C"] = info["c"] = c_val & 0x1FF
     if bx_val is not None:
-        info["Bx"] = bx_val & 0x3FFFF
+        info["Bx"] = info["bx"] = bx_val & 0x3FFFF
     if sbx_val is not None:
-        info["sBx"] = int(sbx_val)
+        info["sBx"] = info["sbx"] = int(sbx_val)
 
-    mnemonic: Optional[str] = None
-    if opcode_map and opcode_num in opcode_map:
-        mnemonic = canonicalise_opcode_name(opcode_map[opcode_num])
+    raw_name: Optional[str] = None
+    if isinstance(entry, Mapping):
+        raw_name = (
+            entry.get("mnemonic")
+            or entry.get("op")
+            or entry.get("name")
+            or entry.get("mnemonic_name")
+        )
+    elif isinstance(entry, str):
+        raw_name = entry
 
+    mnemonic = canonicalise_opcode_name(raw_name) if raw_name else None
+    if not mnemonic and isinstance(raw_name, str):
+        mnemonic = raw_name.upper()
     if not mnemonic:
         mnemonic = f"OP_{opcode_num:02X}"
 
     info["mnemonic"] = mnemonic
     info["op"] = mnemonic
+    info["opnum"] = opcode_num
     info["raw"] = raw
+    if operand_model:
+        info["operands"] = operand_model
+    if isinstance(entry, Mapping):
+        for key in ("trust", "source", "source_snippet"):
+            value = entry.get(key)
+            if value is not None:
+                info.setdefault(key, value)
 
     return info
 
@@ -324,10 +359,10 @@ def _coerce_int(value: Any) -> Optional[int]:
     return None
 
 
-def _normalise_opcode_map(mapping: Optional[Mapping[Any, Any]]) -> Dict[int, str]:
+def _normalise_opcode_map(mapping: Optional[Mapping[Any, Any]]) -> Dict[int, Dict[str, Any]]:
     if not isinstance(mapping, Mapping):
         return {}
-    normalised: Dict[int, str] = {}
+    normalised: Dict[int, Dict[str, Any]] = {}
     for key, value in mapping.items():
         try:
             if isinstance(key, str):
@@ -336,7 +371,45 @@ def _normalise_opcode_map(mapping: Optional[Mapping[Any, Any]]) -> Dict[int, str
                 opcode = int(key)
         except (TypeError, ValueError):
             continue
-        normalised[opcode & 0x3F] = str(value)
+        opcode_id = opcode & 0x3F
+        entry = normalised.setdefault(opcode_id, {"opcode": opcode_id})
+        candidate_name: Optional[str] = None
+        operands_value: Any = None
+        trust_value: Any = None
+        source_value: Any = None
+        snippet_value: Any = None
+        if hasattr(value, "mnemonic"):
+            candidate_name = getattr(value, "mnemonic")
+            operands_value = getattr(value, "operands", None)
+        elif isinstance(value, Mapping):
+            candidate_name = (
+                value.get("mnemonic")
+                or value.get("op")
+                or value.get("name")
+                or value.get("mnemonic_name")
+            )
+            operands_value = value.get("operands")
+            trust_value = value.get("trust")
+            source_value = value.get("source")
+            snippet_value = value.get("source_snippet")
+        else:
+            candidate_name = str(value)
+        canonical = canonicalise_opcode_name(candidate_name)
+        if canonical:
+            entry["mnemonic"] = canonical
+            entry["op"] = canonical
+        elif isinstance(candidate_name, str) and candidate_name:
+            entry.setdefault("mnemonic", candidate_name.upper())
+            entry.setdefault("op", candidate_name.upper())
+        operand_model = normalize_operand_model(operands_value) if operands_value is not None else ""
+        if operand_model:
+            entry["operands"] = operand_model
+        if trust_value is not None and "trust" not in entry:
+            entry["trust"] = trust_value
+        if source_value and "source" not in entry:
+            entry["source"] = source_value
+        if snippet_value and "source_snippet" not in entry:
+            entry["source_snippet"] = snippet_value
     return normalised
 
 
@@ -351,10 +424,10 @@ def _minimal_instruction(data: Mapping[str, Any]) -> Optional[MinimalVMInstructi
     if name not in _MINI_LIFT_OPS:
         return None
     try:
-        opcode = int(data.get("opcode", 0)) & 0x3F
-        a_val = int(data.get("A", 0)) & 0xFF
-        b_val = int(data.get("B", 0)) & 0x1FF
-        c_val = int(data.get("C", 0)) & 0x1FF
+        opcode = int(data.get("opnum", data.get("opcode", 0))) & 0x3F
+        a_val = int(data.get("a", data.get("A", 0))) & 0xFF
+        b_val = int(data.get("b", data.get("B", 0))) & 0x1FF
+        c_val = int(data.get("c", data.get("C", 0))) & 0x1FF
         pc_val = int(data.get("pc", 0))
     except Exception:
         return None
