@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline, utils
+from .utils import write_text
 from .deobfuscator import LuaDeobfuscator
 from .lph_reader import read_lph_blob
 from .passes.preprocess import flatten_json_to_lua
@@ -928,7 +929,7 @@ def _build_json_payload(
                     trace_path_obj.parent.mkdir(parents=True, exist_ok=True)
                     if not trace_path_obj.exists():
                         try:
-                            trace_path_obj.write_text("", encoding="utf-8")
+                            write_text(trace_path_obj, "")
                         except OSError:
                             pass
                 bootstrap_summary["artifact_paths"] = artifact_paths

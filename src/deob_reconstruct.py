@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, MutableMapping
 
 from . import simple_graph as nx
+from .utils import write_text
 
 
 def _read_json(path: str | os.PathLike[str]) -> Any:
@@ -182,13 +183,13 @@ def reconstruct(
         chunk_index = len(chunks) + 1
         chunk_lines_data = output_lines[offset : offset + chunk_lines]
         chunk_path = out_path / f"deobfuscated.part{chunk_index:02d}.lua"
-        chunk_path.write_text("".join(chunk_lines_data), encoding="utf-8")
+        write_text(chunk_path, "".join(chunk_lines_data))
         chunks.append(chunk_path)
 
     full_text = "".join(output_lines)
     total_lines = len(full_text.splitlines())
     if total_lines <= 3000:
-        (out_path / "deobfuscated.full.lua").write_text(full_text, encoding="utf-8")
+        write_text(out_path / "deobfuscated.full.lua", full_text)
 
     return {"status": "ok", "chunks": len(chunks), "total_lines": total_lines}
 

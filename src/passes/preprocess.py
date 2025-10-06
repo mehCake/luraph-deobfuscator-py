@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, TYPE_CHECKING, Union
 
 from .. import utils
+from ..utils import write_text
 
 if TYPE_CHECKING:  # pragma: no cover - import for typing only
     from ..pipeline import Context
@@ -48,7 +49,7 @@ def _write_reconstructed(ctx: "Context", combined: str) -> None:
     else:
         temp_dir = Path(tempfile.mkdtemp(prefix="luraph_preprocess_"))
         target = temp_dir / filename
-    target.write_text(combined, encoding="utf-8")
+    write_text(target, combined)
     ctx.temp_paths["reconstructed_lua"] = target
 
 

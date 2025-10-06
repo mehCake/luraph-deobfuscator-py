@@ -137,4 +137,11 @@ class BootstrapExtractor:
             LOG.debug("[BOOTSTRAP] No constants discovered in bootstrapper text")
 
 
-__all__ = ["BootstrapExtractor"]
+from .bootstrap_parser import BootstrapParser, BootstrapParseResult, OpcodeHandler
+
+__all__ = [
+    "BootstrapExtractor",
+    "BootstrapParser",
+    "BootstrapParseResult",
+    "OpcodeHandler",
+]

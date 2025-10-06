@@ -10,6 +10,8 @@ from typing import Any, Dict
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from src.utils import write_text
+
 DEFAULT_BASE_URL = "https://api.luraph.com/v1"
 CACHE_DIR = Path(os.environ.get("LURAPH_CACHE_DIR", Path.home() / ".cache" / "luraph"))
 
@@ -46,7 +48,7 @@ class LuraphAPI:
             parsed = json.loads(payload)
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive
             raise RuntimeError(f"invalid JSON from Luraph API: {exc}") from exc
-        cache_path.write_text(payload, encoding="utf-8")
+        write_text(cache_path, payload)
         return parsed
 
     def version_info(self, version: str) -> Dict[str, Any]:

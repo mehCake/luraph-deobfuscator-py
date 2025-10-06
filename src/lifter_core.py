@@ -20,13 +20,14 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
 # Opcodes for vanilla Lua 5.1 – used as suggestions when generating the
 # candidate list.  The final verified opcode map is produced by
 # ``opcode_verifier`` once it has executed its checks.
 from src.versions.luraph_v14_4_1 import _BASE_OPCODE_TABLE
-from src.utils.luraph_vm import canonicalise_opcode_name
+from src.utils import write_json, write_text
+from src.utils.luraph_vm import canonicalise_opcode_name, rebuild_vm_bytecode
 from src.vm.lifter_core import lift_program
 
 
@@ -284,6 +285,7 @@ def run_lifter(unpacked_path: str | os.PathLike[str], out_dir: str | os.PathLike
     ir_dicts = [item.as_dict() for item in ir]
 
     opcode_lookup: Dict[int, str] = {}
+    verified_payload: Mapping[str, Any] | Dict[str, Any] = {}
     verified_map_path = out_path / "opcode_map.v14_4_1.verified.json"
     if verified_map_path.exists():
         try:
@@ -292,6 +294,7 @@ def run_lifter(unpacked_path: str | os.PathLike[str], out_dir: str | os.PathLike
         except Exception:
             verified_payload = {}
         if isinstance(verified_payload, MutableMapping):
+            verified_payload = dict(verified_payload)
             for key, value in verified_payload.items():
                 try:
                     opnum = int(key)
@@ -305,49 +308,73 @@ def run_lifter(unpacked_path: str | os.PathLike[str], out_dir: str | os.PathLike
                 if canon:
                     opcode_lookup[opnum] = canon
 
-    for index, entry in enumerate(ir_dicts):
-        entry.setdefault("index", index)
+    rebuild = rebuild_vm_bytecode(data, verified_payload if verified_payload else None)
+    if rebuild.constants:
+        consts = rebuild.constants
+    lift_instructions = [dict(row) for row in rebuild.instructions] or list(ir_dicts)
+
+    for idx, entry in enumerate(lift_instructions):
+        entry.setdefault("index", idx)
         if "opcode" not in entry and isinstance(entry.get("opnum"), int):
             entry["opcode"] = entry["opnum"]
-        opnum = entry.get("opnum")
-        mnemonic: Optional[str] = None
-        if isinstance(opnum, int):
+        if opcode_lookup:
+            opnum = entry.get("opnum")
+            if not isinstance(opnum, int):
+                opnum = entry.get("opcode") if isinstance(entry.get("opcode"), int) else None
+            if not isinstance(opnum, int):
+                continue
             mnemonic = opcode_lookup.get(opnum)
-        if mnemonic:
-            entry["mnemonic"] = mnemonic
+            if mnemonic:
+                entry.setdefault("mnemonic", mnemonic)
+                entry.setdefault("op", mnemonic)
 
-    lift_result = lift_program(ir_dicts, consts, opcode_lookup)
+    lift_result = lift_program(lift_instructions, consts, opcode_lookup)
 
-    (out_path / "lift_ir.lua").write_text(lift_result.lua_source, encoding="utf-8")
-    (out_path / "lift_ir.json").write_text(
-        json.dumps(lift_result.ir_entries, indent=2),
-        encoding="utf-8",
-    )
-
-    (out_path / "opcode_candidates.json").write_text(
-        json.dumps(opcode_candidates, indent=2),
-        encoding="utf-8",
-    )
+    write_text(out_path / "lift_ir.lua", lift_result.lua_source)
+    write_json(out_path / "lift_ir.json", lift_result.ir_entries)
+    write_json(out_path / "lift_stack.json", lift_result.stack_trace)
+    write_json(out_path / "lift_metadata.json", lift_result.metadata)
+    write_json(out_path / "opcode_candidates.json", opcode_candidates)
 
     unique_opnums = sorted({i.opnum for i in ir if isinstance(i.opnum, int)})
     report_lines = [
         f"instructions={len(ir)}",
         f"unique_opnums={len(unique_opnums)}",
         f"unknown_entries={sorted(unknown)}",
-        "candidate_summary:",
     ]
+    if lift_result.metadata:
+        rehydrated = lift_result.metadata.get("rehydrated_functions")
+        if rehydrated is not None:
+            report_lines.append(f"rehydrated_functions={rehydrated}")
+        details = lift_result.metadata.get("rehydrated_details")
+        if isinstance(details, list) and details:
+            report_lines.append("rehydrated_details:")
+            for entry in details:
+                if not isinstance(entry, Mapping):
+                    continue
+                idx = entry.get("index")
+                name = entry.get("name")
+                tag = entry.get("tag")
+                decoded_with = entry.get("decoded_with")
+                report_lines.append(
+                    f"  - index={idx}, name={name}, tag={tag}, decoded_with={decoded_with}"
+                )
+    report_lines.append("candidate_summary:")
     for opnum in unique_opnums:
         cand = opcode_candidates.get(str(opnum), {})
         names = ", ".join(cand.get("candidates", [])) or "<none>"
         report_lines.append(f"  - op {opnum}: {names}")
 
-    (out_path / "lift_report.txt").write_text("\n".join(report_lines), encoding="utf-8")
+    write_text(out_path / "lift_report.txt", "\n".join(report_lines))
 
     return {
         "status": "ok",
         "instructions": len(ir),
         "unique_opnums": len(unique_opnums),
         "opcode_candidates": len(opcode_candidates),
+        "rehydrated_functions": lift_result.metadata.get("rehydrated_functions"),
+        "function_count": lift_result.metadata.get("function_count"),
+        "missing_opcodes": lift_result.metadata.get("opcode_coverage", {}).get("missing", []),
     }
 
 

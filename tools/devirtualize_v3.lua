@@ -70,6 +70,64 @@ local function log(msg)
 end
 
 
+local function install_neutralizers(init_source)
+  local notes = {}
+
+  if type(_G.debug) ~= "table" then
+    _G.debug = {}
+    notes[#notes + 1] = "created debug table"
+  end
+
+  local dbg = _G.debug
+  dbg.getinfo = function(...)
+    return {
+      short_src = "safe",
+      source = "=[neutralized]",
+      what = "Lua",
+      currentline = 0,
+    }
+  end
+  notes[#notes + 1] = "patched debug.getinfo"
+
+  local original_pcall = _G.pcall
+  local unpack_fn = (table and table.unpack) or unpack
+  _G.pcall = function(fn, ...)
+    if type(fn) ~= "function" then
+      return true, fn
+    end
+    if type(original_pcall) == "function" then
+      local results = { original_pcall(fn, ...) }
+      if results[1] then
+        if unpack_fn then
+          return true, unpack_fn(results, 2, #results)
+        end
+        return true, results[2]
+      end
+      return true, nil
+    end
+    local results = { fn(...) }
+    if unpack_fn then
+      return true, unpack_fn(results, 1, #results)
+    end
+    return true, results[1]
+  end
+  notes[#notes + 1] = "patched pcall"
+
+  if type(init_source) == "string" and init_source:match("if%s+not%s+is_sandbox%s+then") then
+    notes[#notes + 1] = "detected sandbox guard"
+  end
+
+  if _G.is_sandbox ~= true then
+    _G.is_sandbox = true
+    notes[#notes + 1] = "forced is_sandbox=true"
+  end
+
+  if #notes > 0 then
+    log("Neutralizers installed: " .. table.concat(notes, ", "))
+  end
+end
+
+
 local function read_all(path)
   local f, err = io.open(path, "rb")
   if not f then
@@ -178,6 +236,12 @@ if not raw_json then
 end
 
 write_file(out_dir .. "/bootstrap_blob.b64.txt", base64_encode(raw_json))
+
+local init_source, init_err = read_all("initv4.lua")
+if not init_source then
+  log("Unable to scan initv4.lua for traps: " .. tostring(init_err))
+end
+install_neutralizers(init_source)
 
 local ok, load_err = pcall(function()
   _G.LPH_String = raw_json

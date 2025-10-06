@@ -25,6 +25,7 @@ from typing import (
 from version_detector import VersionInfo
 
 from . import utils
+from .utils import write_json, write_text
 from .detect import ask_confirm, detect_version_from_text, legacy_detector
 from .report import DeobReport
 from .deobfuscator import LuaDeobfuscator, VMIR
@@ -302,7 +303,7 @@ class Context:
         if self.artifacts:
             utils.ensure_directory(self.artifacts)
             meta_path = self.artifacts / f"{name}.json"
-            meta_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+            write_json(meta_path, summary, sort_keys=True)
 
     def write_artifact(self, name: str, content: str, *, extension: str = ".lua") -> None:
         if not self.artifacts:
@@ -312,7 +313,7 @@ class Context:
         utils.ensure_directory(self.artifacts)
         safe_name = name.replace(" ", "_")
         path = self.artifacts / f"{safe_name}{extension}"
-        path.write_text(content, encoding="utf-8")
+        write_text(path, content)
 
 
 def _is_interactive() -> bool:

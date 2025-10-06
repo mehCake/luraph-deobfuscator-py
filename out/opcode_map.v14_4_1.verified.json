@@ -1,28 +1,308 @@
 {
   "0": {
-    "mnemonic": "MOVE",
-    "confidence": 0.8,
+    "mnemonic": "NOP",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
     "evidence": [
-      "MOVE-like samples=1"
+      "bootstrap dispatch"
+    ]
+  },
+  "1": {
+    "mnemonic": "LOADK",
+    "operands": "A,Bx",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "2": {
+    "mnemonic": "LOADBOOL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "3": {
+    "mnemonic": "LOADNIL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
     ]
   },
   "4": {
-    "mnemonic": "LOADK",
-    "confidence": 0.9,
+    "mnemonic": "GETUPVAL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
     "evidence": [
-      "LOADK-like samples=1"
+      "bootstrap dispatch"
     ]
   },
-  "28": {
-    "mnemonic": "OP_28",
-    "confidence": 0.3,
-    "evidence": []
-  },
-  "30": {
-    "mnemonic": "MOVE",
-    "confidence": 0.8,
+  "5": {
+    "mnemonic": "GETGLOBAL",
+    "operands": "A,Bx",
+    "confidence": 1.0,
+    "status": "verified",
     "evidence": [
-      "MOVE-like samples=1"
+      "bootstrap dispatch"
+    ]
+  },
+  "6": {
+    "mnemonic": "GETTABLE",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "7": {
+    "mnemonic": "SETGLOBAL",
+    "operands": "A,Bx",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "8": {
+    "mnemonic": "SETUPVAL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "9": {
+    "mnemonic": "SETTABLE",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "10": {
+    "mnemonic": "NEWTABLE",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "11": {
+    "mnemonic": "SELF",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "12": {
+    "mnemonic": "ADD",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "13": {
+    "mnemonic": "SUB",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "14": {
+    "mnemonic": "MUL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "15": {
+    "mnemonic": "DIV",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "16": {
+    "mnemonic": "MOVE",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "17": {
+    "mnemonic": "LOADKX",
+    "operands": "A,Bx",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "18": {
+    "mnemonic": "JMP",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "19": {
+    "mnemonic": "CALL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "20": {
+    "mnemonic": "TAILCALL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "21": {
+    "mnemonic": "RETURN",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "22": {
+    "mnemonic": "FORITER",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "23": {
+    "mnemonic": "TFORCALL",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "24": {
+    "mnemonic": "SETLIST",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "25": {
+    "mnemonic": "CLOSURE",
+    "operands": "A,Bx",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "26": {
+    "mnemonic": "VARARG",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "34": {
+    "mnemonic": "CONCAT",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "40": {
+    "mnemonic": "JMP",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "41": {
+    "mnemonic": "FORPREP",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "42": {
+    "mnemonic": "FORLOOP",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "43": {
+    "mnemonic": "TFORLOOP",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "44": {
+    "mnemonic": "SETLIST",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
+    ]
+  },
+  "45": {
+    "mnemonic": "CLOSE",
+    "operands": "A,B,C",
+    "confidence": 1.0,
+    "status": "verified",
+    "evidence": [
+      "bootstrap dispatch"
     ]
   }
 }

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 from .. import utils
+from ..utils import write_text
 from ..deobfuscator import VMIR
 from ..versions import PayloadInfo, VersionHandler, get_handler
 from ..versions.luraph_v14_4_1 import looks_like_vm_bytecode
@@ -2907,7 +2908,7 @@ def _write_opcode_dump(data: bytes) -> None:
         out_dir = Path("out")
         utils.ensure_directory(out_dir)
         hex_text = " ".join(f"{byte:02X}" for byte in data)
-        (out_dir / "opcodes.hex").write_text(hex_text, encoding="utf-8")
+        write_text(out_dir / "opcodes.hex", hex_text)
     except Exception as exc:  # pragma: no cover - debugging aid only
         LOG.debug("failed to write opcode dump: %s", exc)
 
