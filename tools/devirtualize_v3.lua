@@ -1,6 +1,10 @@
 package.path = package.path .. ";./tools/?.lua;./tools/?/init.lua;./tools/shims/?.lua"
 
-local script_key = arg and arg[1] or os.getenv("SCRIPT_KEY") or ""
+local script_key =
+  (arg and arg[1])
+  or os.getenv("SCRIPT_KEY")
+  or os.getenv("LURAPH_SCRIPT_KEY")
+  or ""
 local json_path = (arg and arg[2]) or "Obfuscated.json"
 local out_dir = (arg and (arg[4] or arg[3])) or "out"
 local logs_dir = out_dir .. "/logs"
@@ -150,8 +154,14 @@ local function write_file(path, data, mode)
 end
 
 local function write_failure(message)
-  write_file(out_dir .. '/failure_report.txt', message or '')
+  local text = message or ''
+  if not text:match('\n$') then
+    text = text .. '\n'
+  end
+  write_file(out_dir .. '/failure_report.txt', text)
 end
+
+local has_cjson, cjson = pcall(require, 'cjson')
 
 local function base64_encode(data)
   local alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -187,20 +197,27 @@ local function base64_encode(data)
   return table.concat(result)
 end
 
-local function emit_status(status, message, extra)
-  local payload = { status = status }
-  if message then
-    payload.message = message
+local function encode_json(payload)
+  if has_cjson and cjson then
+    return cjson.encode(payload)
+  end
+  return dumper.to_json(payload)
+end
+
+local function emit_result(status, message, extra)
+  local payload = { status = status, message = message }
+  if not message then
+    payload.message = status == 'ok' and 'success' or 'failure'
   end
   if extra then
     for k, v in pairs(extra) do
       payload[k] = v
     end
   end
-  local encoded = dumper.to_json(payload)
-  io.stdout:write(encoded .. "\n")
+  local encoded = encode_json(payload)
+  io.stdout:write(encoded)
   if status ~= 'ok' then
-    local details = message or 'unknown failure'
+    local details = payload.message or 'unknown failure'
     if extra then
       local lines = {}
       for k, v in pairs(extra) do
@@ -211,7 +228,9 @@ local function emit_status(status, message, extra)
       end
     end
     write_failure(details)
+    os.exit(1)
   end
+  os.exit(0)
 end
 
 local function is_vm_data_shape(tbl)
@@ -231,8 +250,17 @@ end
 
 local raw_json, json_err = read_all(json_path)
 if not raw_json then
-  emit_status("error", "failed to read Obfuscated.json", { error = json_err or "unknown" })
-  os.exit(1)
+  emit_result('error', 'failed to read Obfuscated.json', { error = json_err or 'unknown' })
+end
+
+raw_json = raw_json:gsub('^%s*\239\187\191', '')
+
+local decoded_payload = nil
+if has_cjson and cjson then
+  local ok_decode, parsed = pcall(cjson.decode, raw_json)
+  if ok_decode and type(parsed) == 'table' then
+    decoded_payload = parsed
+  end
 end
 
 write_file(out_dir .. "/bootstrap_blob.b64.txt", base64_encode(raw_json))
@@ -240,6 +268,8 @@ write_file(out_dir .. "/bootstrap_blob.b64.txt", base64_encode(raw_json))
 local init_source, init_err = read_all("initv4.lua")
 if not init_source then
   log("Unable to scan initv4.lua for traps: " .. tostring(init_err))
+else
+  init_source = init_source:gsub('^%s*\239\187\191', '')
 end
 install_neutralizers(init_source)
 
@@ -264,25 +294,265 @@ if not ok then
   log("initv4.lua execution failed: " .. tostring(load_err))
 end
 
+local function find_unpacked()
+  local function probe(container, key)
+    if type(container) ~= 'table' then
+      return nil
+    end
+    local ok, value = pcall(function()
+      return rawget(container, key)
+    end)
+    if ok and value ~= nil then
+      return value
+    end
+    return nil
+  end
+
+  local direct = probe(_G, 'unpackedData')
+  if direct ~= nil then
+    return direct
+  end
+  if type(_ENV) == 'table' then
+    local env_val = probe(_ENV, 'unpackedData')
+    if env_val ~= nil then
+      return env_val
+    end
+    local env_alt = probe(_ENV, 'unpacked')
+    if env_alt ~= nil then
+      return env_alt
+    end
+    local env_global = probe(_ENV, '_G')
+    if type(env_global) == 'table' then
+      local nested = probe(env_global, 'unpackedData')
+      if nested ~= nil then
+        return nested
+      end
+      local nested_alt = probe(env_global, 'unpacked')
+      if nested_alt ~= nil then
+        return nested_alt
+      end
+    end
+  end
+  local alt = probe(_G, 'unpacked')
+  if alt ~= nil then
+    return alt
+  end
+  return nil
+end
+
+local unpacked = find_unpacked()
+
+local function try_unpacked_call(fn)
+  if type(fn) ~= "function" then
+    return nil
+  end
+
+  local unpack_fn = (table and table.unpack) or unpack
+
+  local call_specs = {}
+  local seen = {}
+  local function add_attempt(...)
+    local args = { ... }
+    local last = 0
+    for i = #args, 1, -1 do
+      if args[i] ~= nil then
+        last = i
+        break
+      end
+    end
+    local trimmed = {}
+    for i = 1, last do
+      trimmed[i] = args[i]
+    end
+    local key = tostring(#trimmed)
+    for i = 1, #trimmed do
+      key = key .. '|' .. tostring(trimmed[i])
+    end
+    if not seen[key] then
+      seen[key] = true
+      call_specs[#call_specs + 1] = trimmed
+    end
+  end
+
+  add_attempt()
+  add_attempt(raw_json)
+  add_attempt(raw_json, script_key)
+  add_attempt(raw_json, json_path)
+  add_attempt(raw_json, script_key, json_path)
+  add_attempt(raw_json, script_key, out_dir)
+  if decoded_payload ~= nil then
+    add_attempt(decoded_payload)
+    add_attempt(decoded_payload, script_key)
+    add_attempt(decoded_payload, json_path)
+    add_attempt(decoded_payload, script_key, json_path)
+  end
+  add_attempt(script_key)
+  add_attempt(script_key, raw_json)
+  add_attempt(script_key, json_path)
+  add_attempt(script_key, json_path, out_dir)
+  add_attempt(json_path)
+
+  for _, args in ipairs(call_specs) do
+    local attempt = function()
+      if unpack_fn then
+        return fn(unpack_fn(args, 1, #args))
+      end
+      return fn()
+    end
+
+    local ok_call, data = pcall(attempt)
+    if ok_call and type(data) == "table" and is_vm_data_shape(data) then
+      return data
+    end
+    if not unpacked then
+      local fallback = find_unpacked()
+      if fallback then
+        return fallback
+      end
+    end
+  end
+
+  return nil
+end
+
+local function try_env_lookup(env)
+  if type(env) ~= "table" or unpacked then
+    return
+  end
+  local candidate = rawget(env, "LPH_UnpackData")
+  if type(candidate) == "function" then
+    unpacked = try_unpacked_call(candidate)
+    if unpacked then
+      return
+    end
+  end
+  local env_global = rawget(env, "_G")
+  if type(env_global) == "table" then
+    local nested = rawget(env_global, "LPH_UnpackData")
+    if type(nested) == "function" then
+      unpacked = try_unpacked_call(nested)
+    end
+  end
+end
+
+try_env_lookup(_G)
+if not unpacked then
+  unpacked = find_unpacked()
+end
+
+if not unpacked then
+  try_env_lookup(_ENV)
+  if not unpacked then
+    unpacked = find_unpacked()
+  end
+end
+
+if not unpacked and type(getgenv) == "function" then
+  local ok_env, env = pcall(getgenv)
+  if ok_env then
+    try_env_lookup(env)
+    if not unpacked then
+      unpacked = find_unpacked()
+    end
+  end
+end
+
+if not unpacked and type(debug) == "table" and type(debug.sethook) == "function" and type(debug.getlocal) == "function" then
+  local captured = nil
+  local function hook(event)
+    if event == "call" then
+      local i = 1
+      while true do
+        local name, value = debug.getlocal(2, i)
+        if not name then
+          break
+        end
+        if type(value) == "table" and is_vm_data_shape(value) then
+          captured = value
+          pcall(debug.sethook)
+          return
+        end
+        i = i + 1
+      end
+    end
+  end
+
+  local ok_hook = pcall(debug.sethook, hook, "c")
+  if ok_hook then
+    local entry_points = { "VMRun", "Run", "Init", "bootstrap", "main" }
+    for _, name in ipairs(entry_points) do
+      if captured then
+        break
+      end
+      local fn = rawget(_G, name)
+      if not fn and type(getgenv) == "function" then
+        local ok_env, env = pcall(getgenv)
+        if ok_env and type(env) == "table" then
+          fn = env[name]
+        end
+      end
+      if type(fn) == "function" then
+        pcall(fn, "LPH!tick", _G)
+        if captured then
+          break
+        end
+      end
+    end
+    pcall(debug.sethook)
+  end
+
+  if captured and is_vm_data_shape(captured) then
+    unpacked = captured
+  elseif not unpacked then
+    unpacked = find_unpacked()
+  end
+end
+
 local candidates = {}
-if type(_G.unpackedData) == "table" then
-  candidates[#candidates + 1] = _G.unpackedData
+local seen_candidates = setmetatable({}, { __mode = "k" })
+
+local function push_candidate(tbl)
+  if type(tbl) ~= "table" then
+    return
+  end
+  if seen_candidates[tbl] then
+    return
+  end
+  seen_candidates[tbl] = true
+  candidates[#candidates + 1] = tbl
 end
-if type(_G.decoded_output) == "table" then
-  candidates[#candidates + 1] = _G.decoded_output
-end
-if type(_G.DecodedLuraphScript) == "table" then
-  candidates[#candidates + 1] = _G.DecodedLuraphScript
+
+push_candidate(unpacked)
+push_candidate(_G.unpackedData)
+push_candidate(_G.unpacked)
+push_candidate(_G.decoded_output)
+push_candidate(_G.DecodedLuraphScript)
+
+if type(_ENV) == "table" then
+  push_candidate(rawget(_ENV, "unpackedData"))
+  push_candidate(rawget(_ENV, "unpacked"))
+  push_candidate(rawget(_ENV, "decoded_output"))
+  local env_global = rawget(_ENV, "_G")
+  if type(env_global) == "table" then
+    push_candidate(env_global.unpackedData)
+    push_candidate(env_global.unpacked)
+    push_candidate(env_global.decoded_output)
+    push_candidate(env_global.DecodedLuraphScript)
+  end
 end
 
 if type(getgenv) == "function" then
   local ok_env, env = pcall(getgenv)
   if ok_env and type(env) == "table" then
-    if type(env.unpackedData) == "table" then
-      candidates[#candidates + 1] = env.unpackedData
-    end
-    if type(env.decoded_output) == "table" then
-      candidates[#candidates + 1] = env.decoded_output
+    push_candidate(env.unpackedData)
+    push_candidate(env.unpacked)
+    push_candidate(env.decoded_output)
+    local env_global = rawget(env, "_G")
+    if type(env_global) == "table" then
+      push_candidate(env_global.unpackedData)
+      push_candidate(env_global.unpacked)
+      push_candidate(env_global.decoded_output)
+      push_candidate(env_global.DecodedLuraphScript)
     end
   end
 end
@@ -314,11 +584,16 @@ for _, value in ipairs(candidates) do
   end
 end
 
-local unpacked = nil
-for _, value in ipairs(candidates) do
-  if is_vm_data_shape(value) then
-    unpacked = value
-    break
+if unpacked then
+  table.insert(candidates, 1, unpacked)
+end
+
+if not unpacked then
+  for _, value in ipairs(candidates) do
+    if is_vm_data_shape(value) then
+      unpacked = value
+      break
+    end
   end
 end
 
@@ -327,8 +602,8 @@ if not unpacked and type(_G) == "table" then
 end
 
 if not unpacked then
-  emit_status("error", "could not locate unpackedData table", { stderr = "see out/logs/deobfuscation.log" })
-  os.exit(1)
+  log("could not locate unpackedData table")
+  emit_result('error', 'could not locate unpackedData table', { stderr = 'see out/logs/deobfuscation.log' })
 end
 
 local ok_lua, err_lua = write_file(out_dir .. "/unpacked_dump.lua", "return " .. dumper.to_lua_literal(unpacked))
@@ -337,7 +612,6 @@ if not ok_lua then
 end
 
 local json_written = false
-local has_cjson, cjson = pcall(require, "cjson")
 if has_cjson and cjson then
   local status, encoded = pcall(cjson.encode, unpacked)
   if status then
@@ -358,5 +632,4 @@ if type(_G.__SHIM_USED) == "table" then
   write_file(out_dir .. "/shim_usage.txt", table.concat(entries, "\n"), "wb")
 end
 
-emit_status("ok", nil, { dump = out_dir .. "/unpacked_dump.json" })
-os.exit(0)
+emit_result('ok', 'unpackedData recovered', { dump = out_dir .. "/unpacked_dump.json" })

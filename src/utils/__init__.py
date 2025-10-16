@@ -29,7 +29,7 @@ if LEGACY_PATH.exists():  # pragma: no branch - normal test path
         sys.modules.setdefault("src._legacy_utils", module)
         _legacy_utils = module
 
-from .io_utils import chunk_lines, ensure_out, write_b64_text, write_json, write_text  # noqa: F401
+from .io_utils import atomic_write, chunk_lines, ensure_out, write_b64_text, write_json, write_text  # noqa: F401
 from .lph_decoder import parse_escaped_lua_string, try_xor  # noqa: F401
 from .luraph_vm import looks_like_vm_bytecode, rebuild_vm_bytecode  # noqa: F401
 from .opcode_inference import infer_opcode_map  # noqa: F401
@@ -61,6 +61,7 @@ if _legacy_utils is not None:
         {
             "chunk_lines",
             "ensure_out",
+            "atomic_write",
             "parse_escaped_lua_string",
             "try_xor",
             "write_b64_text",
@@ -92,6 +93,7 @@ else:  # pragma: no cover - minimal fallback when legacy helpers unavailable
     __all__ = [
         "chunk_lines",
         "ensure_out",
+        "atomic_write",
         "parse_escaped_lua_string",
         "try_xor",
         "write_b64_text",

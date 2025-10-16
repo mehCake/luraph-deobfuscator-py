@@ -24,6 +24,7 @@ from .passes.preprocess import flatten_json_to_lua
 from .utils_pkg.ir import IRModule
 from .utils.luraph_vm import canonicalise_opcode_name
 from .utils.opcode_inference import DEFAULT_OPCODE_NAMES
+from .vm.opcode_constants import MANDATORY_MNEMONICS
 from version_detector import VersionInfo
 
 LOG_FILE = Path("deobfuscator.log")
@@ -1552,6 +1553,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             final_ctx.pass_metadata["payload_decode"] = payload_bucket
         payload_bucket.setdefault("handler_payload_meta", {})
 
+        def _coerce_int(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
         if lph_summary_meta:
             final_ctx.bootstrapper_metadata.update(lph_summary_meta)
         if lph_opcode_map_int and not final_ctx.vm_metadata.get("opcode_map"):
@@ -1606,6 +1619,163 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for entry in report.warnings
             ):
                 report.warnings.append(warning_message)
+
+        success = True
+        error_message: Optional[str] = None
+
+        lifter_metadata_raw = lifter_summary.get("metadata") if args.run_lifter else None
+        lifter_metadata = lifter_metadata_raw if isinstance(lifter_metadata_raw, Mapping) else None
+
+        functions_lifted = None
+        if lifter_metadata is not None:
+            functions_lifted = _coerce_int(lifter_metadata.get("functions"))
+            if functions_lifted is None:
+                functions_lifted = _coerce_int(lifter_metadata.get("function_count"))
+
+        placeholder_only_output = False
+        if isinstance(payload_bucket, Mapping):
+            placeholder_only_output = bool(payload_bucket.get("placeholder_output")) or bool(
+                payload_bucket.get("placeholders_only")
+            )
+            handler_meta_summary = payload_bucket.get("handler_payload_meta")
+            if isinstance(handler_meta_summary, Mapping):
+                placeholder_only_output = placeholder_only_output or bool(
+                    handler_meta_summary.get("placeholder_output")
+                )
+                placeholder_only_output = placeholder_only_output or bool(
+                    handler_meta_summary.get("placeholders_only")
+                )
+            placeholder_source = payload_bucket.get("handler_placeholder_source")
+            if (
+                not placeholder_only_output
+                and isinstance(placeholder_source, str)
+                and placeholder_source.strip()
+            ):
+                placeholder_only_output = True
+
+        placeholder_label = "placeholder-only output"
+        if (
+            args.run_lifter
+            and placeholder_only_output
+            and (functions_lifted is None or functions_lifted <= 0)
+        ):
+            print(utils.colorize_text(f"WARNING: {placeholder_label}", "red", bold=True))
+            if report is not None and placeholder_label not in report.warnings:
+                report.warnings.append(placeholder_label)
+
+        mandatory_missing: set[str] = set()
+
+        def _collect_missing_names(values: Any) -> None:
+            if isinstance(values, str):
+                cleaned = values.strip()
+                if cleaned:
+                    mandatory_missing.add(cleaned.upper())
+            elif isinstance(values, Sequence) and not isinstance(
+                values, (bytes, bytearray, str)
+            ):
+                for entry in values:
+                    if isinstance(entry, str):
+                        cleaned = entry.strip()
+                        if cleaned:
+                            mandatory_missing.add(cleaned.upper())
+
+        for key in ("mandatory_missing_ops", "mandatory_missing"):
+            _collect_missing_names(final_ctx.vm_metadata.get(key))
+
+        vm_errors = final_ctx.vm_metadata.get("errors")
+        if isinstance(vm_errors, Sequence):
+            for entry in vm_errors:
+                if isinstance(entry, str) and entry.startswith("missing/low-trust:"):
+                    cleaned = entry.split(":", 1)[1].strip()
+                    if cleaned:
+                        mandatory_missing.add(cleaned.upper())
+
+        related_containers: Tuple[Any, ...] = (
+            final_ctx.vm_metadata.get("opcode_table"),
+            final_ctx.vm_metadata.get("lifter"),
+            final_ctx.bootstrapper_metadata
+            if isinstance(final_ctx.bootstrapper_metadata, Mapping)
+            else None,
+            payload_bucket,
+            payload_bucket.get("handler_payload_meta")
+            if isinstance(payload_bucket.get("handler_payload_meta"), Mapping)
+            else None,
+        )
+
+        for container in related_containers:
+            if isinstance(container, Mapping):
+                for key in ("mandatory_missing_ops", "mandatory_missing"):
+                    _collect_missing_names(container.get(key))
+
+        if lifter_metadata is not None:
+            for key in ("mandatory_missing_ops", "mandatory_missing"):
+                _collect_missing_names(lifter_metadata.get(key))
+            meta_errors = lifter_metadata.get("errors")
+            if isinstance(meta_errors, Sequence):
+                for entry in meta_errors:
+                    if (
+                        isinstance(entry, str)
+                        and entry.startswith("missing/low-trust:")
+                    ):
+                        cleaned = entry.split(":", 1)[1].strip()
+                        if cleaned:
+                            mandatory_missing.add(cleaned.upper())
+
+        missing_recognized = {
+            name for name in mandatory_missing if name in MANDATORY_MNEMONICS
+        }
+        required_mandatory = len(MANDATORY_MNEMONICS)
+        trusted_count: Optional[int] = None
+        if missing_recognized:
+            trusted_count = max(0, required_mandatory - len(missing_recognized))
+
+        coverage_failure = False
+        if args.run_lifter and args.lifter_mode == "accurate":
+            coverage_failure = bool(missing_recognized)
+            if lifter_metadata is not None:
+                status_value = lifter_metadata.get("status")
+                reason_value = lifter_metadata.get("reason")
+                if isinstance(status_value, str) and status_value.lower() == "skipped":
+                    reason_text = str(reason_value or "")
+                    if "mandatory" in reason_text.lower():
+                        coverage_failure = True
+                if not coverage_failure:
+                    errors_bucket = lifter_metadata.get("errors")
+                    if isinstance(errors_bucket, Sequence):
+                        if any(
+                            isinstance(entry, str)
+                            and entry.startswith("missing/low-trust:")
+                            for entry in errors_bucket
+                        ):
+                            coverage_failure = True
+            if coverage_failure and not missing_recognized:
+                trusted_count = None
+
+        if coverage_failure:
+            detail_parts: List[str] = []
+            if trusted_count is not None:
+                detail_parts.append(f"{trusted_count}/{required_mandatory} trusted")
+            if mandatory_missing:
+                detail_parts.append(
+                    "missing: " + ", ".join(sorted(mandatory_missing))
+                )
+            if detail_parts:
+                invariant_message = (
+                    "mandatory opcode coverage below threshold ("
+                    + "; ".join(detail_parts)
+                    + ")"
+                )
+            else:
+                invariant_message = "mandatory opcode coverage below threshold"
+            if args.force:
+                if report is not None and invariant_message not in report.warnings:
+                    report.warnings.append(invariant_message)
+            else:
+                success = False
+                error_message = invariant_message
+                if report is not None and invariant_message not in report.errors:
+                    report.errors.append(invariant_message)
+
         wants_json_output = (
             not args.detect_only and item.json_destination is not None
         )
@@ -1693,7 +1863,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if final_timings:
             summary_lines.append(utils.format_pass_summary(final_timings))
         summary = "\n".join(line for line in summary_lines if line)
-        return WorkResult(item, True, output_path=item.destination, summary=summary)
+        return WorkResult(
+            item,
+            success,
+            output_path=item.destination,
+            summary=summary,
+            error=error_message,
+        )
 
     try:
         results, duration = utils.run_parallel(work_items, _process, jobs=jobs)

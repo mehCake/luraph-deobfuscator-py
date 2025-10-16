@@ -29,7 +29,8 @@ def test_cli_runs_with_initv4_payload(tmp_path: Path) -> None:
 
     cmd = [
         sys.executable,
-        str(PROJECT_ROOT / "main.py"),
+        "-m",
+        "src.main",
         str(target),
         "--script-key",
         SCRIPT_KEY,
@@ -46,7 +47,7 @@ def test_cli_runs_with_initv4_payload(tmp_path: Path) -> None:
         "--artifact-only",
     ]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=PROJECT_ROOT)
     assert proc.returncode == 0, proc.stderr
 
     lua_out = target.with_name(f"{target.stem}_deob.lua")

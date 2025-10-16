@@ -44,12 +44,51 @@ def _atomic_write_text(
         raise
 
 __all__ = [
+    "atomic_write",
     "ensure_out",
     "write_text",
     "write_json",
     "write_b64_text",
     "chunk_lines",
 ]
+
+
+def atomic_write(
+    path: str | os.PathLike[str],
+    data: str | bytes | bytearray,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """Atomically persist *data* at *path*.
+
+    The implementation mirrors :func:`write_text`/``write_json`` by writing to a
+    uniquely named temporary file within the destination directory before
+    swapping it into place via :func:`os.replace`.  ``data`` may be a ``str`` or
+    ``bytes`` instance; the helper selects the appropriate file mode
+    automatically.
+    """
+
+    target = _as_fs_path(path)
+    directory = _ensure_directory(target)
+    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".partial", dir=directory)
+    try:
+        if isinstance(data, (bytes, bytearray)):
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        else:
+            with os.fdopen(fd, "w", encoding=encoding) as handle:
+                handle.write(str(data))
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def ensure_out(*paths: str | os.PathLike[str]) -> str:
@@ -71,10 +110,7 @@ def write_text(
 ) -> None:
     """Write ``content`` to ``path`` using UTF-8 encoding."""
 
-    def _writer(handle) -> None:
-        handle.write(content)
-
-    _atomic_write_text(path, _writer, encoding=encoding)
+    atomic_write(path, content, encoding=encoding)
 
 
 def write_json(

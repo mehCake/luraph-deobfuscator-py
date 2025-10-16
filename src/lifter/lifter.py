@@ -7,6 +7,7 @@ import bz2
 import json
 import logging
 import lzma
+import string
 import zlib
 from dataclasses import dataclass
 from typing import (
@@ -31,6 +32,34 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .runner import LifterLimits
 
 LOG = logging.getLogger(__name__)
+
+
+_LUA_KEYWORDS = {
+    "and",
+    "break",
+    "do",
+    "else",
+    "elseif",
+    "end",
+    "false",
+    "for",
+    "function",
+    "if",
+    "in",
+    "local",
+    "nil",
+    "not",
+    "or",
+    "repeat",
+    "return",
+    "then",
+    "true",
+    "until",
+    "while",
+}
+
+_IDENTIFIER_HEAD = set(string.ascii_letters + "_")
+_IDENTIFIER_BODY = _IDENTIFIER_HEAD | set(string.digits)
 
 
 def _xor_bytes(data: bytes, key: bytes) -> bytes:
@@ -139,6 +168,7 @@ def lift_program(
     root: bool = True,
     script_key: Optional[str | bytes] = None,
     rehydration_state: Optional[Dict[str, Any]] = None,
+    vm_metadata: Optional[Mapping[str, Any]] = None,
     limits: "LifterLimits | None" = None,
     debug_logger: Optional[logging.Logger] = None,
 ) -> LiftOutput:
@@ -158,6 +188,7 @@ def lift_program(
         root=root,
         script_key=script_key,
         rehydration_state=rehydration_state,
+        vm_metadata=vm_metadata,
         limits=limits,
         debug_logger=debug_logger,
     )
@@ -192,6 +223,7 @@ class _LiftContext(VMEmulator):
         root: bool,
         script_key: Optional[str | bytes],
         rehydration_state: Optional[Dict[str, Any]],
+        vm_metadata: Optional[Mapping[str, Any]],
         limits: "LifterLimits | None" = None,
         debug_logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -214,6 +246,13 @@ class _LiftContext(VMEmulator):
         self._rehydration_state = rehydration_state if isinstance(rehydration_state, dict) else {}
         self._rehydration_state.setdefault("counter", 0)
         self._rehydration_state.setdefault("count", 0)
+        self._vm_metadata = dict(vm_metadata) if isinstance(vm_metadata, Mapping) else {}
+        self._has_metatable_flow = bool(
+            self._extract_metatable_flag(self._vm_metadata)
+        )
+        self._metatable_handlers = self._extract_metatable_handlers(self._vm_metadata)
+        self._setmetatable_calls = self._extract_setmetatable_calls(self._vm_metadata)
+        self._chunk_details = self._extract_chunk_details(self._vm_metadata)
         self._rehydrated_info: Dict[int, Dict[str, Any]] = {}
         self._local_rehydrated_count = 0
         self._metadata: Dict[str, Any] = {}
@@ -229,6 +268,8 @@ class _LiftContext(VMEmulator):
         self._function_count = 1
         self._function_prototypes: set[int] = set()
         self._processed_instructions = 0
+        self._pending_self_calls: Dict[int, Dict[str, Any]] = {}
+        self._closure_upvalues: Dict[int, List[str]] = {}
 
         if self._debug_logger is not None:
             self._debug_logger.debug(
@@ -251,6 +292,127 @@ class _LiftContext(VMEmulator):
     def _debug(self, message: str, *args: Any) -> None:
         if self._debug_logger is not None:
             self._debug_logger.debug(message, *args)
+
+    @staticmethod
+    def _extract_metatable_flag(metadata: Mapping[str, Any]) -> bool:
+        if not isinstance(metadata, Mapping):
+            return False
+        direct = metadata.get("has_metatable_flow")
+        if isinstance(direct, bool):
+            return direct
+        lifter_meta = metadata.get("lifter")
+        if isinstance(lifter_meta, Mapping):
+            nested = lifter_meta.get("has_metatable_flow")
+            if isinstance(nested, bool):
+                return nested
+        return False
+
+    @staticmethod
+    def _extract_metatable_handlers(metadata: Mapping[str, Any]) -> Dict[str, int]:
+        handlers: Dict[str, int] = {}
+        if not isinstance(metadata, Mapping):
+            return handlers
+
+        def _coerce(source: Mapping[str, Any] | None) -> None:
+            if not isinstance(source, Mapping):
+                return
+            for key, value in source.items():
+                if isinstance(value, int):
+                    handlers[str(key)] = value
+
+        _coerce(metadata.get("metatable_handlers"))
+        lifter_meta = metadata.get("lifter")
+        if isinstance(lifter_meta, Mapping):
+            _coerce(lifter_meta.get("metatable_handlers"))
+        return handlers
+
+    @staticmethod
+    def _extract_setmetatable_calls(metadata: Mapping[str, Any]) -> Optional[int]:
+        if not isinstance(metadata, Mapping):
+            return None
+        direct = metadata.get("setmetatable_calls")
+        if isinstance(direct, int):
+            return direct
+        lifter_meta = metadata.get("lifter")
+        if isinstance(lifter_meta, Mapping):
+            nested = lifter_meta.get("setmetatable_calls")
+            if isinstance(nested, int):
+                return nested
+        return None
+
+    @staticmethod
+    def _extract_chunk_details(metadata: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(metadata, Mapping):
+            return []
+        payload_chunks = metadata.get("payload_chunks")
+        details: List[Dict[str, Any]] = []
+        if isinstance(payload_chunks, Mapping):
+            payload_iterable = payload_chunks.values()
+        else:
+            payload_iterable = payload_chunks
+        if isinstance(payload_iterable, list) or isinstance(payload_iterable, tuple):
+            candidates = payload_iterable
+        else:
+            candidates = []
+        for entry in candidates:
+            if not isinstance(entry, Mapping):
+                continue
+            record: Dict[str, Any] = {}
+            index_value = entry.get("chunk_index")
+            if isinstance(index_value, int):
+                record["chunk_index"] = index_value
+            source_kind = entry.get("source_kind")
+            if isinstance(source_kind, str):
+                record["source_kind"] = source_kind
+            header_value = entry.get("header")
+            if isinstance(header_value, str):
+                record["header"] = header_value
+            offset_value = entry.get("chunk_offset")
+            if isinstance(offset_value, int):
+                record["chunk_offset"] = offset_value
+            if record:
+                details.append(record)
+        details.sort(key=lambda item: item.get("chunk_index", 0))
+        return details
+
+    def _identifier_from_literal(self, literal: str) -> Optional[str]:
+        if not isinstance(literal, str):
+            return None
+        text = literal.strip()
+        if len(text) < 2 or text[0] not in {'"', "'"} or text[-1] != text[0]:
+            return None
+        try:
+            value = parse_lua_expression(text)
+        except Exception:
+            return None
+        if not isinstance(value, str):
+            return None
+        if not value or value in _LUA_KEYWORDS:
+            return None
+        if value[0] not in _IDENTIFIER_HEAD:
+            return None
+        if any(ch not in _IDENTIFIER_BODY for ch in value[1:]):
+            return None
+        return value
+
+    @staticmethod
+    def _is_simple_identifier(expr: str) -> bool:
+        if not isinstance(expr, str):
+            return False
+        text = expr.strip()
+        if not text or text[0] not in _IDENTIFIER_HEAD:
+            return False
+        return all(ch in _IDENTIFIER_BODY for ch in text[1:])
+
+    def _table_access_expr(self, table_expr: str, key_repr: str) -> str:
+        key_ident = self._identifier_from_literal(key_repr)
+        if (
+            not self._has_metatable_flow
+            and key_ident
+            and self._is_simple_identifier(table_expr)
+        ):
+            return f"{table_expr}.{key_ident}"
+        return f"{table_expr}[{key_repr}]"
 
     def _mark_partial_from_limits(self) -> None:
         if not self._limits:
@@ -349,6 +511,20 @@ class _LiftContext(VMEmulator):
         self._metadata.setdefault("function_count", self._function_count)
         self._metadata.setdefault("distinct_opcodes", len(seen))
         self._metadata.setdefault("opcode_coverage", coverage)
+        if self._closure_upvalues:
+            closure_map = self._metadata.setdefault("closure_upvalues", {})
+            for proto, captures in self._closure_upvalues.items():
+                closure_map[str(proto)] = list(captures)
+        if self._has_metatable_flow:
+            self._metadata.setdefault("has_metatable_flow", True)
+        if self._metatable_handlers:
+            self._metadata.setdefault(
+                "metatable_handlers", dict(sorted(self._metatable_handlers.items()))
+            )
+        if isinstance(self._setmetatable_calls, int):
+            self._metadata.setdefault("setmetatable_calls", self._setmetatable_calls)
+        if self._chunk_details:
+            self._metadata.setdefault("chunk_details", list(self._chunk_details))
         if self._limits and self._limits.partial:
             self._mark_partial_from_limits()
         self._debug(
@@ -716,6 +892,7 @@ class _LiftContext(VMEmulator):
                         root=False,
                         script_key=self._script_key_bytes,
                         rehydration_state=self._rehydration_state,
+                        vm_metadata=self._vm_metadata,
                         limits=self._limits,
                         debug_logger=self._debug_logger,
                     )
@@ -1003,10 +1180,16 @@ class _LiftContext(VMEmulator):
         translator = {
             "MOVE": self._translate_move,
             "LOADK": self._translate_loadk,
+            "VARARG": self._translate_vararg,
             "CALL": self._translate_call,
             "RETURN": self._translate_return,
+            "SELF": self._translate_self,
+            "GETUPVAL": self._translate_getupval,
+            "SETUPVAL": self._translate_setupval,
             "GETTABLE": self._translate_gettable,
             "SETTABLE": self._translate_settable,
+            "GETTABUP": self._translate_gettabup,
+            "SETTABUP": self._translate_settabup,
             "CLOSURE": self._translate_closure,
             "ADD": lambda e, i: self._translate_arith(e, i, "+"),
             "SUB": lambda e, i: self._translate_arith(e, i, "-"),
@@ -1027,8 +1210,8 @@ class _LiftContext(VMEmulator):
         dest = self._reg(A)
         src = self._reg(B)
         value = self._register_state.get(B, src)
-        if isinstance(A, int):
-            self._register_state[A] = value
+        self._invalidate_self_for_register(A)
+        self.write_register(A, value)
         line = f"{dest} = {value}  -- MOVE"
         comment = f"MOVE {dest} <- {value}"
         return TranslationResult([line], comment)
@@ -1038,21 +1221,65 @@ class _LiftContext(VMEmulator):
         const_index = self._infer_constant(entry)
         literal = self._format_constant(const_index)
         dest = self._reg(A)
-        if isinstance(A, int):
-            self._register_state[A] = literal
+        self._invalidate_self_for_register(A)
+        self.write_register(A, literal)
         if const_index is None:
             comment = f"LOADK {dest} <- {literal}"
         else:
             comment = f"LOADK {dest} <- K[{const_index}]"
         return TranslationResult([f"{dest} = {literal}  -- LOADK"], comment)
 
+    def _translate_vararg(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
+        A = self._as_int(entry.get("A"))
+        B = self._as_int(entry.get("B"))
+        base_index = A if isinstance(A, int) else 0
+        target_count = (B or 0) - 1 if B else 0
+        dest = self._reg(A)
+        if (B or 0) <= 1:
+            self._invalidate_self_for_register(A)
+            self.write_register(A, "...")
+            self.mark_open_vararg(A)
+            line = f"{dest} = ...  -- VARARG"
+            if B == 0:
+                line += " (open)"
+            return TranslationResult([line], f"VARARG {dest}")
+        targets = [self._reg(base_index + offset) for offset in range(target_count)]
+        for offset in range(target_count):
+            reg_index = base_index + offset
+            value = "..." if offset == 0 else f"select({offset + 1}, ...)"
+            self._invalidate_self_for_register(reg_index)
+            self.write_register(reg_index, value)
+        self.mark_open_vararg(None)
+        assign = ", ".join(targets)
+        line = f"{assign} = ...  -- VARARG"
+        return TranslationResult([line], f"VARARG {assign}")
+
     def _translate_call(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
         A = self._as_int(entry.get("A"))
         B = self._as_int(entry.get("B"))
         C = self._as_int(entry.get("C"))
         func = self._reg(A)
-        args = self._call_args(A, B)
+        raw_args = self._call_args(A, B)
+        stack_lines = [f"stack[#stack+1] = {arg}  -- arg" for arg in raw_args]
+        args = list(raw_args)
         call_expr = f"{func}({', '.join(args)})" if args else f"{func}()"
+        pending_self = self._pending_self_calls.pop(A, None)
+        if pending_self:
+            receiver = pending_self.get("object", self.reg((A or 0) + 1))
+            method_name = pending_self.get("method_name")
+            method_expr = pending_self.get("method_expr", func)
+            args = list(raw_args)
+            if args and args[0] == receiver:
+                args = args[1:]
+            if method_name:
+                call_expr = (
+                    f"{receiver}:{method_name}({', '.join(args)})"
+                    if args
+                    else f"{receiver}:{method_name}()"
+                )
+            else:
+                actual_args = [receiver] + args
+                call_expr = f"{method_expr}({', '.join(actual_args)})"
         stack_lines = [f"stack[#stack+1] = {arg}  -- arg" for arg in args]
         comment = f"CALL {func}"
         returns_meta: Any
@@ -1082,10 +1309,9 @@ class _LiftContext(VMEmulator):
         if isinstance(A, int) and isinstance(C, int) and C > 1:
             for offset in range(C - 1):
                 target_index = A + offset
-                if offset == 0:
-                    self._register_state[target_index] = call_expr
-                else:
-                    self._register_state[target_index] = f"{call_expr}__{offset}"
+                value = call_expr if offset == 0 else f"{call_expr}__{offset}"
+                self._invalidate_self_for_register(target_index)
+                self.write_register(target_index, value)
         lines = stack_lines + [frame_note, f"{assign} = {call_expr}  -- CALL"]
         return TranslationResult(lines, comment + f" -> {assign}")
 
@@ -1095,14 +1321,63 @@ class _LiftContext(VMEmulator):
         self.pop_frame()
         frame_pop = "frames[#frames] = nil"
         if B == 0:
-            lines = [frame_pop, "return ...  -- RETURN"]
-            return TranslationResult(lines, "RETURN varargs")
+            values = self._collect_return_values(A)
+            rendered = ", ".join(values)
+            lines = [frame_pop, f"return {rendered}  -- RETURN"]
+            return TranslationResult(lines, f"RETURN {rendered}")
         if B == 1:
             lines = [frame_pop, "return  -- RETURN"]
             return TranslationResult(lines, "RETURN")
         values = [self._reg((A or 0) + offset) for offset in range((B or 1) - 1)]
         lines = [frame_pop, f"return {', '.join(values)}  -- RETURN"]
         return TranslationResult(lines, f"RETURN {values}")
+
+    def _translate_self(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
+        A = self._as_int(entry.get("A"))
+        B = self._as_int(entry.get("B"))
+        C = self._as_int(entry.get("C"))
+        receiver = self._reg(B)
+        key = self._rk(C)
+        method_expr = f"{receiver}[{key}]"
+        dest = self._reg(A)
+        self_reg = self._reg((A or 0) + 1)
+        self._invalidate_self_for_register(A)
+        self._invalidate_self_for_register((A or 0) + 1)
+        self.write_register(A, method_expr)
+        self.write_register((A or 0) + 1, receiver)
+        method_name: Optional[str] = None
+        if isinstance(key, str) and key.startswith('"') and key.endswith('"'):
+            method_name = key[1:-1]
+        self._pending_self_calls[A] = {
+            "object": receiver,
+            "method_expr": method_expr,
+            "method_name": method_name,
+        }
+        lines = [
+            f"{self_reg} = {receiver}  -- SELF (receiver)",
+            f"{dest} = {method_expr}  -- SELF",
+        ]
+        comment = f"SELF {receiver}:{method_name or key}"
+        return TranslationResult(lines, comment)
+
+    def _translate_getupval(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
+        A = self._as_int(entry.get("A"))
+        B = self._as_int(entry.get("B"))
+        dest = self._reg(A)
+        source = self.upvalue_value(B)
+        self._invalidate_self_for_register(A)
+        self.write_register(A, source)
+        line = f"{dest} = {source}  -- GETUPVAL"
+        return TranslationResult([line], f"GETUPVAL {dest}")
+
+    def _translate_setupval(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
+        A = self._as_int(entry.get("A"))
+        B = self._as_int(entry.get("B"))
+        value = self._register_state.get(A, self._reg(A))
+        cell = self.upvalue_cell(B)
+        self.set_upvalue(B, value)
+        line = f"{cell} = {value}  -- SETUPVAL"
+        return TranslationResult([line], f"SETUPVAL {cell}")
 
     def _translate_gettable(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
         A = self._as_int(entry.get("A"))
@@ -1111,9 +1386,9 @@ class _LiftContext(VMEmulator):
         dest = self._reg(A)
         table = self._reg(B)
         key = self._rk(C)
-        expr = f"{table}[{key}]"
-        if isinstance(A, int):
-            self._register_state[A] = expr
+        expr = self._table_access_expr(table, key)
+        self._invalidate_self_for_register(A)
+        self.write_register(A, expr)
         return TranslationResult([f"{dest} = {expr}  -- GETTABLE"], f"GETTABLE {dest} <- {expr}")
 
     def _translate_settable(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
@@ -1123,8 +1398,32 @@ class _LiftContext(VMEmulator):
         table = self._reg(A)
         key = self._rk(B)
         value = self._rk(C)
-        line = f"{table}[{key}] = {value}  -- SETTABLE"
-        return TranslationResult([line], f"SETTABLE {table}[{key}] = {value}")
+        target = self._table_access_expr(table, key)
+        line = f"{target} = {value}  -- SETTABLE"
+        return TranslationResult([line], f"SETTABLE {target} = {value}")
+
+    def _translate_gettabup(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
+        A = self._as_int(entry.get("A"))
+        B = self._as_int(entry.get("B"))
+        C = self._as_int(entry.get("C"))
+        dest = self._reg(A)
+        table = self.upvalue_value(B)
+        key = self._rk(C)
+        expr = self._table_access_expr(table, key)
+        self._invalidate_self_for_register(A)
+        self.write_register(A, expr)
+        return TranslationResult([f"{dest} = {expr}  -- GETTABUP"], f"GETTABUP {dest} <- {expr}")
+
+    def _translate_settabup(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
+        A = self._as_int(entry.get("A"))
+        B = self._as_int(entry.get("B"))
+        C = self._as_int(entry.get("C"))
+        table = self.upvalue_value(A)
+        key = self._rk(B)
+        value = self._rk(C)
+        target = self._table_access_expr(table, key)
+        line = f"{target} = {value}  -- SETTABUP"
+        return TranslationResult([line], f"SETTABUP {target} = {value}")
 
     def _translate_closure(self, entry: Mapping[str, Any], _: int) -> TranslationResult:
         A = self._as_int(entry.get("A"))
@@ -1136,6 +1435,11 @@ class _LiftContext(VMEmulator):
             self._function_prototypes.add(proto)
             self._function_count += 1
         lines: List[str] = []
+        captures = self._closure_captures(entry)
+        if captures:
+            metadata.setdefault("closure_upvalues", captures)
+            if isinstance(proto, int):
+                self._closure_upvalues[proto] = captures
         info = self._rehydrated_info.get(proto) if isinstance(proto, int) else None
         if info:
             nested_name = self._nested_function_name(proto)
@@ -1175,8 +1479,8 @@ class _LiftContext(VMEmulator):
             lines.append("{DEDENT}")
             lines.append("end")
             lines.append(f"{dest} = {nested_name}  -- CLOSURE")
-            if isinstance(A, int):
-                self._register_state[A] = nested_name
+            self._invalidate_self_for_register(A)
+            self.write_register(A, nested_name)
             metadata["rehydrated"] = True
             return TranslationResult(lines, f"CLOSURE {dest}", metadata=metadata)
         if payload is not None:
@@ -1189,6 +1493,7 @@ class _LiftContext(VMEmulator):
                 root=False,
                 script_key=self._script_key_bytes,
                 rehydration_state=self._rehydration_state,
+                vm_metadata=self._vm_metadata,
                 limits=self._limits,
                 debug_logger=self._debug_logger,
             )
@@ -1206,13 +1511,13 @@ class _LiftContext(VMEmulator):
             lines.append("{DEDENT}")
             lines.append("end")
             lines.append(f"{dest} = {nested_name}  -- CLOSURE")
-            if isinstance(A, int):
-                self._register_state[A] = nested_name
+            self._invalidate_self_for_register(A)
+            self.write_register(A, nested_name)
             return TranslationResult(lines, f"CLOSURE {dest}", metadata=metadata)
         literal = f"closure(proto_{proto if proto is not None else '???'})"
-        if isinstance(A, int):
-            self._register_state[A] = literal
-        return TranslationResult([f"{dest} = {literal}  -- CLOSURE"], f"CLOSURE {dest}")
+        self._invalidate_self_for_register(A)
+        self.write_register(A, literal)
+        return TranslationResult([f"{dest} = {literal}  -- CLOSURE"], f"CLOSURE {dest}", metadata=metadata)
 
     def _translate_arith(
         self, entry: Mapping[str, Any], _: int, op: str
@@ -1224,8 +1529,8 @@ class _LiftContext(VMEmulator):
         right = self._rk(C)
         dest = self._reg(A)
         expr = f"{left} {op} {right}"
-        if isinstance(A, int):
-            self._register_state[A] = expr
+        self._invalidate_self_for_register(A)
+        self.write_register(A, expr)
         mnemonic = entry.get("mnemonic", op)
         return TranslationResult([f"{dest} = {expr}  -- {mnemonic}"], f"{mnemonic} {dest}")
 
@@ -1304,6 +1609,82 @@ class _LiftContext(VMEmulator):
         metadata = {"control": {"type": "jump", "target": target}}
         label = self._labels.get(target, f"label_{target + 1:04d}")
         return TranslationResult([], f"JMP -> {label}", metadata=metadata)
+
+    def _invalidate_self_for_register(self, index: Optional[int]) -> None:
+        if isinstance(index, int):
+            self._pending_self_calls.pop(index, None)
+
+    def _collect_return_values(self, start: Optional[int]) -> List[str]:
+        if not isinstance(start, int):
+            return ["..."]
+        values: List[str] = []
+        index = start
+        max_reg = self.max_initialized_register
+        while index <= max_reg:
+            value = self._register_state.get(index)
+            if value is None:
+                if index == start:
+                    value = self.reg(index)
+                else:
+                    break
+            values.append(value)
+            if value == "..." or value.startswith("select("):
+                break
+            index += 1
+        if not any(v == "..." or v.startswith("select(") for v in values):
+            values.append("...")
+        return values
+
+    def _iter_capture_entries(self, value: Any) -> Iterable[Any]:
+        if value is None:
+            return []
+        if isinstance(value, Mapping):
+            array = value.get("array")
+            if isinstance(array, list):
+                return list(array)
+            return [value]
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return list(value)
+        return [value]
+
+    def _closure_captures(self, entry: Mapping[str, Any]) -> List[str]:
+        raw = (
+            entry.get("captures")
+            or entry.get("upvalues")
+            or entry.get("upvalue_indices")
+            or entry.get("upvalue_map")
+        )
+        captures: List[str] = []
+        for item in self._iter_capture_entries(raw):
+            if isinstance(item, Mapping):
+                type_hint = str(item.get("type") or item.get("kind") or "").lower()
+                up_index = None
+                if "upvalue" in item:
+                    up_index = self._as_int(item.get("upvalue"))
+                if up_index is None and "upvalue_index" in item:
+                    up_index = self._as_int(item.get("upvalue_index"))
+                if up_index is None and type_hint.startswith("up"):
+                    up_index = self._as_int(item.get("index"))
+                if up_index is not None:
+                    captures.append(self.upvalue_cell(up_index))
+                    continue
+                reg_index = None
+                if "register" in item:
+                    reg_index = self._as_int(item.get("register"))
+                if reg_index is None and "reg" in item:
+                    reg_index = self._as_int(item.get("reg"))
+                if reg_index is None and type_hint.startswith("reg"):
+                    reg_index = self._as_int(item.get("index"))
+                if reg_index is not None:
+                    captures.append(self._register_state.get(reg_index, self.reg(reg_index)))
+                    continue
+                continue
+            if isinstance(item, int):
+                captures.append(self.upvalue_cell(item))
+                continue
+            if isinstance(item, str):
+                captures.append(item)
+        return captures
 
     def _translate_unknown(self, entry: Mapping[str, Any]) -> TranslationResult:
         opnum = entry.get("opcode") or entry.get("opnum")
