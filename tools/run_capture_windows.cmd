@@ -37,6 +37,6 @@ if exist .venv\Scripts\activate.bat (
 )
 
 python -m pip install --quiet -r requirements.txt
-python src\sandbox_runner.py --init %INIT% --json %JSON% --key %SCRIPT_KEY% --out %OUT_DIR% --run-lifter %EXTRA%
+python -m src.sandbox_runner --init %INIT% --json %JSON% --key %SCRIPT_KEY% --out %OUT_DIR% --run-lifter %EXTRA%
 
 endlocal

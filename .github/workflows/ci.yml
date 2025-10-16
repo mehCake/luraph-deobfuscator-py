@@ -7,6 +7,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      SCRIPT_KEY: ${{ secrets.LURAPH_TEST_KEY }}
+      LURAPH_SCRIPT_KEY: ${{ secrets.LURAPH_TEST_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +30,11 @@ jobs:
           sudo apt-get install -y luajit luarocks
           sudo luarocks install lua-cjson || true
           luajit -v || true
+
+      - name: Sandbox runner help
+        run: |
+          . .venv/bin/activate
+          python -m src.sandbox_runner --help
 
       - name: Run tests
         run: |

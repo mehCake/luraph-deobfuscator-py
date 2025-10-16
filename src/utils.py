@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from .exceptions import VMEmulationError
 from .vm import LuraphVM
+from src.utils.io_utils import atomic_write
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -68,8 +69,7 @@ def safe_write_file(filepath: str, content: str, encoding: str = 'utf-8') -> boo
     path = Path(filepath)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w', encoding=encoding) as f:
-            f.write(content)
+        atomic_write(path, content, encoding=encoding)
         logging.debug(f"Successfully wrote to file '{filepath}'")
         return True
     except Exception as e:

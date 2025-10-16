@@ -37,7 +37,8 @@ def test_pipeline_full(tmp_path):
     out_dir = tmp_path / "out"
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "src" / "sandbox_runner.py"),
+        "-m",
+        "src.sandbox_runner",
         "--init",
         str(INIT_PATH),
         "--json",
@@ -47,9 +48,16 @@ def test_pipeline_full(tmp_path):
         "--out",
         str(out_dir),
         "--run-lifter",
+        "--use-fixtures",
+        "--lifter-mode",
+        "fast",
     ]
 
-    completed = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    env = os.environ.copy()
+    env.setdefault("SCRIPT_KEY", SCRIPT_KEY)
+    env.setdefault("LURAPH_SCRIPT_KEY", SCRIPT_KEY)
+
+    completed = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT, env=env)
     if completed.returncode != 0:
         failure_path = out_dir / "failure_report.txt"
         failure_text = failure_path.read_text(encoding="utf-8") if failure_path.exists() else "<missing failure report>"
@@ -74,6 +82,9 @@ def test_pipeline_full(tmp_path):
     assert summary_path.exists()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary.get("status") == "ok"
+    assert summary.get("script_key_provider") == "override"
+    assert summary.get("bootstrap_source") == "embedded"
+    assert summary.get("lifter_mode") == "fast"
 
     metadata_path = out_dir / "lift_metadata.json"
     assert metadata_path.exists()
@@ -85,4 +96,11 @@ def test_pipeline_full(tmp_path):
     assert metadata.get("distinct_opcodes", 0) == len(seen)
     if "missing" in coverage:
         assert not coverage["missing"]
+
+    bootstrap_meta_path = out_dir / "bootstrap_blob.meta.json"
+    assert bootstrap_meta_path.exists()
+    bootstrap_meta = json.loads(bootstrap_meta_path.read_text(encoding="utf-8"))
+    assert bootstrap_meta.get("script_key_provider") == "override"
+    assert bootstrap_meta.get("bootstrap_source") == "embedded"
+    assert isinstance(bootstrap_meta.get("timestamp"), str)
 

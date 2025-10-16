@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timezone
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import re
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -18,6 +20,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOG_PATH: Path | None = None
+FIXTURE_DIR = REPO_ROOT / "tools" / "fixtures"
+FIXTURE_JSON = FIXTURE_DIR / "fixture_unpacked_dump.json"
+FIXTURE_LUA = FIXTURE_DIR / "fixture_deobfuscated_output.lua"
+SCRIPT_KEY_LITERAL_RE = re.compile(r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -75,7 +81,13 @@ def _append_failure_notes(out_dir: Path, header: str, lines: Sequence[str]) -> N
     _log(f"Appended diagnostics to {failure_path}")
 
 
-def _copy_bootstrap_blob(json_path: Path, out_dir: Path) -> None:
+def _copy_bootstrap_blob(
+    json_path: Path,
+    out_dir: Path,
+    *,
+    script_key_provider: str,
+    bootstrap_source: str,
+) -> None:
     try:
         raw = json_path.read_bytes()
     except OSError as exc:
@@ -84,6 +96,12 @@ def _copy_bootstrap_blob(json_path: Path, out_dir: Path) -> None:
     encoded = base64.b64encode(raw).decode("ascii")
     target = out_dir / "bootstrap_blob.b64.txt"
     write_text(target, encoded)
+    meta = {
+        "script_key_provider": script_key_provider,
+        "bootstrap_source": bootstrap_source,
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    write_json(out_dir / "bootstrap_blob.meta.json", meta)
     _log(f"Wrote bootstrap blob to {target}")
 
 
@@ -157,6 +175,25 @@ def _write_unpacked_outputs(out_dir: Path, data: Any) -> None:
     _log(f"Wrote unpacked dump to {json_path} and {lua_path}")
 
 
+def _generate_fixture_outputs(out_dir: Path) -> Tuple[bool, Any, str]:
+    if not FIXTURE_JSON.exists():
+        return False, None, "fixture_unpacked_dump.json missing"
+    try:
+        with FIXTURE_JSON.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, None, f"fixture unpacked dump invalid: {exc}"
+
+    _write_unpacked_outputs(out_dir, raw)
+    target_lua = out_dir / "deobfuscated.full.lua"
+    if FIXTURE_LUA.exists():
+        shutil.copyfile(FIXTURE_LUA, target_lua)
+    else:
+        write_text(target_lua, "-- fixture placeholder\nreturn {}\n")
+    _log("Generated deterministic fixture outputs", "WARN")
+    return True, _normalise(raw), "fixture_unpacked_dump.json"
+
+
 def _collect_weak_candidates(out_dir: Path) -> list[str]:
     path = out_dir / "opcode_candidates.json"
     if not path.exists():
@@ -205,48 +242,92 @@ def _validate_unpacked(data: Any) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _describe_script_key_provider(
+    script_key: str,
+    source: str | None,
+    *,
+    forced_missing: bool,
+) -> str:
+    if forced_missing and not script_key:
+        return "force"
+    if script_key:
+        if source == "cli":
+            return "override"
+        if source in {"env", "bootstrap", "auto-lph-context"}:
+            return "detected"
+        return "detected"
+    return "none"
+
+
+def _bootstrap_source_label(json_path: Path) -> str:
+    if json_path.suffix.lower() == ".lua":
+        return "initv4.lua"
+    return "embedded"
+
+
 def _find_luajit() -> Path | None:
     """Compatibility wrapper for legacy imports."""
 
     return find_luajit()
 
 
+def _probe_luajit_runtime(executable: Path) -> bool:
+    try:
+        subprocess.run(
+            [str(executable), "-v"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _probe_lupa_runtime() -> bool:
+    try:
+        from lupa import LuaRuntime  # type: ignore
+    except Exception:
+        return False
+
+    try:
+        runtime = LuaRuntime(unpack_returned_tuples=True)
+        table = runtime.eval("{1,2,3}")
+        try:
+            length = len(table)  # type: ignore[arg-type]
+        except TypeError:
+            length = 0
+        return length == 3
+    except Exception:
+        return False
+
+
+def choose_runtime() -> str:
+    if _probe_lupa_runtime():
+        return "lupa"
+    luajit_exe = _find_luajit()
+    if luajit_exe and _probe_luajit_runtime(luajit_exe):
+        return "luajit"
+    return "emulator"
+
+
+def _extract_script_key_literal(init_path: Path) -> Optional[str]:
+    try:
+        text = init_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = SCRIPT_KEY_LITERAL_RE.search(text)
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    return candidate or None
+
+
 def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: int) -> Tuple[bool, Any, str]:
     luajit_exe = _find_luajit()
     if not luajit_exe:
-        fixture_data = {
-            "array": [
-                4,
-                0,
-                {"array": [2, 2, 2]},
-                {
-                    "array": [
-                        {"array": [None, None, 4, 0, None, 1, 0, 0]},
-                        {"array": [None, None, 0, 0, None, 2, 1, None]},
-                        {"array": [None, None, 28, 0, None, 2, 2, 1]},
-                        {"array": [None, None, 30, 0, None, 0, 0, 0]},
-                    ]
-                },
-                {"array": ["print", "hi"]},
-                {},
-                18,
-                {"array": ["print", "hi"]},
-            ]
-        }
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "logs").mkdir(parents=True, exist_ok=True)
-        unpacked_path = out_dir / "unpacked_dump.json"
-        write_json(unpacked_path, fixture_data)
-        lua_path = out_dir / "deobfuscated.full.lua"
-        write_text(
-            lua_path,
-            "-- fallback fixture\n" "function main()\n  print('hi')\nend\n",
-        )
-        _log(
-            "luajit executable not found; generated minimal fixture unpacked dump",
-            "WARN",
-        )
-        return True, _normalise(fixture_data), ""
+        return False, None, "luajit executable not found"
 
     wrapper = REPO_ROOT / "tools" / "devirtualize_v3.lua"
     if not wrapper.exists():
@@ -254,6 +335,7 @@ def _run_lua_wrapper(out_dir: Path, script_key: str, json_path: Path, timeout: i
 
     env = os.environ.copy()
     env["SCRIPT_KEY"] = script_key
+    env["LURAPH_SCRIPT_KEY"] = script_key
     cmd = build_luajit_command(luajit_exe, str(wrapper), script_key, str(json_path), str(out_dir))
     _log(f"Running Lua wrapper: {subprocess.list2cmdline(cmd)}")
     start = time.time()
@@ -410,14 +492,32 @@ def _write_summary(out_dir: Path, summary: Dict[str, Any]) -> None:
     _log(f"Summary written to {path}")
 
 
+def _augment_summary(
+    summary: Dict[str, Any],
+    *,
+    script_key_provider: str,
+    bootstrap_source: str,
+    lifter_mode: str,
+) -> Dict[str, Any]:
+    summary.setdefault("script_key_provider", script_key_provider)
+    summary.setdefault("bootstrap_source", bootstrap_source)
+    summary.setdefault("lifter_mode", lifter_mode)
+    return summary
+
+
 def _run_lifter_pipeline(
-    out_dir: Path, *, skip_verifier: bool = False, skip_reconstruction: bool = False
+    out_dir: Path,
+    *,
+    mode: str = "accurate",
+    skip_verifier: bool = False,
+    skip_reconstruction: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     from src.lifter_core import run_lifter
     from src.opcode_verifier import run_verification
     from src.deob_reconstruct import reconstruct
 
     lifter_result = run_lifter(out_dir / "unpacked_dump.json", out_dir)
+    lifter_result.setdefault("mode", mode)
     verifier_result: Dict[str, Any] = {"status": "skipped"}
     reconstruct_result: Dict[str, Any] = {"status": "skipped"}
 
@@ -444,10 +544,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Luraph sandbox and optional lifting stages")
     parser.add_argument("--init", required=True, help="Path to initv4.lua")
     parser.add_argument("--json", required=True, help="Path to Obfuscated.json")
-    parser.add_argument("--key", required=True, help="Script key to inject")
+    parser.add_argument("--key", help="Script key to inject (falls back to SCRIPT_KEY env)")
     parser.add_argument("--out", default="out", help="Output directory")
     parser.add_argument("--timeout", type=int, default=12, help="Timeout for sandbox subprocesses")
     parser.add_argument("--run-lifter", action="store_true", help="Run lifter + verification after capture")
+    parser.add_argument(
+        "--lifter-mode",
+        choices=["accurate", "fast"],
+        default="accurate",
+        help="Select lifter accuracy mode when --run-lifter is enabled",
+    )
     parser.add_argument("--use-fixtures", action="store_true", help="Allow using existing out/unpacked_dump.json")
     parser.add_argument("--detect-protections", action="store_true", help="Scan bootstrap for protection techniques")
     parser.add_argument("--capture-runtime", choices=["frida", "luajit", "emulator"], help="Attempt runtime capture via the given method")
@@ -456,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture-target", default=None, help="Process name or file path used by runtime capture helpers")
     parser.add_argument("--lph-api-key", default=None, help="Optional Luraph API key for metadata lookups")
     parser.add_argument("--force-partial", action="store_true", help="Force partial pipeline mode even if macros/settings allow full run")
+    parser.add_argument("--force", action="store_true", help="Proceed without a script key when fixtures are used")
 
     args = parser.parse_args(argv)
 
@@ -473,36 +580,109 @@ def main(argv: list[str] | None = None) -> int:
 
     init_path = Path(args.init).resolve()
     json_path = Path(args.json).resolve()
-    script_key = args.key
+    bootstrap_source = _bootstrap_source_label(json_path)
+
+    script_key_source = "cli" if args.key else None
+    script_key_candidate = args.key or os.environ.get("SCRIPT_KEY") or os.environ.get("LURAPH_SCRIPT_KEY")
+    if script_key_candidate and not script_key_source:
+        script_key_source = "env"
 
     if not init_path.exists():
         _write_failure(out_dir, f"init file not found: {init_path}")
-        _write_summary(out_dir, {
-            "status": "fail",
-            "unpacked_dump_exists": False,
-            "instructions": 0,
-            "unique_opnums": 0,
-            "opcodes_verified": 0,
-            "high_confidence": 0,
-            "chunks": 0,
-            "fallback_fixture": False,
-        })
+        summary = _augment_summary(
+            {
+                "status": "fail",
+                "unpacked_dump_exists": False,
+                "instructions": 0,
+                "unique_opnums": 0,
+                "opcodes_verified": 0,
+                "high_confidence": 0,
+                "chunks": 0,
+                "fallback_fixture": False,
+            },
+            script_key_provider="none",
+            bootstrap_source=bootstrap_source,
+            lifter_mode=args.lifter_mode,
+        )
+        _write_summary(out_dir, summary)
         return 2
     if not json_path.exists():
         _write_failure(out_dir, f"JSON payload not found: {json_path}")
-        _write_summary(out_dir, {
-            "status": "fail",
-            "unpacked_dump_exists": False,
-            "instructions": 0,
-            "unique_opnums": 0,
-            "opcodes_verified": 0,
-            "high_confidence": 0,
-            "chunks": 0,
-            "fallback_fixture": False,
-        })
+        summary = _augment_summary(
+            {
+                "status": "fail",
+                "unpacked_dump_exists": False,
+                "instructions": 0,
+                "unique_opnums": 0,
+                "opcodes_verified": 0,
+                "high_confidence": 0,
+                "chunks": 0,
+                "fallback_fixture": False,
+            },
+            script_key_provider="none",
+            bootstrap_source=bootstrap_source,
+            lifter_mode=args.lifter_mode,
+        )
+        _write_summary(out_dir, summary)
         return 2
 
-    _copy_bootstrap_blob(json_path, out_dir)
+    if not script_key_candidate:
+        inline_key = _extract_script_key_literal(init_path)
+        if inline_key:
+            script_key_candidate = inline_key
+            script_key_source = script_key_source or "bootstrap"
+
+    script_key = script_key_candidate or ""
+    script_key_missing_forced = False
+    script_key_provider = "none"
+    forced_limit_note: Optional[str] = None
+    limitations_collected: List[str] = []
+
+    if not script_key:
+        message = (
+            "script key not provided; supply via --key or set SCRIPT_KEY/LURAPH_SCRIPT_KEY"
+        )
+        if not (args.force or args.use_fixtures):
+            _write_failure(out_dir, message)
+            summary = _augment_summary(
+                {
+                    "status": "fail",
+                    "unpacked_dump_exists": False,
+                    "instructions": 0,
+                    "unique_opnums": 0,
+                    "opcodes_verified": 0,
+                    "high_confidence": 0,
+                    "chunks": 0,
+                    "fallback_fixture": False,
+                },
+                script_key_provider=script_key_provider,
+                bootstrap_source=bootstrap_source,
+                lifter_mode=args.lifter_mode,
+            )
+            _write_summary(out_dir, summary)
+            return 2
+        script_key_missing_forced = True
+        script_key_provider = "force"
+        forced_limit_note = "script key missing; used force/fixtures"
+        _log(message + " (continuing due to --force/--use-fixtures)", "WARN")
+    else:
+        if script_key_source:
+            _log(f"Script key source: {script_key_source}")
+        else:
+            _log("Script key resolved from unspecified source")
+
+    script_key_provider = _describe_script_key_provider(
+        script_key,
+        script_key_source,
+        forced_missing=script_key_missing_forced,
+    )
+    bootstrap_source = _bootstrap_source_label(json_path)
+    _copy_bootstrap_blob(
+        json_path,
+        out_dir,
+        script_key_provider=script_key_provider,
+        bootstrap_source=bootstrap_source,
+    )
 
     detection_report: Dict[str, Any] = _run_detection(
         init_path, out_dir, write_report=args.detect_protections, api_key=args.lph_api_key
@@ -515,6 +695,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     detection_metadata = detection_report.get("metadata", {})
     limitations_collected: list[str] = list(detection_report.get("limitations", []))
+    if forced_limit_note and forced_limit_note not in limitations_collected:
+        limitations_collected.append(forced_limit_note)
 
     def _add_limitation(note: str) -> None:
         if note and note not in limitations_collected:
@@ -637,40 +819,81 @@ def main(argv: list[str] | None = None) -> int:
                 "WARN",
             )
 
+    details = ""
+    last_details = ""
     if not capture_status:
-        _log("Attempting in-process sandbox via lupa")
-        success, data, details = _run_python_sandbox(init_path, json_path, script_key)
-        if success:
-            capture_status = True
-            capture_data = data
-            _write_unpacked_outputs(out_dir, capture_data)
+        if args.use_fixtures:
+            fallback_plan = ["fixture"]
+            _log("--use-fixtures supplied; skipping live sandbox execution")
         else:
-            _log(f"Python sandbox unavailable: {details}", "WARN")
-            _log("Falling back to Lua wrapper")
-            success, data, details = _run_lua_wrapper(out_dir, script_key, json_path, args.timeout)
-            if success:
-                capture_status = True
-                capture_data = data
-            elif args.use_fixtures:
-                _log("Wrapper failed but --use-fixtures supplied; attempting fixture load", "WARN")
-                success, data, details = _load_fixture(out_dir)
+            preferred_runtime = choose_runtime()
+            _log(f"Preferred sandbox runtime: {preferred_runtime}")
+            if preferred_runtime == "lupa":
+                fallback_plan = ["lupa", "luajit", "fixture"]
+            elif preferred_runtime == "luajit":
+                fallback_plan = ["luajit", "lupa", "fixture"]
+            else:
+                fallback_plan = ["fixture", "lupa", "luajit"]
+
+        for method in fallback_plan:
+            if method == "lupa":
+                _log("Attempting in-process sandbox via lupa")
+                success, data, details = _run_python_sandbox(init_path, json_path, script_key)
                 if success:
                     capture_status = True
                     capture_data = data
+                    _write_unpacked_outputs(out_dir, capture_data)
+                    capture_method_used = capture_method_used or "lupa"
+                    break
+                last_details = details
+                _log(f"Python sandbox unavailable: {details}", "WARN")
+            elif method == "luajit":
+                _log("Falling back to Lua wrapper")
+                success, data, details = _run_lua_wrapper(out_dir, script_key, json_path, args.timeout)
+                if success:
+                    capture_status = True
+                    capture_data = data
+                    capture_method_used = capture_method_used or "luajit"
+                    break
+                last_details = details
+                _log(f"Lua wrapper failed: {details}", "WARN")
+            elif method == "fixture":
+                _log("Generating deterministic sandbox fixture", "WARN")
+                success, data, details = _generate_fixture_outputs(out_dir)
+                if success:
+                    capture_data = data
                     fallback_used = True
+                    last_details = "sandbox fallback: used fixture_unpacked_dump.json"
+                    _write_failure(out_dir, last_details)
+                    if args.use_fixtures or script_key_missing_forced:
+                        capture_status = True
+                        capture_method_used = capture_method_used or "fixture"
+                    break
+                last_details = details
+                _log(f"Fixture generation failed: {details}", "WARN")
+            else:
+                continue
+
+        if not capture_status and last_details:
+            details = last_details
 
     if not capture_status:
         _write_failure(out_dir, "sandbox capture failed", details)
-        summary = {
-            "status": "fail",
-            "unpacked_dump_exists": False,
-            "instructions": 0,
-            "unique_opnums": 0,
-            "opcodes_verified": 0,
-            "high_confidence": 0,
-            "chunks": 0,
-            "fallback_fixture": fallback_used,
-        }
+        summary = _augment_summary(
+            {
+                "status": "fail",
+                "unpacked_dump_exists": False,
+                "instructions": 0,
+                "unique_opnums": 0,
+                "opcodes_verified": 0,
+                "high_confidence": 0,
+                "chunks": 0,
+                "fallback_fixture": fallback_used,
+            },
+            script_key_provider=script_key_provider,
+            bootstrap_source=bootstrap_source,
+            lifter_mode=args.lifter_mode,
+        )
         if capture_method_used:
             summary["runtime_capture_method"] = capture_method_used
         summary = _apply_detection_to_summary(summary)
@@ -708,16 +931,21 @@ def main(argv: list[str] | None = None) -> int:
     valid, message = _validate_unpacked(capture_data)
     if not valid:
         _write_failure(out_dir, f"unpacked dump invalid: {message}")
-        summary = {
-            "status": "fail",
-            "unpacked_dump_exists": False,
-            "instructions": 0,
-            "unique_opnums": 0,
-            "opcodes_verified": 0,
-            "high_confidence": 0,
-            "chunks": 0,
-            "fallback_fixture": fallback_used,
-        }
+        summary = _augment_summary(
+            {
+                "status": "fail",
+                "unpacked_dump_exists": False,
+                "instructions": 0,
+                "unique_opnums": 0,
+                "opcodes_verified": 0,
+                "high_confidence": 0,
+                "chunks": 0,
+                "fallback_fixture": fallback_used,
+            },
+            script_key_provider=script_key_provider,
+            bootstrap_source=bootstrap_source,
+            lifter_mode=args.lifter_mode,
+        )
         if capture_method_used:
             summary["runtime_capture_method"] = capture_method_used
         summary = _apply_detection_to_summary(summary)
@@ -727,32 +955,44 @@ def main(argv: list[str] | None = None) -> int:
     unpacked_json_path = out_dir / "unpacked_dump.json"
     if not unpacked_json_path.exists():
         _write_failure(out_dir, "unpacked_dump.json not found after capture")
-        summary = {
-            "status": "fail",
-            "unpacked_dump_exists": False,
-            "instructions": 0,
-            "unique_opnums": 0,
-            "opcodes_verified": 0,
-            "high_confidence": 0,
-            "chunks": 0,
-            "fallback_fixture": fallback_used,
-        }
+        summary = _augment_summary(
+            {
+                "status": "fail",
+                "unpacked_dump_exists": False,
+                "instructions": 0,
+                "unique_opnums": 0,
+                "opcodes_verified": 0,
+                "high_confidence": 0,
+                "chunks": 0,
+                "fallback_fixture": fallback_used,
+            },
+            script_key_provider=script_key_provider,
+            bootstrap_source=bootstrap_source,
+            lifter_mode=args.lifter_mode,
+        )
         if capture_method_used:
             summary["runtime_capture_method"] = capture_method_used
         summary = _apply_detection_to_summary(summary)
         _write_summary(out_dir, summary)
         return 5
 
-    summary = {
-        "status": "ok",
-        "unpacked_dump_exists": True,
-        "instructions": 0,
-        "unique_opnums": 0,
-        "opcodes_verified": 0,
-        "high_confidence": 0,
-        "chunks": 0,
-        "fallback_fixture": fallback_used,
-    }
+    summary = _augment_summary(
+        {
+            "status": "ok",
+            "unpacked_dump_exists": True,
+            "instructions": 0,
+            "unique_opnums": 0,
+            "opcodes_verified": 0,
+            "high_confidence": 0,
+            "chunks": 0,
+            "fallback_fixture": fallback_used,
+        },
+        script_key_provider=script_key_provider,
+        bootstrap_source=bootstrap_source,
+        lifter_mode=args.lifter_mode,
+    )
+    summary["script_key_source"] = script_key_source or ("forced" if script_key_missing_forced else "unknown")
+    summary["script_key_missing_forced"] = script_key_missing_forced
     if capture_method_used:
         summary["runtime_capture_method"] = capture_method_used
     if runtime_metadata:
@@ -767,7 +1007,9 @@ def main(argv: list[str] | None = None) -> int:
             summary = _apply_detection_to_summary(summary)
         else:
             lifter_result, verifier_result, reconstruct_result = _run_lifter_pipeline(
-                out_dir, skip_verifier=skip_verifier_due_to_jit
+                out_dir,
+                mode=args.lifter_mode,
+                skip_verifier=skip_verifier_due_to_jit,
             )
             if lifter_result.get("status") != "ok":
                 _write_failure(out_dir, "lifter failed", lifter_result.get("message", ""))

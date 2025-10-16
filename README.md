@@ -50,9 +50,21 @@ single command:
 
 ```powershell
 pip install -r requirements.txt
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
+python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
 # or
 tools\run_capture_windows.cmd --key <script_key>
+```
+
+The sandbox honours the `SCRIPT_KEY`/`LURAPH_SCRIPT_KEY` environment variables.
+When the CLI flag `--key` is omitted the runner will fall back to the
+environment and inline bootstrap hints before resorting to fixture mode.
+Deterministic CI runs can combine `--use-fixtures` with
+`--lifter-mode fast` to bypass runtime capture and verification while still
+producing a full set of artifacts:
+
+```bash
+SCRIPT_KEY=<script_key> python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json \
+    --out out --run-lifter --use-fixtures --lifter-mode fast
 ```
 
 ### Linux / macOS
@@ -63,7 +75,7 @@ Install LuaJIT and `lua-cjson`, then install the Python dependencies:
 sudo apt-get install -y luajit luarocks
 sudo luarocks install lua-cjson
 pip install -r requirements.txt
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
+python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
 ```
 
 Run `python tools/check_deps.py` at any time to confirm that both lupa and a
@@ -79,23 +91,23 @@ heavily protected payloads:
 
 ```bash
 # Scan initv4.lua (and supporting version shims) for known protection patterns
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
+python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --detect-protections
 
 # Directly run the static detector if you only need the report
 python detect_protections.py initv4.lua -o out/protection_report.json
 
 # Attempt a runtime capture using the Frida helper against a prerecorded trace
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
+python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --capture-runtime frida \
     --capture-target file://path/to/trace.bin
 
 # Force the LuaJIT wrapper capture with extended logging
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
+python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --capture-runtime luajit --capture-timeout 20
 
 # Run in partial mode when macros disable virtualization
-python src/sandbox_runner.py --init initv4.lua --json Obfuscated.json \
+python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json \
     --key <script_key> --out out --force-partial
 ```
 

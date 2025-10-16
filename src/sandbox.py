@@ -99,6 +99,37 @@ def _install_safe_globals(
     """Patch globals to neutralise anti-analysis checks inside the sandbox."""
 
     actions: list[str] = []
+    original_debug_getinfo: Optional[Any] = None
+
+    def _table_lookup(obj: Any, key: str) -> Any:
+        try:
+            if hasattr(obj, "get"):
+                return obj.get(key)
+        except Exception:
+            pass
+        try:
+            return obj[key]
+        except Exception:
+            return None
+
+    def _is_guard_function(func: Any) -> bool:
+        if not callable(func):
+            return False
+        if original_debug_getinfo is None:
+            return False
+        try:
+            info = original_debug_getinfo(func)
+        except Exception:
+            return False
+        what = _table_lookup(info, "what")
+        nups = _table_lookup(info, "nups")
+        try:
+            nups_val = int(nups)
+        except (TypeError, ValueError):
+            nups_val = None
+        if nups_val is None and nups is None:
+            nups_val = 0
+        return what == "Lua" and nups_val == 0
 
     def _log_action(message: str) -> None:
         if log_callback:
@@ -115,38 +146,134 @@ def _install_safe_globals(
             globals_table["debug"] = debug_table
             actions.append("created debug table")
 
+        original_debug_getinfo = None
+        try:
+            original_debug_getinfo = debug_table["getinfo"]
+        except Exception:
+            original_debug_getinfo = None
+
         def _safe_debug_getinfo(*_args: Any, **_kwargs: Any):
             table = lua.table()
             table["short_src"] = "safe"
             table["source"] = "=[neutralized]"
             table["what"] = "Lua"
+            table["nups"] = 0
             table["currentline"] = 0
             return table
 
         debug_table["getinfo"] = _safe_debug_getinfo
         actions.append("patched debug.getinfo")
+
+        def _safe_traceback(*_args: Any, **_kwargs: Any) -> str:
+            return ""
+
+        debug_table["traceback"] = _safe_traceback
+        actions.append("stubbed debug.traceback")
     except Exception as exc:  # pragma: no cover - defensive
         _log_action(f"Failed to patch debug.getinfo: {exc}")
+        original_debug_getinfo = None
+
+    def _flatten_pcall_result(success: bool, result: Any):
+        if isinstance(result, tuple):
+            return (success, *result)
+        if isinstance(result, list):
+            return (success, *result)
+        return (success, result)
 
     # Override pcall so it always reports success while still invoking the function.
     try:
         def _safe_pcall(func: Any, *args: Any):
             if func is None or not callable(func):
                 return (True, func)
+            guard = _is_guard_function(func)
             try:
                 result = func(*args)
-            except Exception:
-                return (True, None)
-            if isinstance(result, tuple):
-                return (True, *result)
-            if isinstance(result, list):
-                return (True, *result)
-            return (True, result)
+            except Exception as exc:
+                if guard:
+                    _log_action("pcall neutralized guard lambda")
+                    return (True, None)
+                return (False, str(exc))
+            return _flatten_pcall_result(True, result)
 
         globals_table["pcall"] = _safe_pcall
         actions.append("patched pcall")
     except Exception as exc:  # pragma: no cover - defensive
         _log_action(f"Failed to patch pcall: {exc}")
+
+    try:
+        def _safe_xpcall(func: Any, err_handler: Any, *args: Any):
+            if func is None or not callable(func):
+                return (True, func)
+            guard = _is_guard_function(func)
+            try:
+                result = func(*args)
+            except Exception as exc:
+                if guard:
+                    _log_action("xpcall neutralized guard lambda")
+                    return (True, None)
+                handler_result = None
+                if callable(err_handler):
+                    try:
+                        handler_result = err_handler(exc)
+                    except Exception:
+                        handler_result = None
+                return _flatten_pcall_result(False, handler_result or str(exc))
+            return _flatten_pcall_result(True, result)
+
+        globals_table["xpcall"] = _safe_xpcall
+        actions.append("patched xpcall")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to patch xpcall: {exc}")
+
+    def _install_noop(name: str, *, return_value: Any = None) -> None:
+        try:
+            def _noop(*_args: Any, **_kwargs: Any):
+                return return_value
+
+            globals_table[name] = _noop
+            actions.append(f"stubbed {name}")
+        except Exception as exc:  # pragma: no cover - defensive
+            _log_action(f"Failed to stub {name}: {exc}")
+
+    _install_noop("collectgarbage", return_value=0)
+    _install_noop("newproxy")
+
+    try:
+        def _safe_getfenv(*_args: Any, **_kwargs: Any):
+            return globals_table
+
+        globals_table["getfenv"] = _safe_getfenv
+        actions.append("stubbed getfenv")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to stub getfenv: {exc}")
+
+    try:
+        def _safe_setfenv(target: Any, env: Any):
+            return target
+
+        globals_table["setfenv"] = _safe_setfenv
+        actions.append("stubbed setfenv")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to stub setfenv: {exc}")
+
+    try:
+        try:
+            jit_table = globals_table["jit"]
+        except Exception:
+            jit_table = None
+        if not hasattr(jit_table, "__setitem__"):
+            jit_table = lua.table()
+            globals_table["jit"] = jit_table
+            actions.append("created jit table")
+
+        def _jit_noop(*_args: Any, **_kwargs: Any):
+            return False
+
+        for jit_name in ("on", "off", "flush", "status", "attach", "detach"):
+            jit_table[jit_name] = _jit_noop
+        actions.append("stubbed jit.*")
+    except Exception as exc:  # pragma: no cover - defensive
+        _log_action(f"Failed to stub jit table: {exc}")
 
     trap_detected = False
     if bootstrap_source and re.search(r"if\s+not\s+is_sandbox\s+then", bootstrap_source):
@@ -212,6 +339,53 @@ def capture_unpacked(
     with open(initv4_path, "r", encoding="utf-8-sig", errors="ignore") as handle:
         code = handle.read()
 
+    if code.startswith("\ufeff"):
+        code = code.lstrip("\ufeff")
+
+    def _execute_bootstrap(source: str) -> None:
+        variants = []
+        if source:
+            variants.append(source)
+            stripped = source.lstrip("\ufeff")
+            if stripped != source:
+                variants.append(stripped)
+            normalised = source.replace("\r\n", "\n")
+            if normalised not in variants:
+                variants.append(normalised)
+
+        loader = None
+        for name in ("loadstring", "load"):
+            try:
+                candidate_loader = globals_table[name]
+            except Exception:
+                candidate_loader = None
+            if callable(candidate_loader):
+                loader = candidate_loader
+                break
+
+        last_error: Exception | None = None
+        for candidate in variants:
+            try:
+                lua.execute(candidate)
+                return
+            except Exception as exc:
+                last_error = exc
+        if loader is not None:
+            for candidate in variants:
+                try:
+                    chunk = loader(candidate)
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                try:
+                    if chunk:
+                        chunk()
+                        return
+                except Exception as exc:
+                    last_error = exc
+        if last_error is not None:
+            _log_neutral(f"lua.execute fallback failed: {last_error}")
+
     _install_safe_globals(
         lua,
         globals_table,
@@ -225,11 +399,9 @@ def capture_unpacked(
         pass
 
     try:
-        lua.execute(code)
-    except Exception:
-        # The bootstrap often raises after scheduling the VM. We ignore errors
-        # here because the hook/global scans below usually still succeed.
-        pass
+        _execute_bootstrap(code)
+    except Exception as exc:
+        _log_neutral(f"bootstrap execution raised: {exc}")
 
     maybe_unpack = globals_table["LPH_UnpackData"]
     if maybe_unpack:

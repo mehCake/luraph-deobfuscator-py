@@ -2,7 +2,7 @@ Luraph Deobfuscation Pipeline Outputs
 =====================================
 
 This directory contains the human-readable artefacts produced by
-``src/sandbox_runner.py``.  Each run captures the virtual machine payload,
+``python -m src.sandbox_runner``.  Each run captures the virtual machine payload,
 analyses its instructions, and writes progressively richer summaries.
 
 Key artefacts
@@ -29,7 +29,7 @@ To repeat the capture with a different key, run:
 
 .. code-block:: console
 
-   python src/sandbox_runner.py \
+   python -m src.sandbox_runner \
        --init initv4.lua \
        --json Obfuscated.json \
        --key <SCRIPT_KEY> \
