@@ -1120,6 +1120,11 @@ class LuaDeobfuscator:
         const_decoder = handler.const_decoder() if handler is not None else None
 
         discovered_chunks = 0
+        source_kind = "lua"
+        if isinstance(source, str) and source.lstrip().startswith(("{", "[")):
+            source_kind = "json"
+        search_text = source if isinstance(source, str) else ""
+        search_start = 0
 
         for index, blob in enumerate(payloads):
             if not isinstance(blob, str):
@@ -1130,6 +1135,23 @@ class LuaDeobfuscator:
                 encoded_lengths.append(max(len(cleaned) - 2, 0))
             else:
                 encoded_lengths.append(len(cleaned))
+
+            offset = -1
+            if search_text:
+                offset = search_text.find(blob, search_start)
+                if offset < 0:
+                    offset = search_text.find(blob)
+                if offset >= 0:
+                    search_start = offset + len(blob)
+
+            header_source = cleaned
+            if len(header_source) >= 2 and header_source[0] in {'"', "'"} and header_source[0] == header_source[-1]:
+                header_source = header_source[1:-1]
+            header_value: Optional[str] = None
+            if len(header_source) >= 4:
+                prefix = header_source[:4]
+                upper = prefix.upper()
+                header_value = upper if upper in {"LPH!", "LPH~"} else prefix
 
             decoded_length = 0
             cleaned_flag = False
@@ -1159,8 +1181,14 @@ class LuaDeobfuscator:
             vm_lift_attempted = False
             chunk_detail: Dict[str, Any] = {
                 "index": index,
+                "chunk_index": index,
                 "decoded_bytes": decoded_length,
+                "source_kind": source_kind,
             }
+            if offset >= 0:
+                chunk_detail["chunk_offset"] = offset
+            if header_value:
+                chunk_detail["header"] = header_value
 
             if suspicious_chunk:
                 message = (
@@ -1303,6 +1331,8 @@ class LuaDeobfuscator:
             meta["chunk_errors"] = errors
         if chunk_details:
             meta["chunk_meta"] = chunk_details
+            payload_meta = meta.setdefault("handler_payload_meta", {})
+            payload_meta["chunk_details"] = [dict(entry) for entry in chunk_details]
         if chunk_suspicious_flags:
             meta["chunk_suspicious_flags"] = chunk_suspicious_flags
         if chunk_warnings:

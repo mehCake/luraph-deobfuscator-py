@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
 
 from src.lifter.cfg import CFGBuilder
-from src.lifter.emit_structured import IfNode, StructuredEmitter, WhileNode
+from src.lifter.emit_structured import IfNode, RepeatNode, StructuredEmitter, WhileNode
 
 
 @dataclass
@@ -49,6 +49,7 @@ def test_emit_if_structure():
     assert any(isinstance(stmt, IfNode) for stmt in emitter.ast)
     assert any(line.strip().startswith("if a < b then") for line in lines)
     assert any("result = 1" in line for line in lines)
+    assert lines.count("return result") == 1
 
 
 def test_emit_while_loop():
@@ -80,6 +81,7 @@ def test_emit_while_loop():
     assert any(isinstance(stmt, WhileNode) for stmt in emitter.ast)
     assert any(line.strip().startswith("while i < limit do") for line in lines)
     assert "goto" not in " ".join(lines)
+    assert lines.count("return i") == 1
 
 
 def _collect_whiles(statements, acc):
@@ -141,3 +143,86 @@ def test_nested_loops_emit():
     assert len(loops) >= 2
     assert any(line.strip().startswith("while outer < bound do") for line in lines)
     assert any(line.strip().startswith("while inner < limit do") for line in lines)
+
+
+def test_emit_if_elseif_else_chain():
+    instructions = [
+        {"mnemonic": "TEST1"},
+        {"mnemonic": "JMP"},
+        {"mnemonic": "LOADK"},
+        {"mnemonic": "JMP"},
+        {"mnemonic": "TEST2"},
+        {"mnemonic": "JMP"},
+        {"mnemonic": "LOADK"},
+        {"mnemonic": "LOADK"},
+        {"mnemonic": "RETURN"},
+    ]
+    translations = [
+        FakeTranslation(metadata={"condition": "x == 1"}),
+        FakeTranslation(
+            metadata={
+                "control": {
+                    "type": "cond",
+                    "condition": "x == 1",
+                    "true_target": 2,
+                    "false_target": 4,
+                    "guard_index": 0,
+                }
+            }
+        ),
+        FakeTranslation(lines=["choice = 'one'"]),
+        FakeTranslation(metadata={"control": {"type": "jump", "target": 8}}),
+        FakeTranslation(metadata={"condition": "x == 2"}),
+        FakeTranslation(
+            metadata={
+                "control": {
+                    "type": "cond",
+                    "condition": "x == 2",
+                    "true_target": 6,
+                    "false_target": 7,
+                    "guard_index": 4,
+                }
+            }
+        ),
+        FakeTranslation(lines=["choice = 'two'"]),
+        FakeTranslation(lines=["choice = 'other'"]),
+        FakeTranslation(lines=["return choice"]),
+    ]
+    _, lines, _ = build_and_emit(instructions, translations)
+    structured = "\n".join(lines)
+    assert "elseif x == 2 then" in structured
+    assert structured.count("return choice") == 1
+
+
+def test_repeat_until_reconstruction():
+    instructions = [
+        {"mnemonic": "TEST"},
+        {"mnemonic": "JMP"},
+        {"mnemonic": "LOADK"},
+        {"mnemonic": "GUARD"},
+        {"mnemonic": "JMP"},
+        {"mnemonic": "RETURN"},
+    ]
+    translations = [
+        FakeTranslation(),
+        FakeTranslation(
+            metadata={
+                "control": {
+                    "type": "cond",
+                    "condition": "true",
+                    "true_target": 2,
+                    "false_target": 5,
+                    "guard_index": 0,
+                }
+            }
+        ),
+        FakeTranslation(lines=["process()"]),
+        FakeTranslation(lines=["if done then", "{INDENT}", "break", "{DEDENT}", "end"]),
+        FakeTranslation(metadata={"control": {"type": "jump", "target": 1}}),
+        FakeTranslation(lines=["return result"]),
+    ]
+    emitter, lines, _ = build_and_emit(instructions, translations)
+    assert any(isinstance(stmt, RepeatNode) for stmt in emitter.ast)
+    structured = "\n".join(lines)
+    assert "repeat" in structured and "until done" in structured
+    assert structured.count("return result") == 1

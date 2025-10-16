@@ -34,6 +34,9 @@ class VMEmulator:
         self._frame_depth = 0
         self._max_call_depth = 0
         self._upvalues: Dict[int, str] = {}
+        self._upvalue_cells: Dict[int, str] = {}
+        self._max_initialized_register = -1
+        self._open_vararg_base: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -75,10 +78,66 @@ class VMEmulator:
                 return literal
         return f"K[{index}]"
 
-    def call_args(self, base: int, count: Optional[int]) -> List[str]:
+    def call_args(self, base: Optional[int], count: Optional[int]) -> List[str]:
+        if not isinstance(base, int):
+            return []
+        if count == 0:
+            args: List[str] = []
+            max_reg = max(self._max_initialized_register, base)
+            index = base + 1
+            while index <= max_reg:
+                value = self._register_state.get(index)
+                if value is None:
+                    break
+                args.append(value)
+                if value == "..." or value.startswith("select("):
+                    break
+                index += 1
+            if not args and isinstance(self._open_vararg_base, int) and self._open_vararg_base >= base + 1:
+                args.append("...")
+            return args
         if not isinstance(count, int) or count <= 1:
             return []
-        return [self.reg(base + offset) for offset in range(1, count)]
+        args: List[str] = []
+        for offset in range(1, count):
+            reg_index = base + offset
+            value = self._register_state.get(reg_index)
+            if value is None:
+                value = self.register_name(reg_index)
+            args.append(value)
+        return args
+
+    def write_register(self, index: Optional[int], value: str) -> None:
+        if not isinstance(index, int):
+            return
+        self._register_state[index] = value
+        self._max_initialized_register = max(self._max_initialized_register, index)
+
+    def upvalue_cell(self, index: Optional[int]) -> str:
+        if not isinstance(index, int):
+            return "UPVAL[?]"
+        name = self._upvalue_cells.get(index)
+        if name is None:
+            name = f"UPVAL{index}"
+            self._upvalue_cells[index] = name
+        return name
+
+    def upvalue_value(self, index: Optional[int]) -> str:
+        if not isinstance(index, int):
+            return "UPVAL[?]"
+        return self._upvalues.get(index, self.upvalue_cell(index))
+
+    def set_upvalue(self, index: Optional[int], value: str) -> None:
+        if not isinstance(index, int):
+            return
+        self.upvalue_cell(index)
+        self._upvalues[index] = value
+
+    def mark_open_vararg(self, base: Optional[int]) -> None:
+        if isinstance(base, int):
+            self._open_vararg_base = base
+        else:
+            self._open_vararg_base = None
 
     def lua_literal(self, value: Any) -> str:
         if isinstance(value, str):
@@ -181,6 +240,10 @@ class VMEmulator:
     @property
     def prototypes(self) -> Sequence[Any]:
         return self._prototypes
+
+    @property
+    def max_initialized_register(self) -> int:
+        return self._max_initialized_register
 
 
 __all__ = ["VMEmulator", "FrameSnapshot"]

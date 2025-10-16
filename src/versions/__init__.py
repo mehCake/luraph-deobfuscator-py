@@ -9,6 +9,8 @@ from typing import Any, Dict, Iterable, Iterator, Optional, Protocol, Tuple, Typ
 if False:  # pragma: no cover - typing helpers
     from ..vm.emulator import LuraphVM
 
+from ..vm.opcode_constants import is_mandatory_mnemonic
+
 _CONFIG_PATH = Path(__file__).with_name("config.json")
 _DATA = json.loads(_CONFIG_PATH.read_text())
 _VERSIONS: Dict[str, Dict[str, Any]] = _DATA.get("versions", {})
@@ -32,6 +34,11 @@ class OpSpec:
     mnemonic: str
     operands: Tuple[str, ...] = ()
     description: str | None = None
+    mandatory: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.mandatory and is_mandatory_mnemonic(self.mnemonic):
+            object.__setattr__(self, "mandatory", True)
 
 
 @runtime_checkable
@@ -164,6 +171,7 @@ __all__ = [
     "ConstDecoder",
     "decode_constant_pool",
     "OpSpec",
+    "is_mandatory_mnemonic",
     "PayloadInfo",
     "VersionHandler",
     "get_handler",

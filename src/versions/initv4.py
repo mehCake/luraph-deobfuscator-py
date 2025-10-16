@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from src.utils import write_json
+from src.vm.opcode_constants import MANDATORY_CONFIDENCE_THRESHOLD, MANDATORY_MNEMONICS
 from src.vm.opcode_utils import opcode_table_merge
 
 from . import OpSpec
@@ -65,12 +66,39 @@ _TABLE_ASSIGN_RE = re.compile(
     re.DOTALL,
 )
 
+_SETMETATABLE_CALL_RE = re.compile(r'\bsetmetatable\s*\(')
+
+_METAMETHOD_ASSIGN_PATTERNS: Dict[str, re.Pattern[str]] = {
+    name: re.compile(
+        rf"(?:\[\s*['\"]{name}['\"]\s*\]|(?<!\w){name}(?!\w))\s*=\s*",
+    )
+    for name in ("__index", "__newindex")
+}
+
 
 LOG = logging.getLogger(__name__)
 
 
 def _is_identifier_char(char: str) -> bool:
     return char.isalnum() or char == "_"
+
+
+def _metatable_handler_counts(text: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    if not text:
+        return counts
+    for name, pattern in _METAMETHOD_ASSIGN_PATTERNS.items():
+        matches = list(pattern.finditer(text))
+        if matches:
+            counts[name] = len(matches)
+    return counts
+
+
+def _detect_metatable_flow(text: str) -> tuple[bool, Dict[str, int], int]:
+    handlers = _metatable_handler_counts(text)
+    setmeta_calls = len(_SETMETATABLE_CALL_RE.findall(text)) if text else 0
+    has_flow = bool(handlers)
+    return has_flow, handlers, setmeta_calls
 
 
 def _matches_keyword(text: str, index: int, keyword: str) -> bool:
@@ -695,6 +723,14 @@ class InitV4Bootstrap:
         opcode_name_map = extracted.get("opcode_map") or {}
         constants: Dict[str, int] = dict(extracted.get("constants") or {})
 
+        has_metatable_flow, metamethod_handlers, setmeta_calls = _detect_metatable_flow(self.text)
+        if metamethod_handlers:
+            self.metadata.setdefault("metatable_handlers", dict(metamethod_handlers))
+            if setmeta_calls:
+                self.metadata.setdefault("setmetatable_calls", setmeta_calls)
+        if has_metatable_flow:
+            self.metadata.setdefault("has_metatable_flow", True)
+
         if debug:
             raw = extracted.get("raw_matches")
             if isinstance(raw, dict) and raw:
@@ -919,9 +955,32 @@ class InitV4Bootstrap:
             "helper_structures": helper_structures,
         }
 
+        if metamethod_handlers:
+            extraction["metatable_handlers"] = dict(sorted(metamethod_handlers.items()))
+            if setmeta_calls:
+                extraction["setmetatable_calls"] = setmeta_calls
+        if has_metatable_flow:
+            extraction["has_metatable_flow"] = True
+
         canonical_entries: List[Dict[str, object]] = []
+        mandatory_status: Dict[str, Optional[Dict[str, object]]] = {
+            name: None for name in MANDATORY_MNEMONICS
+        }
+
         if merged_canonical:
             for opcode, info in sorted(merged_canonical.items()):
+                mnemonic_value = info.get("mnemonic")
+                if isinstance(mnemonic_value, str):
+                    upper_name = mnemonic_value.upper()
+                    existing_entry = mandatory_status.get(upper_name)
+                    if upper_name in mandatory_status:
+                        current_confidence = int(info.get("confidence", 0) or 0)
+                        if (
+                            existing_entry is None
+                            or int(existing_entry.get("confidence", 0) or 0)
+                            < current_confidence
+                        ):
+                            mandatory_status[upper_name] = dict(info)
                 canonical_entries.append(
                     {
                         "opcode": opcode,
@@ -930,8 +989,17 @@ class InitV4Bootstrap:
                         "operands": info.get("operands"),
                         "trust": info.get("trust"),
                         "source": info.get("source"),
+                        "confidence": info.get("confidence"),
+                        "mandatory": info.get("mandatory"),
                     }
                 )
+
+        mandatory_missing = [
+            name
+            for name, entry in mandatory_status.items()
+            if entry is None or int(entry.get("confidence", 0) or 0)
+            < MANDATORY_CONFIDENCE_THRESHOLD
+        ]
 
         if opcode_entries:
             extraction["opcode_table"] = {
@@ -942,6 +1010,11 @@ class InitV4Bootstrap:
             }
             if canonical_entries:
                 extraction["opcode_table"]["canonical_entries"] = canonical_entries
+            if mandatory_missing:
+                extraction["opcode_table"]["mandatory_missing"] = sorted(mandatory_missing)
+                extraction["opcode_table"][
+                    "mandatory_threshold"
+                ] = MANDATORY_CONFIDENCE_THRESHOLD
         elif canonical_entries:
             extraction["opcode_table"] = {
                 "count": len(canonical_entries),
@@ -949,6 +1022,11 @@ class InitV4Bootstrap:
                 "trusted_entries": trusted_high,
                 "canonical_entries": canonical_entries,
             }
+            if mandatory_missing:
+                extraction["opcode_table"]["mandatory_missing"] = sorted(mandatory_missing)
+                extraction["opcode_table"][
+                    "mandatory_threshold"
+                ] = MANDATORY_CONFIDENCE_THRESHOLD
 
         if warnings:
             extraction["warnings"] = list(warnings)
@@ -977,6 +1055,14 @@ class InitV4Bootstrap:
             summary["opcode_table_trusted"] = trusted_high >= 30
         if warnings:
             summary["warnings"] = list(warnings)
+        if metamethod_handlers:
+            summary["metatable_handlers"] = dict(sorted(metamethod_handlers.items()))
+            if setmeta_calls:
+                summary["setmetatable_calls"] = setmeta_calls
+        if has_metatable_flow:
+            summary["has_metatable_flow"] = True
+        if mandatory_missing:
+            summary.setdefault("opcode_table_mandatory_missing", sorted(mandatory_missing))
 
         for key, value in summary.items():
             if key == "extraction":
@@ -997,6 +1083,11 @@ class InitV4Bootstrap:
                 table_meta.setdefault("entries", opcode_entries)
                 if canonical_entries:
                     table_meta.setdefault("canonical_entries", canonical_entries)
+                if mandatory_missing:
+                    table_meta.setdefault("mandatory_missing", sorted(mandatory_missing))
+                    table_meta.setdefault(
+                        "mandatory_threshold", MANDATORY_CONFIDENCE_THRESHOLD
+                    )
         elif canonical_entries:
             table_meta = self.metadata.setdefault(
                 "opcode_table",
@@ -1008,6 +1099,11 @@ class InitV4Bootstrap:
             )
             if isinstance(table_meta, dict):
                 table_meta.setdefault("canonical_entries", canonical_entries)
+                if mandatory_missing:
+                    table_meta.setdefault("mandatory_missing", sorted(mandatory_missing))
+                    table_meta.setdefault(
+                        "mandatory_threshold", MANDATORY_CONFIDENCE_THRESHOLD
+                    )
 
         if debug and raw_matches:
             dump_payload = {

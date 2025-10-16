@@ -73,3 +73,35 @@ def test_opcode_table_merge_prefers_high_trust() -> None:
     assert merged[0x11]["mnemonic"] == "ADD"
     assert merged[0x11]["operands"] == "A B C"
     assert merged[0x11]["trust"] == "low"
+
+
+def test_opcode_table_merge_marks_confidence_and_mandatory() -> None:
+    bootstrap_handlers = {
+        0x00: OpcodeHandler(
+            opcode=0x00,
+            mnemonic="move",
+            operands="A B",
+            trust="high",
+            source_snippet="function(state, a, b) state[a] = state[b] end",
+            offset=0,
+        )
+    }
+    heuristic_table = {
+        0x00: OpSpec("MOVE", ("A", "B")),
+        0x01: OpSpec("LOADK", ("A", "Bx")),
+        0x1C: OpSpec("CALL", ("A", "B", "C")),
+    }
+
+    merged = opcode_table_merge(bootstrap_handlers, heuristic_table)
+
+    move_entry = merged[0x00]
+    assert move_entry["trust"] == "high"
+    assert move_entry["confidence"] >= 3
+    assert move_entry["mandatory"] is True
+    assert move_entry["source"] == "bootstrap"
+
+    loadk_entry = merged[0x01]
+    assert loadk_entry["trust"] == "heuristic"
+    assert loadk_entry["confidence"] == 0
+    assert loadk_entry["mandatory"] is True
+    assert loadk_entry["source"] == "heuristic"
