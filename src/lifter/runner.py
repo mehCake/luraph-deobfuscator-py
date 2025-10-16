@@ -125,6 +125,7 @@ def run_lifter_safe(
     prototypes: Sequence[Any] | None = None,
     script_key: Optional[str | bytes] = None,
     rehydration_state: Optional[Mapping[str, Any]] = None,
+    vm_metadata: Optional[Mapping[str, Any]] = None,
     instruction_budget: Optional[int] = DEFAULT_INSTRUCTION_BUDGET,
     time_limit: Optional[float] = DEFAULT_TIME_LIMIT,
     recursion_limit: Optional[int] = DEFAULT_RECURSION_LIMIT,
@@ -171,6 +172,7 @@ def run_lifter_safe(
             root=root,
             script_key=script_key,
             rehydration_state=rehydration_state,
+            vm_metadata=vm_metadata,
             limits=limits,
             debug_logger=debug_logger,
         )

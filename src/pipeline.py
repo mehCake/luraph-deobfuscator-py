@@ -35,6 +35,7 @@ from .passes.payload_decode import run as payload_decode_run
 from .passes.vm_devirtualize import run as vm_devirtualize_run
 from .passes.vm_lift import run as vm_lift_run
 from .passes.cleanup import run as cleanup_run
+from .passes.string_folding import run as string_folding_run
 from .passes.string_reconstruction import run as string_reconstruction_run
 from .passes.render import run as render_run
 
@@ -748,6 +749,18 @@ def _pass_cleanup(ctx: Context) -> None:
         ctx.write_artifact("cleanup", ctx.stage_output)
 
 
+def _pass_string_folding(ctx: Context) -> None:
+    metadata = string_folding_run(ctx)
+    report = ctx.report
+    if report is not None:
+        warnings = metadata.get("warnings")
+        if isinstance(warnings, list):
+            report.warnings.extend(str(item) for item in warnings if item)
+    ctx.record_metadata("string_folding", metadata)
+    if ctx.stage_output:
+        ctx.write_artifact("string_folding", ctx.stage_output)
+
+
 def _pass_string_reconstruction(ctx: Context) -> None:
     metadata = string_reconstruction_run(ctx)
     report = ctx.report
@@ -781,6 +794,7 @@ PIPELINE.register_pass("payload_decode", _pass_payload_decode, 30)
 PIPELINE.register_pass("vm_lift", _pass_vm_lift, 40)
 PIPELINE.register_pass("vm_devirtualize", _pass_vm_devirtualize, 50)
 PIPELINE.register_pass("cleanup", _pass_cleanup, 60)
+PIPELINE.register_pass("string_folding", _pass_string_folding, 62)
 PIPELINE.register_pass("string_reconstruction", _pass_string_reconstruction, 65)
 PIPELINE.register_pass("render", _pass_render, 70)
 
