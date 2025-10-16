@@ -432,6 +432,25 @@ def _strip_json_quotes_and_escapes(blob: str) -> str:
     return stripped
 
 
+def _detect_source_kind(text: str, *, default: str = "lua") -> str:
+    stripped = text.lstrip()
+    if not stripped:
+        return default
+    if stripped[0] in "[{":
+        return "json"
+    return default
+
+
+def _extract_chunk_header(body: str) -> Optional[str]:
+    if not body or len(body) < 4:
+        return None
+    prefix = body[:4]
+    upper = prefix.upper()
+    if upper in {"LPH!", "LPH~"}:
+        return upper
+    return prefix
+
+
 def _persist_bootstrap_blob(
     ctx: "Context", decoded: bytes, *, chunk_index: int
 ) -> Optional[Dict[str, str]]:
@@ -1056,6 +1075,12 @@ def _iterative_initv4_decode(
             initial_artifacts["opcode_map"]
         )
 
+    discovery_counter = 0
+    source_kind_default = "json" if getattr(ctx, "from_json", False) else "lua"
+    source_kind = _detect_source_kind(current_text, default=source_kind_default)
+    search_text = current_text
+    search_start = 0
+
     for _iteration in range(max(1, max_iterations)):
         try:
             payloads = decoder.locate_payload(current_text)
@@ -1072,6 +1097,14 @@ def _iterative_initv4_decode(
         for blob in payloads:
             if not isinstance(blob, str):
                 continue
+
+            offset = -1
+            if search_text:
+                offset = search_text.find(blob, search_start)
+                if offset < 0:
+                    offset = search_text.find(blob)
+                if offset >= 0:
+                    search_start = offset + len(blob)
 
             stripped = _strip_json_quotes_and_escapes(blob)
             encoded_length = len(stripped)
@@ -1188,11 +1221,20 @@ def _iterative_initv4_decode(
             chunk_record.update(
                 {
                     "index": chunk_index,
+                    "chunk_index": chunk_index,
                     "encoded_size": encoded_length,
                     "decoded_byte_count": len(decoded_bytes),
                     "used_key_masked": masked_key,
                 }
             )
+            header = _extract_chunk_header(stripped)
+            if header:
+                chunk_record["header"] = header
+            if offset >= 0:
+                chunk_record["chunk_offset"] = offset
+            chunk_record["source_kind"] = source_kind
+            chunk_record["discovery_order"] = discovery_counter
+            discovery_counter += 1
             alphabet_source = "bootstrap" if decoder.alphabet else "heuristic"
             if manual_alphabet_override and decoder.alphabet:
                 alphabet_source = "manual_override"
@@ -1361,6 +1403,12 @@ def _iterative_initv4_decode(
             change_bucket = payload_meta.setdefault("payload_iteration_changes", [])
             for change in iteration_changes:
                 change_bucket.append(bool(change))
+
+    if aggregate_meta["chunk_details"]:
+        payload_meta = aggregate_meta.setdefault("handler_payload_meta", {})
+        payload_meta["chunk_details"] = [
+            dict(entry) for entry in aggregate_meta["chunk_details"]
+        ]
 
     return decoded_chunks, current_text, aggregate_meta
 
@@ -1541,6 +1589,13 @@ def _merge_chunk_meta(metadata: Dict[str, Any], chunk_meta: Dict[str, Any]) -> N
         if isinstance(success, int):
             metadata["handler_chunk_success_count"] = success
 
+    details = chunk_meta.get("chunk_details")
+    if isinstance(details, list):
+        bucket = payload_meta.setdefault("chunk_details", [])
+        for entry in details:
+            if isinstance(entry, dict):
+                bucket.append(dict(entry))
+
     if (
         "chunk_suspicious_flags" in chunk_meta
         and "handler_chunk_suspicious" not in metadata
@@ -1687,11 +1742,35 @@ def _merge_payload_meta(target: Dict[str, Any], meta: Any) -> None:
                 if isinstance(item, int):
                     existing.append(item)
             continue
-        if key in {"chunk_meta", "decode_attempts", "decode_errors"} and isinstance(value, list):
+        if key == "handler_payload_meta" and isinstance(value, Mapping):
+            existing_meta = target.setdefault("handler_payload_meta", {})
+            if not isinstance(existing_meta, dict):
+                existing_meta = {}
+                target["handler_payload_meta"] = existing_meta
+            nested_details = value.get("chunk_details")
+            if isinstance(nested_details, list):
+                detail_bucket = existing_meta.setdefault("chunk_details", [])
+                order_base = len(detail_bucket)
+                for offset, item in enumerate(nested_details):
+                    if isinstance(item, dict):
+                        entry = dict(item)
+                        entry["discovery_order"] = order_base + offset
+                        detail_bucket.append(entry)
+            for nested_key, nested_value in value.items():
+                if nested_key == "chunk_details":
+                    continue
+                if nested_key not in existing_meta:
+                    existing_meta[nested_key] = nested_value
+            continue
+        if key in {"chunk_meta", "chunk_details", "decode_attempts", "decode_errors"} and isinstance(value, list):
             existing = target.setdefault(key, [])
-            for item in value:
+            order_base = len(existing)
+            for offset, item in enumerate(value):
                 if isinstance(item, dict):
-                    existing.append(dict(item))
+                    entry = dict(item)
+                    if key in {"chunk_meta", "chunk_details"}:
+                        entry["discovery_order"] = order_base + offset
+                    existing.append(entry)
             continue
         if key in {"chunk_methods", "chunk_alphabet_sources"} and isinstance(value, list):
             existing = target.setdefault(key, [])
@@ -2292,6 +2371,26 @@ def _finalise_metadata(
                     payload_meta.setdefault(key, value)
         final["handler_payload_meta"] = payload_meta
 
+    payload_meta = final.get("handler_payload_meta")
+    if isinstance(payload_meta, dict):
+        details = payload_meta.get("chunk_details")
+        if isinstance(details, list):
+            normalised: List[Dict[str, Any]] = []
+            for entry in details:
+                if isinstance(entry, Mapping):
+                    normalised.append(dict(entry))
+            if normalised:
+                normalised.sort(
+                    key=lambda item: (
+                        item.get("discovery_order", 0),
+                        item.get("chunk_offset", 0),
+                    )
+                )
+                for index, entry in enumerate(normalised):
+                    entry["chunk_index"] = index
+                    entry.pop("discovery_order", None)
+                payload_meta["chunk_details"] = normalised
+
     if last_meta:
         if last_meta.get("script_payload"):
             final["script_payload"] = True
@@ -2607,6 +2706,28 @@ def run(ctx: "Context") -> Dict[str, Any]:
             base_raw.update(ctx_raw)
             merged["raw_matches"] = base_raw
         ctx.result["bootstrapper_metadata"] = merged
+
+    payload_meta_obj = metadata.get("handler_payload_meta")
+    chunk_payloads: List[Dict[str, Any]] = []
+    if isinstance(payload_meta_obj, Mapping):
+        detail_entries = payload_meta_obj.get("chunk_details")
+        if isinstance(detail_entries, list):
+            for entry in detail_entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                record: Dict[str, Any] = {}
+                if isinstance(entry.get("chunk_index"), int):
+                    record["chunk_index"] = entry["chunk_index"]
+                if isinstance(entry.get("source_kind"), str):
+                    record["source_kind"] = entry["source_kind"]
+                if isinstance(entry.get("header"), str):
+                    record["header"] = entry["header"]
+                if isinstance(entry.get("chunk_offset"), int):
+                    record["chunk_offset"] = entry["chunk_offset"]
+                if record:
+                    chunk_payloads.append(record)
+    if chunk_payloads:
+        ctx.vm_metadata["payload_chunks"] = chunk_payloads
 
     placeholder_source = metadata.get("handler_placeholder_source")
     if (

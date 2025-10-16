@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import bz2
+import hashlib
 import json
 import logging
 import lzma
@@ -186,6 +187,18 @@ def _ensure_instruction_dicts(items: Iterable[Any]) -> List[Dict[str, Any]]:
     return instructions
 
 
+def _coerce_sequence(value: Any) -> Optional[List[Any]]:
+    if isinstance(value, LuaTable):
+        value = value.to_python()
+    if isinstance(value, Mapping):
+        array_data = value.get("array")
+        if isinstance(array_data, Sequence) and not isinstance(array_data, (str, bytes, bytearray)):
+            return list(array_data)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return list(value)
+    return None
+
+
 def _normalise_rehydrated_payload(payload: Any) -> Optional[Dict[str, Any]]:
     if isinstance(payload, LuaTable):
         payload = _lua_to_python(payload)
@@ -215,14 +228,86 @@ def _normalise_rehydrated_payload(payload: Any) -> Optional[Dict[str, Any]]:
         if instructions is not None:
             proto_constants = list(constants) if isinstance(constants, Sequence) else []
             proto_prototypes = list(prototypes) if isinstance(prototypes, Sequence) else []
+            upvalues = payload.get("upvalues") if isinstance(payload, Mapping) else []
+            upvalue_entries = _coerce_sequence(upvalues) or []
             return {
                 "instructions": _ensure_instruction_dicts(instructions),
                 "constants": [_lua_to_python(item) for item in proto_constants],
                 "prototypes": [_lua_to_python(item) for item in proto_prototypes],
+                "upvalues": [_lua_to_python(item) for item in upvalue_entries],
             }
     if isinstance(payload, list):
-        return {"instructions": _ensure_instruction_dicts(payload), "constants": [], "prototypes": []}
+        return {
+            "instructions": _ensure_instruction_dicts(payload),
+            "constants": [],
+            "prototypes": [],
+            "upvalues": [],
+        }
     return None
+
+
+def _proto_digest_counts(
+    payload: Any,
+    normalised: Optional[Mapping[str, Any]],
+) -> Tuple[int, int, int]:
+    code_len = 0
+    const_len = 0
+    upvalue_len = 0
+
+    if isinstance(normalised, Mapping):
+        instructions = normalised.get("instructions")
+        if isinstance(instructions, Sequence):
+            code_len = len(instructions)
+        constants = normalised.get("constants")
+        if isinstance(constants, Sequence):
+            const_len = len(constants)
+        upvalues = normalised.get("upvalues")
+        if isinstance(upvalues, Sequence):
+            upvalue_len = len(upvalues)
+
+    if code_len == 0 and payload is not None:
+        if isinstance(payload, Mapping):
+            for key in ("instructions", "code", "bytecode", "opcodes"):
+                seq = _coerce_sequence(payload.get(key))
+                if seq is not None:
+                    code_len = len(seq)
+                    break
+        elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+            code_len = len(payload)
+
+    if const_len == 0 and isinstance(payload, Mapping):
+        for key in ("constants", "consts", "k", "values"):
+            seq = _coerce_sequence(payload.get(key))
+            if seq is not None:
+                const_len = len(seq)
+                break
+
+    if upvalue_len == 0 and isinstance(payload, Mapping):
+        for key in ("upvalues", "upvals", "upvalue_map"):
+            seq = _coerce_sequence(payload.get(key))
+            if seq is not None:
+                upvalue_len = len(seq)
+                break
+        if upvalue_len == 0:
+            for key in ("nups", "num_upvalues", "upvalue_count"):
+                raw = payload.get(key)
+                if isinstance(raw, (int, float)):
+                    upvalue_len = int(raw)
+                    break
+
+    return code_len, const_len, upvalue_len
+
+
+def _compute_rehydration_digest(
+    payload: Any,
+    normalised: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    code_len, const_len, upvalue_len = _proto_digest_counts(payload, normalised)
+    try:
+        digest_input = f"{code_len}|{const_len}|{upvalue_len}".encode("ascii")
+    except UnicodeEncodeError:  # pragma: no cover - defensive
+        return None
+    return hashlib.sha1(digest_input).hexdigest()
 
 
 def _interpret_rehydrated_payload(data: bytes) -> Tuple[Optional[Any], Optional[str], Dict[str, Any]]:
@@ -405,6 +490,7 @@ def rehydrate_encfunc(
     normalised: Optional[Dict[str, Any]] = None
     lua_source: Optional[str] = None
     method_used = "raw"
+    last_digest: Optional[str] = None
 
     for label, decrypt_callable in candidate_attempts:
         try:
@@ -417,9 +503,16 @@ def rehydrate_encfunc(
         last_payload = payload
         last_meta = meta
         method_used = label
+        candidate_normalised: Optional[Dict[str, Any]] = None
+        if payload_obj is not None:
+            candidate_normalised = _normalise_rehydrated_payload(payload_obj)
+            digest_value = _compute_rehydration_digest(payload_obj, candidate_normalised)
+            if digest_value:
+                meta["rehydration_digest"] = digest_value
+                last_digest = digest_value
         if payload_obj is None and source_text is None:
             continue
-        normalised = _normalise_rehydrated_payload(payload_obj)
+        normalised = candidate_normalised
         lua_source = source_text
         break
 
@@ -432,6 +525,9 @@ def rehydrate_encfunc(
         "errors": errors,
     }
     metadata.update(last_meta)
+
+    if normalised is None and lua_source is None and last_digest:
+        errors.append(f"{method_used}: failed to lift proto (digest={last_digest})")
 
     result = EncFuncResult(
         proto=normalised,

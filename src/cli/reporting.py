@@ -183,6 +183,28 @@ def run_lifter_for_cli(
     trace_logger = None
     debug_directory: Optional[Path] = None
 
+    vm_errors: List[str] = []
+    if mode == "accurate":
+        vm_meta = getattr(ctx, "vm_metadata", None)
+        if isinstance(vm_meta, Mapping):
+            error_list = vm_meta.get("errors")
+            if isinstance(error_list, Sequence):
+                vm_errors = [
+                    str(entry)
+                    for entry in error_list
+                    if isinstance(entry, str) and entry.startswith("missing/low-trust:")
+                ]
+        if vm_errors:
+            metadata["status"] = "skipped"
+            metadata["reason"] = "mandatory opcode trust too low"
+            metadata["errors"] = vm_errors
+            return {
+                "metadata": metadata,
+                "artifacts": artifacts,
+                "lift_metadata": lift_metadata,
+                "stack_trace": list(stack_trace),
+            }
+
     if debug and mode == "accurate":
         base_dir = debug_dir or (Path("out") / "debug")
         debug_directory = (base_dir / source_path.stem).resolve()
@@ -249,6 +271,7 @@ def run_lifter_for_cli(
             opcode_map,
             prototypes=getattr(vm_ir, "prototypes", None) or [],
             script_key=script_key,
+            vm_metadata=getattr(ctx, "vm_metadata", None),
             debug_logger=trace_logger,
         )
     finally:

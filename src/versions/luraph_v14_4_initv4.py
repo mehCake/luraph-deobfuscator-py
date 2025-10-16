@@ -25,8 +25,9 @@ import logging
 import re
 import string
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from ..vm.opcode_constants import MANDATORY_CONFIDENCE_THRESHOLD
 from .initv4 import InitV4Bootstrap
 from .luraph_v14_2_json import LuraphV142JSON
 
@@ -338,6 +339,17 @@ class InitV4Decoder:
         meta: Dict[str, Any] = {}
         if isinstance(extraction, Mapping):
             meta.update(extraction)
+        opcode_table_meta = (
+            extraction.get("opcode_table") if isinstance(extraction, Mapping) else {}
+        )
+        missing_ops = []
+        if isinstance(opcode_table_meta, Mapping):
+            raw_missing = opcode_table_meta.get("mandatory_missing")
+            if isinstance(raw_missing, Iterable):
+                missing_ops = sorted({str(name).upper() for name in raw_missing if name})
+            threshold_value = opcode_table_meta.get("mandatory_threshold")
+        else:
+            threshold_value = None
         if self._alphabet:
             meta.setdefault("alphabet_length", len(self._alphabet))
             meta.setdefault("alphabet_source", self._alphabet_source)
@@ -362,6 +374,35 @@ class InitV4Decoder:
                 setattr(self.ctx, "bootstrapper_metadata", combined)
             else:
                 setattr(self.ctx, "bootstrapper_metadata", dict(meta))
+
+        if summary.get("has_metatable_flow"):
+            vm_meta = getattr(self.ctx, "vm_metadata", None)
+            if isinstance(vm_meta, dict):
+                lifter_meta = vm_meta.setdefault("lifter", {})
+                if isinstance(lifter_meta, dict):
+                    lifter_meta.setdefault("has_metatable_flow", True)
+                    handlers = summary.get("metatable_handlers")
+                    if isinstance(handlers, Mapping):
+                        lifter_meta.setdefault("metatable_handlers", dict(handlers))
+                    setmeta_calls = summary.get("setmetatable_calls")
+                    if isinstance(setmeta_calls, int):
+                        lifter_meta.setdefault("setmetatable_calls", setmeta_calls)
+
+        if missing_ops:
+            try:
+                meta.setdefault("mandatory_missing_ops", missing_ops)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            vm_meta = getattr(self.ctx, "vm_metadata", None)
+            if isinstance(vm_meta, dict):
+                errors_bucket = vm_meta.setdefault("errors", [])
+                for name in missing_ops:
+                    message = f"missing/low-trust: {name}"
+                    if message not in errors_bucket:
+                        errors_bucket.append(message)
+                if threshold_value is None:
+                    threshold_value = MANDATORY_CONFIDENCE_THRESHOLD
+                vm_meta.setdefault("mandatory_threshold", threshold_value)
 
         if literal_key:
             try:

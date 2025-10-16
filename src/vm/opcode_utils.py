@@ -9,6 +9,8 @@ if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from src.bootstrap_extractor.bootstrap_parser import OpcodeHandler
     from src.versions import OpSpec
 
+from .opcode_constants import is_mandatory_mnemonic, normalise_trust, trust_score
+
 __all__ = [
     "normalize_mnemonic",
     "normalize_operand_model",
@@ -198,17 +200,20 @@ def opcode_table_merge(
             entry = _entry(int(opcode))
             mnemonic: Optional[str]
             operands: Any
-            trust = entry.get("trust")
+            trust_value = entry.get("trust")
             if hasattr(spec, "mnemonic"):
                 mnemonic = getattr(spec, "mnemonic")
                 operands = getattr(spec, "operands", ())
+                mandatory = getattr(spec, "mandatory", False)
             elif isinstance(spec, Mapping):
                 mnemonic = spec.get("mnemonic") or spec.get("op")
                 operands = spec.get("operands")
-                trust = spec.get("trust", trust)
+                trust_value = spec.get("trust", trust_value)
+                mandatory = bool(spec.get("mandatory"))
             else:
                 mnemonic = str(spec)
                 operands = None
+                mandatory = False
             canonical = normalize_mnemonic(mnemonic)
             if canonical:
                 entry["mnemonic"] = canonical
@@ -216,8 +221,12 @@ def opcode_table_merge(
             operand_model = _normalise_operand_model(operands)
             if operand_model:
                 entry["operands"] = operand_model
-            entry.setdefault("trust", trust or "heuristic")
-            entry.setdefault("source", "heuristic")
+            label = normalise_trust(trust_value)
+            entry.setdefault("trust", label)
+            entry.setdefault("source", entry.get("source") or "heuristic")
+            entry.setdefault("confidence", trust_score(label))
+            if mandatory:
+                entry["mandatory"] = True
 
     if bootstrap_table:
         for opcode, handler in bootstrap_table.items():
@@ -226,13 +235,21 @@ def opcode_table_merge(
             operand_model = operand_model_from_handler(getattr(handler, "source_snippet", ""))
             if not operand_model:
                 operand_model = _normalise_operand_model(getattr(handler, "operands", ""))
-            handler_trust = getattr(handler, "trust", "")
+            handler_trust = normalise_trust(getattr(handler, "trust", ""))
+            handler_confidence = trust_score(handler_trust)
 
             if handler_trust == "high" or "mnemonic" not in entry:
                 if canonical:
                     entry["mnemonic"] = canonical
                     entry["op"] = canonical
-                entry["trust"] = handler_trust or entry.get("trust") or "high"
+            elif canonical and not entry.get("mnemonic"):
+                entry["mnemonic"] = canonical
+                entry["op"] = canonical
+
+            existing_confidence = trust_score(entry.get("trust"))
+            if handler_confidence >= existing_confidence:
+                entry["trust"] = handler_trust or entry.get("trust") or "heuristic"
+                entry["confidence"] = handler_confidence
                 entry["source"] = "bootstrap"
             else:
                 if canonical and not entry.get("mnemonic"):
@@ -241,11 +258,22 @@ def opcode_table_merge(
                 entry.setdefault("source", "bootstrap")
                 if handler_trust and entry.get("trust", "heuristic") == "heuristic":
                     entry["trust"] = handler_trust
+                    entry.setdefault("confidence", handler_confidence)
 
             if operand_model:
-                if getattr(handler, "trust", "") == "high" or not entry.get("operands"):
+                if handler_trust == "high" or not entry.get("operands"):
                     entry["operands"] = operand_model
             if getattr(handler, "source_snippet", None):
                 entry.setdefault("source_snippet", handler.source_snippet)
+
+    for data in merged.values():
+        data.setdefault("trust", "heuristic")
+        data["trust"] = normalise_trust(data.get("trust"))
+        data["confidence"] = trust_score(data.get("trust"))
+        mnemonic_value = data.get("mnemonic")
+        if mnemonic_value and is_mandatory_mnemonic(mnemonic_value):
+            data["mandatory"] = True
+        data.setdefault("mandatory", False)
+        data.setdefault("source", "heuristic")
 
     return merged
