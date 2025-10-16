@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from . import preprocess, vm_devirtualize, vm_lift, cleanup, string_reconstruction, render
+from . import (
+    preprocess,
+    vm_devirtualize,
+    vm_lift,
+    cleanup,
+    string_folding,
+    string_reconstruction,
+    render,
+)
 from .devirtualizer import Devirtualizer
 
 __all__ = [
@@ -11,6 +19,7 @@ __all__ = [
     "vm_lift",
     "vm_devirtualize",
     "cleanup",
+    "string_folding",
     "string_reconstruction",
     "render",
 ]

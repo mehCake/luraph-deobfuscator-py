@@ -264,6 +264,101 @@ if not ok then
   log("initv4.lua execution failed: " .. tostring(load_err))
 end
 
+local unpacked = nil
+
+local function try_unpacked_call(fn)
+  if type(fn) ~= "function" then
+    return nil
+  end
+
+  local attempts = {
+    function()
+      return fn(script_key, json_path, out_dir)
+    end,
+    function()
+      return fn(script_key, json_path)
+    end,
+    function()
+      return fn(script_key)
+    end,
+    function()
+      return fn()
+    end,
+  }
+
+  for _, attempt in ipairs(attempts) do
+    local ok_call, data = pcall(attempt)
+    if ok_call and type(data) == "table" and is_vm_data_shape(data) then
+      return data
+    end
+  end
+
+  return nil
+end
+
+if type(_G.LPH_UnpackData) == "function" then
+  unpacked = try_unpacked_call(_G.LPH_UnpackData)
+end
+
+if not unpacked and type(getgenv) == "function" then
+  local ok_env, env = pcall(getgenv)
+  if ok_env and type(env) == "table" then
+    local candidate = env.LPH_UnpackData
+    if type(candidate) == "function" then
+      unpacked = try_unpacked_call(candidate)
+    end
+  end
+end
+
+if not unpacked and type(debug) == "table" and type(debug.sethook) == "function" and type(debug.getlocal) == "function" then
+  local captured = nil
+  local function hook(event)
+    if event == "call" then
+      local i = 1
+      while true do
+        local name, value = debug.getlocal(2, i)
+        if not name then
+          break
+        end
+        if type(value) == "table" and is_vm_data_shape(value) then
+          captured = value
+          pcall(debug.sethook)
+          return
+        end
+        i = i + 1
+      end
+    end
+  end
+
+  local ok_hook = pcall(debug.sethook, hook, "c")
+  if ok_hook then
+    local entry_points = { "VMRun", "Run", "Init", "bootstrap", "main" }
+    for _, name in ipairs(entry_points) do
+      if captured then
+        break
+      end
+      local fn = rawget(_G, name)
+      if not fn and type(getgenv) == "function" then
+        local ok_env, env = pcall(getgenv)
+        if ok_env and type(env) == "table" then
+          fn = env[name]
+        end
+      end
+      if type(fn) == "function" then
+        pcall(fn, "LPH!tick", _G)
+        if captured then
+          break
+        end
+      end
+    end
+    pcall(debug.sethook)
+  end
+
+  if captured and is_vm_data_shape(captured) then
+    unpacked = captured
+  end
+end
+
 local candidates = {}
 if type(_G.unpackedData) == "table" then
   candidates[#candidates + 1] = _G.unpackedData
@@ -314,11 +409,16 @@ for _, value in ipairs(candidates) do
   end
 end
 
-local unpacked = nil
-for _, value in ipairs(candidates) do
-  if is_vm_data_shape(value) then
-    unpacked = value
-    break
+if unpacked then
+  table.insert(candidates, 1, unpacked)
+end
+
+if not unpacked then
+  for _, value in ipairs(candidates) do
+    if is_vm_data_shape(value) then
+      unpacked = value
+      break
+    end
   end
 end
 

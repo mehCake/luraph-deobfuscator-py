@@ -18,12 +18,15 @@ local unpackedData = {
   [6] = {},
 }
 
+_G.unpackedData = unpackedData
+
 function LPH_UnpackData()
   return unpackedData
 end
 
 function LuraphInterpreter(data, env)
   local decoded = table.concat({
+    "-- expected.lua",
     "local function sum_three()",
     "  local total = 0",
     "  for i = 1, 3 do",

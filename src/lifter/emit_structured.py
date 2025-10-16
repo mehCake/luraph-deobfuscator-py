@@ -11,6 +11,7 @@ __all__ = [
     "InstructionNode",
     "IfNode",
     "WhileNode",
+    "RepeatNode",
     "StructuredEmitter",
 ]
 
@@ -44,7 +45,16 @@ class WhileNode:
     loop: Optional[LoopInfo] = None
 
 
-Statement = InstructionNode | IfNode | WhileNode
+@dataclass
+class RepeatNode:
+    """Structured repeat-until loop."""
+
+    instruction_index: int
+    condition: str
+    body: List["Statement"] = field(default_factory=list)
+
+
+Statement = InstructionNode | IfNode | WhileNode | RepeatNode
 
 
 class StructuredEmitter:
@@ -72,6 +82,7 @@ class StructuredEmitter:
 
     def emit(self) -> tuple[List[str], Dict[int, str]]:
         self._ast = self._build_block(self._cfg.entry, exit_block=None)
+        self._ast = self._normalise(self._ast)
         lines = self._render(self._ast)
         instruction_lua = {
             index: "\n".join(snippets)
@@ -138,10 +149,8 @@ class StructuredEmitter:
                 block_id = target
                 continue
             if terminator.kind == "return":
-                statements.extend(self._instruction_nodes(block, include_only={terminator.instruction_index}))
                 break
             if terminator.kind == "fallthrough":
-                statements.extend(self._instruction_nodes(block, include_only={terminator.instruction_index}))
                 block_id = block.linear_successor
         return statements
 
@@ -316,6 +325,8 @@ class StructuredEmitter:
                 self._render_if(statement, indent, lines)
             elif isinstance(statement, WhileNode):
                 self._render_while(statement, indent, lines)
+            elif isinstance(statement, RepeatNode):
+                self._render_repeat(statement, indent, lines)
 
     def _render_instruction(
         self, node: InstructionNode, indent: int, lines: List[str]
@@ -338,9 +349,38 @@ class StructuredEmitter:
         line = f"if {node.condition} then"
         self._append_control_line(node.instruction_index, line, indent, lines)
         self._render_statements(node.then_branch, indent=indent + 1, lines=lines)
-        if node.else_branch:
+        else_branch = list(node.else_branch)
+        while (
+            len(else_branch) == 1
+            and isinstance(else_branch[0], IfNode)
+            and self._can_chain_elseif(else_branch[0])
+        ):
+            chained = else_branch[0]
+            self._append_control_line(
+                chained.instruction_index,
+                f"elseif {chained.condition} then",
+                indent,
+                lines,
+            )
+            self._render_statements(chained.then_branch, indent=indent + 1, lines=lines)
+            else_branch = list(chained.else_branch)
+        while (
+            else_branch
+            and isinstance(else_branch[0], IfNode)
+            and self._can_chain_elseif(else_branch[0])
+        ):
+            chained = else_branch.pop(0)
+            self._append_control_line(
+                chained.instruction_index,
+                f"elseif {chained.condition} then",
+                indent,
+                lines,
+            )
+            self._render_statements(chained.then_branch, indent=indent + 1, lines=lines)
+            else_branch = list(chained.else_branch) + else_branch
+        if else_branch:
             self._append_control_line(node.instruction_index, "else", indent, lines)
-            self._render_statements(node.else_branch, indent=indent + 1, lines=lines)
+            self._render_statements(else_branch, indent=indent + 1, lines=lines)
         self._append_control_line(node.instruction_index, "end", indent, lines)
 
     def _render_while(self, node: WhileNode, indent: int, lines: List[str]) -> None:
@@ -348,6 +388,16 @@ class StructuredEmitter:
         self._append_control_line(node.instruction_index, line, indent, lines)
         self._render_statements(node.body, indent=indent + 1, lines=lines)
         self._append_control_line(node.instruction_index, "end", indent, lines)
+
+    def _render_repeat(self, node: RepeatNode, indent: int, lines: List[str]) -> None:
+        self._append_control_line(node.instruction_index, "repeat", indent, lines)
+        self._render_statements(node.body, indent=indent + 1, lines=lines)
+        self._append_control_line(
+            node.instruction_index,
+            f"until {node.condition}",
+            indent,
+            lines,
+        )
 
     def _append_control_line(
         self, instruction_index: int, text: str, indent: int, lines: List[str]
@@ -368,3 +418,128 @@ class StructuredEmitter:
         if stripped.startswith("(") and stripped.endswith(")"):
             return f"not {stripped}"
         return f"not ({stripped})"
+
+    # ------------------------------------------------------------------
+    # Normalisation helpers
+    # ------------------------------------------------------------------
+
+    def _normalise(self, statements: List[Statement]) -> List[Statement]:
+        normalised: List[Statement] = []
+        for statement in statements:
+            if isinstance(statement, IfNode):
+                normalised_then = self._normalise(statement.then_branch)
+                normalised_else = self._normalise(statement.else_branch)
+                statement = IfNode(
+                    instruction_index=statement.instruction_index,
+                    condition=statement.condition,
+                    then_branch=normalised_then,
+                    else_branch=normalised_else,
+                    guard_index=statement.guard_index,
+                )
+            elif isinstance(statement, WhileNode):
+                normalised_body = self._normalise(statement.body)
+                statement = WhileNode(
+                    instruction_index=statement.instruction_index,
+                    condition=statement.condition,
+                    body=normalised_body,
+                    loop=statement.loop,
+                )
+                repeat_node = self._maybe_convert_to_repeat(statement)
+                if repeat_node is not None:
+                    statement = repeat_node
+            elif isinstance(statement, RepeatNode):
+                statement = RepeatNode(
+                    instruction_index=statement.instruction_index,
+                    condition=statement.condition,
+                    body=self._normalise(statement.body),
+                )
+            normalised.append(statement)
+        return self._merge_consecutive_instructions(normalised)
+
+    def _merge_consecutive_instructions(self, statements: List[Statement]) -> List[Statement]:
+        merged: List[Statement] = []
+        for statement in statements:
+            if (
+                merged
+                and isinstance(statement, InstructionNode)
+                and isinstance(merged[-1], InstructionNode)
+                and merged[-1].instruction_index == statement.instruction_index
+            ):
+                existing = merged[-1]
+                lines = existing.lines + [line for line in statement.lines if line not in existing.lines]
+                merged[-1] = InstructionNode(existing.instruction_index, lines)
+                continue
+            if isinstance(statement, IfNode):
+                statement.then_branch = self._merge_consecutive_instructions(statement.then_branch)
+                statement.else_branch = self._merge_consecutive_instructions(statement.else_branch)
+            elif isinstance(statement, WhileNode):
+                statement.body = self._merge_consecutive_instructions(statement.body)
+            elif isinstance(statement, RepeatNode):
+                statement.body = self._merge_consecutive_instructions(statement.body)
+            merged.append(statement)
+        return merged
+
+    def _maybe_convert_to_repeat(self, node: WhileNode) -> Optional[RepeatNode]:
+        condition = node.condition.strip().lower()
+        if condition != "true":
+            return None
+        if not node.body:
+            return None
+        tail = node.body[-1]
+        if isinstance(tail, IfNode):
+            if tail.else_branch:
+                return None
+            if not self._is_break_guard(tail):
+                return None
+            body = node.body[:-1]
+            return RepeatNode(
+                instruction_index=node.instruction_index,
+                condition=tail.condition,
+                body=body,
+            )
+        if isinstance(tail, InstructionNode):
+            condition_text = self._extract_break_condition(tail.lines)
+            if condition_text is None:
+                return None
+            body = node.body[:-1]
+            return RepeatNode(
+                instruction_index=node.instruction_index,
+                condition=condition_text,
+                body=body,
+            )
+        return None
+
+    @staticmethod
+    def _is_break_guard(node: IfNode) -> bool:
+        if len(node.then_branch) != 1:
+            return False
+        branch = node.then_branch[0]
+        if not isinstance(branch, InstructionNode):
+            return False
+        for line in branch.lines:
+            if str(line).strip().startswith("break"):
+                return True
+        return False
+
+    @staticmethod
+    def _can_chain_elseif(node: IfNode) -> bool:
+        return node.guard_index is not None or not node.else_branch
+
+    @staticmethod
+    def _extract_break_condition(lines: Sequence[str]) -> Optional[str]:
+        if not lines:
+            return None
+        text = " ".join(str(part) for part in lines)
+        if "break" not in text:
+            return None
+        first = str(lines[0]).strip()
+        if not first.lower().startswith("if "):
+            return None
+        try:
+            prefix, _ = first.split("then", 1)
+        except ValueError:
+            return None
+        condition = prefix[3:].strip()
+        if not condition:
+            return None
+        return condition
