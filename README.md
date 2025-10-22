@@ -1,4 +1,4 @@
-# Lua Deobfuscator (IN BETA MIGHT NOT WORK YET.)
+# Lua Deobfuscator (Doesn't work yet as of now but keep in mind, developement should be going through the course of up to a year or so.)
 # Dev #ishowgoat on discord
 
 Utilities for decoding Lua scripts obfuscated with Luraph/Luarmor styles.  The
