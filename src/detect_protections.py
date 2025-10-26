@@ -72,6 +72,19 @@ _ANTITRACE_PATTERNS: Sequence[tuple[str, str]] = (
     (r"pcall\s*\(\s*debug\.traceback", "traceback_guard"),
 )
 
+_ANTI_TAMPER_PATTERNS: Sequence[tuple[str, str]] = (
+    (r"os\.getenv\s*\(", "os_getenv_check"),
+    (r"os\.(?:date|difftime|clock|time)\s*\(", "os_time_guard"),
+    (r"getfenv\s*\(\s*0\s*\)", "getfenv_zero"),
+    (r"setfenv\s*\(\s*0\s*\)", "setfenv_zero"),
+    (r"if\s+not\s+[A-Za-z_][A-Za-z0-9_]*\s+then\s+error\s*\(", "sentinel_guard"),
+    (
+        r"if\s+[A-Za-z_][A-Za-z0-9_]*\s*~=\s*['\"]?[A-Za-z0-9_]+['\"]?\s+then\s+error\s*\(",
+        "key_guard",
+    ),
+    (r"io\.popen\s*\(", "process_check"),
+)
+
 # Each protection category is mapped to the set of pattern groups tested above.
 _CATEGORY_PATTERNS = {
     "xor": _XOR_PATTERNS,
@@ -81,6 +94,7 @@ _CATEGORY_PATTERNS = {
     "fragmentation": _FRAGMENT_PATTERNS,
     "junk_ops": _JUNK_PATTERNS,
     "anti_trace": _ANTITRACE_PATTERNS,
+    "anti_tamper": _ANTI_TAMPER_PATTERNS,
     "vm_bootstrap": (
         (r"virtual[%s_]*machine" % "\\s", "virtual_machine_label"),
         (r"L1", "helper_L1"),
@@ -99,6 +113,16 @@ _COMMENT_MACRO_CANONICAL = {
     "LPH_JITMAX": "LPH_JIT_MAX",
     "LPH_ENCFUNC": "LPH_ENCFUNC",
     "LPH_NOUPVALUES": "LPH_NO_UPVALUES",
+}
+
+_BYPASS_HINTS: Dict[str, str] = {
+    "os_getenv_check": "Stub or preset os.getenv values (e.g. via sandbox overrides) before running the payload.",
+    "os_time_guard": "Provide deterministic os.date/os.clock/os.difftime returns to satisfy time-based guards.",
+    "getfenv_zero": "Ensure getfenv(0) returns a benign environment or patch the guard to skip environment verification.",
+    "setfenv_zero": "Avoid setfenv(0) tampering by cloning the global environment before execution.",
+    "sentinel_guard": "Initialise the checked sentinel variable or remove the early error() guard before decoding.",
+    "key_guard": "Pre-populate the expected key/token or rewrite the condition so it cannot trigger error().",
+    "process_check": "Monkey-patch io.popen/os.execute to return harmless values to bypass process checks.",
 }
 
 _METADATA_VERSION_REGEX = re.compile(
@@ -142,6 +166,15 @@ def _find_matches(source: str, filename: str, patterns: Sequence[tuple[str, str]
                 snippet = snippet[:160] + "…"
             evidence.append(DetectionEvidence(category, pattern_id, snippet, filename))
     return evidence
+
+
+def _collect_bypass_guidance(findings: Sequence[DetectionEvidence]) -> List[str]:
+    hints: List[str] = []
+    for item in findings:
+        hint = _BYPASS_HINTS.get(item.pattern_id)
+        if hint:
+            hints = _merge_unique(hints, [hint])
+    return hints
 
 
 def _merge_unique(existing: List[str], new_items: Iterable[str]) -> List[str]:
@@ -442,7 +475,7 @@ def _compute_recommendation(macros: Sequence[str], settings: Dict[str, Any], typ
     prefer_frida = False
     if {"LPH_JIT", "LPH_JIT_MAX", "LPH_ENCFUNC"} & macro_set:
         prefer_frida = True
-    if "compression" in types or "anti_trace" in types:
+    if "compression" in types or "anti_trace" in types or "anti_tamper" in types:
         prefer_frida = True
     if "LPH_ENCFUNC" in macro_set:
         prefer_frida = True
@@ -466,6 +499,7 @@ def scan_lua(source: str, *, filename: str = "<memory>", api_client: Optional[Lu
         findings.extend(_find_matches(source, filename, patterns, category))
 
     categories = sorted({item.category for item in findings})
+    bypass_instructions = _collect_bypass_guidance(findings)
     macros = _detect_macros(source)
     settings = _extract_settings(source)
     metadata, metadata_limitations = _extract_metadata(source)
@@ -488,6 +522,7 @@ def scan_lua(source: str, *, filename: str = "<memory>", api_client: Optional[Lu
         "metadata": metadata,
         "limitations": limitations,
         "recommendation": recommendation,
+        "bypass_instructions": bypass_instructions,
     }
     return result
 
@@ -502,6 +537,7 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
     metadata: Dict[str, Any] = {}
     limitations: List[str] = []
     path_list: List[str] = []
+    bypass_instructions: List[str] = []
 
     api_client: Optional[LuraphAPI] = None
     if api_key:
@@ -527,6 +563,9 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
         _merge_settings(settings_tables, known_settings, per_file.get("settings", {}))
         metadata = {**metadata, **per_file.get("metadata", {})}
         limitations = _merge_unique(limitations, per_file.get("limitations", []))
+        bypass_instructions = _merge_unique(
+            bypass_instructions, per_file.get("bypass_instructions", [])
+        )
 
     categories = sorted({item.category for item in combined})
     recommendation = _compute_recommendation(macros, {"known": known_settings}, categories)
@@ -540,6 +579,7 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
         "metadata": metadata,
         "limitations": limitations,
         "recommendation": recommendation,
+        "bypass_instructions": bypass_instructions,
         "scanned": path_list,
     }
 

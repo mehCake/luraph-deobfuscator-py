@@ -16,11 +16,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import string
 import sys
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 
 _WHITESPACE = {" ", "\t", "\r", "\n"}
+_HEX_DIGITS = set(string.hexdigits)
+_SIMPLE_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "\"": "\"",
+    "'": "'",
+}
 
 
 def _is_identifier_start(ch: str) -> bool:
@@ -31,62 +46,220 @@ def _is_identifier_char(ch: str) -> bool:
     return ch.isalnum() or ch == "_"
 
 
-def _unescape_short_string(body: str) -> str:
-    """Decode Lua short string escapes.
+def _parse_unicode_brace_payload(payload: str) -> Optional[List[int]]:
+    """Parse the body of a ``\\u{...}`` escape sequence.
 
-    Lua shares the majority of its escapes with Python (``\n``, ``\r`` …) but
-    additionally allows decimal escapes (``\123``).  We implement the minimal
-    subset required by the fixtures which is enough to resolve obfuscated
-    constants.
+    The payload may contain multiple hexadecimal code points separated by
+    whitespace or commas, and underscores are ignored for readability.  The
+    function returns ``None`` when the payload is malformed.
     """
 
-    result: List[str] = []
-    it = iter(range(len(body)))
-    i = 0
-    while i < len(body):
-        ch = body[i]
+    if not payload:
+        return None
+
+    tokens: List[str] = []
+    current: List[str] = []
+
+    for ch in payload:
+        if ch in _WHITESPACE or ch == ",":
+            if current:
+                token = "".join(current)
+                tokens.append(token)
+                current = []
+            continue
+        if ch in _HEX_DIGITS or ch == "_":
+            current.append(ch)
+            continue
+        return None
+
+    if current:
+        tokens.append("".join(current))
+
+    if not tokens:
+        return None
+
+    codepoints: List[int] = []
+    for token in tokens:
+        cleaned = token.replace("_", "")
+        if not cleaned or set(cleaned) - _HEX_DIGITS:
+            return None
+        try:
+            value = int(cleaned, 16)
+        except ValueError:
+            return None
+        if value < 0 or value > sys.maxunicode:
+            return None
+        codepoints.append(value)
+
+    return codepoints
+
+
+def lu_unescape(text: str) -> str:
+    """Return ``text`` with Lua escape sequences resolved."""
+
+    if not text:
+        return ""
+
+    out: List[str] = []
+    length = len(text)
+    index = 0
+
+    while index < length:
+        ch = text[index]
         if ch != "\\":
-            result.append(ch)
-            i += 1
+            out.append(ch)
+            index += 1
             continue
 
-        i += 1
-        if i >= len(body):
-            result.append("\\")
+        index += 1
+        if index >= length:
+            out.append("\\")
             break
-        esc = body[i]
-        i += 1
-        if esc in "abfnrtv\\\"'":
-            mapping = {
-                "a": "\a",
-                "b": "\b",
-                "f": "\f",
-                "n": "\n",
-                "r": "\r",
-                "t": "\t",
-                "v": "\v",
-                "\\": "\\",
-                "\"": "\"",
-                "'": "'",
-            }
-            result.append(mapping[esc])
-        elif esc.isdigit():
+
+        esc = text[index]
+        index += 1
+
+        simple = _SIMPLE_ESCAPES.get(esc)
+        if simple is not None:
+            out.append(simple)
+            continue
+
+        if esc == "z":
+            while index < length and text[index].isspace():
+                index += 1
+            continue
+
+        if esc == "x":
+            hex_digits = text[index : index + 2]
+            if len(hex_digits) == 2 and set(hex_digits) <= _HEX_DIGITS:
+                out.append(chr(int(hex_digits, 16)))
+                index += 2
+                continue
+            out.append("\\x")
+            continue
+
+        if esc.isdigit():
             digits = esc
-            while i < len(body) and len(digits) < 3 and body[i].isdigit():
-                digits += body[i]
-                i += 1
-            result.append(chr(int(digits, 10)))
-        elif esc == "x" and i + 1 < len(body):
-            hex_digits = body[i : i + 2]
-            if re.fullmatch(r"[0-9a-fA-F]{2}", hex_digits):
-                result.append(chr(int(hex_digits, 16)))
-                i += 2
-            else:
-                result.append("\\x")
+            while index < length and len(digits) < 3 and text[index].isdigit():
+                digits += text[index]
+                index += 1
+            out.append(chr(int(digits, 10) & 0xFF))
+            continue
+
+        if esc == "u" and index < length and text[index] == "{":
+            end = index + 1
+            while end < length and text[end] != "}":
+                end += 1
+            if end < length:
+                payload = text[index + 1 : end]
+                codepoints = _parse_unicode_brace_payload(payload)
+                if codepoints is not None:
+                    try:
+                        chars = [chr(value) for value in codepoints]
+                    except (OverflowError, ValueError):
+                        chars = None
+                    if chars is not None:
+                        out.extend(chars)
+                        index = end + 1
+                        continue
+            out.append("\\u")
+            continue
+
+        out.append("\\" + esc)
+
+    normalized = unicodedata.normalize("NFC", "".join(out))
+    return normalized
+
+
+def canonicalize_escapes(text: str) -> str:
+    """Rewrite recognised Lua escapes in *text* into canonical forms.
+
+    Each supported escape sequence is normalised to either ``\\xHH`` for
+    single-byte characters or ``\\u{HHHH}`` (potentially more than four hex
+    digits) for non-ASCII code points.  The function preserves non-escaped
+    characters verbatim and strips whitespace consumed by ``\\z`` sequences.
+    Unrecognised escapes are passed through unchanged.
+    """
+
+    if not text:
+        return ""
+
+    out: List[str] = []
+    index = 0
+    length = len(text)
+
+    def _emit(codepoint: int) -> None:
+        if codepoint <= 0xFF:
+            out.append(f"\\x{codepoint:02X}")
         else:
-            # Unknown escape – keep it verbatim so the caller can spot it.
-            result.append("\\" + esc)
-    return sys.intern("".join(result))
+            out.append(f"\\u{{{codepoint:04X}}}")
+
+    while index < length:
+        ch = text[index]
+        if ch != "\\":
+            out.append(ch)
+            index += 1
+            continue
+
+        index += 1
+        if index >= length:
+            out.append("\\")
+            break
+
+        esc = text[index]
+        index += 1
+
+        simple = _SIMPLE_ESCAPES.get(esc)
+        if simple is not None:
+            _emit(ord(simple))
+            continue
+
+        if esc == "z":
+            while index < length and text[index].isspace():
+                index += 1
+            continue
+
+        if esc == "x":
+            digits = text[index : index + 2]
+            if len(digits) == 2 and set(digits) <= _HEX_DIGITS:
+                _emit(int(digits, 16))
+                index += 2
+                continue
+            out.append("\\x")
+            continue
+
+        if esc.isdigit():
+            digits = esc
+            while index < length and len(digits) < 3 and text[index].isdigit():
+                digits += text[index]
+                index += 1
+            _emit(int(digits, 10) & 0xFF)
+            continue
+
+        if esc == "u" and index < length and text[index] == "{":
+            end = index + 1
+            while end < length and text[end] != "}":
+                end += 1
+            if end < length:
+                payload = text[index + 1 : end]
+                codepoints = _parse_unicode_brace_payload(payload)
+                if codepoints is not None:
+                    for value in codepoints:
+                        _emit(value)
+                    index = end + 1
+                    continue
+            out.append("\\u")
+            continue
+
+        out.append("\\" + esc)
+
+    return "".join(out)
+
+
+def _unescape_short_string(body: str) -> str:
+    """Decode Lua short string escapes."""
+
+    return sys.intern(lu_unescape(body))
 
 
 @dataclass(frozen=True)

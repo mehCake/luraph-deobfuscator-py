@@ -10,14 +10,19 @@ import os
 import re
 import string
 import sys
+import textwrap
+import time
+import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline, utils
 from .bootstrap import scan_lph_blocks
 from .cli import reporting as cli_reporting
-from .utils import write_text
+from .utils import write_json, write_text
+from .usage_audit import UsageConfirmationError, require_usage_confirmation
 from .deobfuscator import LuaDeobfuscator
 from .lph_reader import read_lph_blob
 from .passes.preprocess import flatten_json_to_lua
@@ -25,10 +30,17 @@ from .utils_pkg.ir import IRModule
 from .utils.luraph_vm import canonicalise_opcode_name
 from .utils.opcode_inference import DEFAULT_OPCODE_NAMES
 from .vm.opcode_constants import MANDATORY_MNEMONICS
-from version_detector import VersionInfo
+from version_detector import (
+    VersionInfo,
+    evaluate_deobfuscation_checklist,
+    evaluate_quality_gate,
+    generate_run_summary,
+    pretty_print_with_mapping,
+)
 
 LOG_FILE = Path("deobfuscator.log")
 DEFAULT_PAYLOAD_ITERATIONS = 5
+CRASH_DIR = Path("out") / "crash_reports"
 
 _SCRIPT_KEY_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]"),
@@ -38,6 +50,26 @@ _SCRIPT_KEY_PATTERNS: Tuple[re.Pattern[str], ...] = (
 _SCRIPT_KEY_REQUIRED_RE = re.compile(r"script_key\s*=\s*script_key\s*or", re.IGNORECASE)
 _LPH_KEY_CANDIDATE_RE = re.compile(r"[a-z0-9]{18,24}")
 _DEFAULT_TEST_KEYS = ("koqzpaexlygm9b227uy",)
+_SCRIPT_KEY_ENV_VARS: Tuple[str, ...] = (
+    "LURAPH_SESSION_KEY",
+    "LURAPH_SCRIPT_KEY",
+    "SCRIPT_KEY",
+)
+
+
+def _consume_env_script_key() -> tuple[Optional[str], Optional[str]]:
+    """Return a script key sourced from the environment, removing it once read."""
+
+    for variable in _SCRIPT_KEY_ENV_VARS:
+        value = os.environ.get(variable)
+        if value is None:
+            continue
+        # Remove the value immediately so it cannot leak into child processes.
+        os.environ.pop(variable, None)
+        stripped = value.strip()
+        if stripped:
+            return stripped, variable
+    return None, None
 
 
 def _detect_script_key(text: Optional[str]) -> Optional[str]:
@@ -133,6 +165,88 @@ class WorkItem:
     json_destination: Optional[Path] = None
 
 
+_ALLOWED_OPTION_KEY_FIELDS = {"script_key_source", "script_key_source_detail"}
+
+
+def _sanitise_crash_options(options: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a serialisable, key-free snapshot of CLI options."""
+
+    sanitized: Dict[str, Any] = {}
+    for key, value in options.items():
+        key_lower = key.lower()
+        if "key" in key_lower and key_lower not in _ALLOWED_OPTION_KEY_FIELDS:
+            continue
+        sanitized[key] = utils.serialise_metadata(value)
+    return sanitized
+
+
+def _normalise_crash_timings(
+    timings: Sequence[Tuple[str, float]],
+    failed_pass: Optional[str] = None,
+    failed_duration: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    entries = [{"name": name, "duration": duration} for name, duration in timings]
+    if failed_pass and failed_duration is not None:
+        entries.append({"name": failed_pass, "duration": failed_duration, "failed": True})
+    return entries
+
+
+def _write_crash_report(
+    *,
+    item: WorkItem,
+    ctx: Optional[pipeline.Context],
+    iteration: int,
+    failed_pass: Optional[str],
+    timings: Sequence[Tuple[str, float]],
+    failed_duration: Optional[float],
+    exc: BaseException,
+) -> Path:
+    """Persist a safe-mode crash report without leaking key material."""
+
+    utils.ensure_directory(CRASH_DIR)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    stem = item.source.stem or item.source.name or "input"
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]", "_", stem)[:80] or "input"
+    crash_path = CRASH_DIR / f"{safe_stem}_iter{iteration}_{timestamp}.json"
+    base_payload: Dict[str, Any] = {
+        "safe_mode": True,
+        "timestamp": timestamp,
+        "timestamp_epoch": time.time(),
+        "input": str(item.source),
+        "destination": str(item.destination) if item.destination else None,
+        "iteration": iteration,
+        "failed_pass": failed_pass,
+        "timings": _normalise_crash_timings(timings, failed_pass, failed_duration),
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__),
+        },
+    }
+    if ctx is not None:
+        base_payload["stage_output_length"] = len(ctx.stage_output or "")
+        base_payload["has_output"] = bool(ctx.output)
+        if ctx.detected_version:
+            base_payload["detected_version"] = ctx.detected_version.name
+        if isinstance(ctx.options, Mapping):
+            base_payload["options"] = _sanitise_crash_options(ctx.options)
+        else:
+            base_payload["options"] = {}
+        base_payload["pass_metadata"] = utils.serialise_metadata(ctx.pass_metadata)
+        base_payload["vm_metadata"] = utils.serialise_metadata(ctx.vm_metadata)
+        report_obj = getattr(ctx, "report", None)
+        if report_obj is not None:
+            base_payload["report"] = report_obj.to_json()
+            base_payload["masked_script_key"] = report_obj.masked_script_key()
+    else:
+        base_payload["options"] = {}
+        base_payload["pass_metadata"] = {}
+        base_payload["vm_metadata"] = {}
+
+    write_json(crash_path, base_payload, sort_keys=True)
+    return crash_path
+
+
 @dataclass
 class WorkResult:
     item: WorkItem
@@ -170,6 +284,362 @@ def _split_list(value: Optional[str]) -> List[str]:
     if not value:
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _parse_opcode_argument(value: str) -> int:
+    token = value.strip().lower()
+    if not token:
+        raise ValueError("opcode must be a non-empty string")
+    base = 10
+    if token.startswith("0x"):
+        token = token[2:]
+        base = 16
+    elif token.startswith("0b"):
+        token = token[2:]
+        base = 2
+    elif token.startswith("0o"):
+        token = token[2:]
+        base = 8
+    return int(token, base)
+
+
+def _load_mapping_payload(path: Path) -> tuple[Optional[object], Dict[str, str]]:
+    if not path.exists():
+        return None, {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.getLogger(__name__).warning("failed to parse mapping file %s: %s", path, exc)
+        return None, {}
+
+    rename_map: Dict[str, str] = {}
+
+    def _add_entry(source: object, target: object) -> None:
+        if isinstance(source, str) and isinstance(target, str) and source and target:
+            rename_map[source] = target
+
+    if isinstance(raw, dict):
+        if raw and all(isinstance(value, str) for value in raw.values()):
+            for key, value in raw.items():
+                _add_entry(key, value)
+        else:
+            for key in ("renames", "mapping", "items", "rows"):
+                container = raw.get(key)
+                if isinstance(container, dict):
+                    for source, target in container.items():
+                        _add_entry(source, target)
+                elif isinstance(container, list):
+                    for entry in container:
+                        if isinstance(entry, Mapping):
+                            source = (
+                                entry.get("name")
+                                or entry.get("source")
+                                or entry.get("identifier")
+                            )
+                            target = (
+                                entry.get("recommended_name")
+                                or entry.get("target")
+                                or entry.get("rename")
+                            )
+                            _add_entry(source, target)
+    elif isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, Mapping):
+                source = entry.get("name") or entry.get("source") or entry.get("identifier")
+                target = entry.get("recommended_name") or entry.get("target") or entry.get("rename")
+                _add_entry(source, target)
+
+    return raw, rename_map
+
+
+def _update_mapping_payload(raw: Optional[object], identifier: str, mnemonic: str) -> object:
+    entry = {"name": identifier, "recommended_name": mnemonic}
+    if raw is None:
+        return {identifier: mnemonic}
+    if isinstance(raw, dict):
+        if raw and all(isinstance(value, str) for value in raw.values()):
+            updated = dict(raw)
+            updated[identifier] = mnemonic
+            return updated
+        updated = dict(raw)
+        renames = updated.get("renames") if isinstance(updated, dict) else None
+        if isinstance(renames, dict):
+            new_renames = dict(renames)
+            new_renames[identifier] = mnemonic
+            updated["renames"] = new_renames
+            return updated
+        if isinstance(renames, list):
+            new_list: List[object] = []
+            found = False
+            for item in renames:
+                if isinstance(item, Mapping):
+                    if (
+                        item.get("name") == identifier
+                        or item.get("source") == identifier
+                        or item.get("identifier") == identifier
+                    ):
+                        updated_item = dict(item)
+                        updated_item["name"] = identifier
+                        updated_item["recommended_name"] = mnemonic
+                        new_list.append(updated_item)
+                        found = True
+                    else:
+                        new_list.append(dict(item))
+                else:
+                    new_list.append(item)
+            if not found:
+                new_list.append(entry)
+            updated["renames"] = new_list
+            return updated
+        updated["renames"] = [entry]
+        return updated
+    if isinstance(raw, list):
+        new_list: List[object] = []
+        found = False
+        for item in raw:
+            if isinstance(item, Mapping):
+                if (
+                    item.get("name") == identifier
+                    or item.get("source") == identifier
+                    or item.get("identifier") == identifier
+                ):
+                    updated_item = dict(item)
+                    updated_item["name"] = identifier
+                    updated_item["recommended_name"] = mnemonic
+                    new_list.append(updated_item)
+                    found = True
+                else:
+                    new_list.append(dict(item))
+            else:
+                new_list.append(item)
+        if not found:
+            new_list.append(entry)
+        return new_list
+    return {identifier: mnemonic}
+
+
+def _canonicalize_user_mnemonic(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    candidate = re.sub(r"[^0-9A-Za-z]+", "_", raw.strip())
+    candidate = re.sub(r"_+", "_", candidate).strip("_")
+    if not candidate:
+        return None
+    canonical = candidate.upper()
+    if canonical[0].isdigit():
+        canonical = f"OP_{canonical}"
+    return canonical
+
+
+def _format_snippet(snippet: str) -> str:
+    normalised = " ".join(snippet.split())
+    return textwrap.shorten(normalised, width=120, placeholder="…")
+
+
+def _collect_opcode_context(
+    opcode: int,
+    upcodes_path: Path,
+    guesses_path: Path,
+) -> Dict[str, Any]:
+    context: Dict[str, Any] = {"entries": [], "guess": None}
+
+    if upcodes_path.exists():
+        try:
+            data = json.loads(upcodes_path.read_text(encoding="utf-8"))
+        except Exception:  # pragma: no cover - diagnostics only
+            data = {}
+        entries = []
+        for entry in data.get("entries", []):
+            if isinstance(entry, Mapping) and entry.get("opcode") == opcode:
+                entries.append(entry)
+        if entries:
+            context["entries"] = entries
+
+    if guesses_path.exists():
+        try:
+            data = json.loads(guesses_path.read_text(encoding="utf-8"))
+        except Exception:  # pragma: no cover - diagnostics only
+            data = {}
+        guesses = data.get("guesses")
+        if isinstance(guesses, Mapping):
+            guess = guesses.get(str(opcode))
+            if isinstance(guess, Mapping):
+                context["guess"] = guess
+
+    return context
+
+
+def _print_opcode_context(
+    opcode: int,
+    identifier: str,
+    existing_name: Optional[str],
+    context: Mapping[str, Any],
+) -> None:
+    print(f"=== Opcode 0x{opcode:02X} ({opcode}) → {identifier}")
+    if existing_name:
+        print(f"Current mapping: {existing_name}")
+    guess = context.get("guess")
+    if isinstance(guess, Mapping):
+        guess_name = guess.get("guess")
+        confidence = guess.get("confidence")
+        if guess_name:
+            if confidence is not None:
+                print(f"Semantic guess: {guess_name} (confidence {confidence})")
+            else:
+                print(f"Semantic guess: {guess_name}")
+        evidence = guess.get("evidence")
+        if evidence:
+            print(f"Evidence: {evidence}")
+    entries = context.get("entries")
+    if isinstance(entries, list) and entries:
+        print("Sample usage:")
+        for entry in entries[:3]:
+            if not isinstance(entry, Mapping):
+                continue
+            mnemonic = entry.get("mnemonic")
+            semantic = entry.get("semantic")
+            freq = entry.get("frequency")
+            table = entry.get("handler_table")
+            print(
+                "  - mnemonic={mnemonic} freq={freq} table={table} semantic={semantic}".format(
+                    mnemonic=mnemonic,
+                    freq=freq,
+                    table=table,
+                    semantic=semantic,
+                )
+            )
+            samples = entry.get("sample_usage")
+            if isinstance(samples, list):
+                for sample in samples[:2]:
+                    if isinstance(sample, Mapping):
+                        snippet = sample.get("snippet")
+                        if isinstance(snippet, str) and snippet.strip():
+                            print(f"    snippet: {_format_snippet(snippet)}")
+    else:
+        print("No recorded usage samples; consider inspecting VM traces or lifter output.")
+
+
+def _prompt_mnemonic(identifier: str, default: Optional[str]) -> Optional[str]:
+    prompt_suffix = f" [{default}]" if default else ""
+    while True:
+        response = input(
+            f"Enter mnemonic for {identifier}{prompt_suffix} (leave blank to keep current, 'q' to abort): "
+        ).strip()
+        if not response:
+            if default:
+                return default
+            else:
+                print("A mnemonic is required unless you abort with 'q'.")
+                continue
+        if response.lower() in {"q", "quit", "exit"}:
+            return None
+        canonical = _canonicalize_user_mnemonic(response)
+        if not canonical:
+            print("Invalid mnemonic. Use letters, digits, or underscores (e.g. LOADK, CALL_PROTO).")
+            continue
+        return canonical
+
+
+def _handle_name_opcode(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="name_opcode",
+        description=(
+            "Interactively assign a mnemonic to an opcode and refresh reconstructed Lua output."
+        ),
+    )
+    parser.add_argument("opcode", help="Numeric opcode value (decimal, hex, 0b/0o accepted)")
+    parser.add_argument(
+        "--name",
+        dest="mnemonic",
+        help="Provide the mnemonic non-interactively (skips the prompt)",
+    )
+    parser.add_argument(
+        "--mapping",
+        default="mapping.json",
+        help="Path to mapping.json to update (created if missing)",
+    )
+    parser.add_argument(
+        "--source",
+        default="reconstructed.lua",
+        help="Reconstructed Lua file to reformat after updating the mapping",
+    )
+    parser.add_argument(
+        "--output",
+        help="Optional override for the pretty-printed Lua output path",
+    )
+    parser.add_argument(
+        "--upcodes",
+        default="upcodes.json",
+        help="Path to upcodes.json for context (optional)",
+    )
+    parser.add_argument(
+        "--guesses",
+        default="opcode_guesses.json",
+        help="Path to opcode_guesses.json for semantic hints (optional)",
+    )
+    parser.add_argument(
+        "--skip-pretty",
+        action="store_true",
+        help="Skip pretty-printing after updating mapping (only write mapping)",
+    )
+
+    args = parser.parse_args(list(argv))
+
+    try:
+        opcode_value = _parse_opcode_argument(args.opcode)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    identifier = f"OP_{opcode_value}"
+    mapping_path = Path(args.mapping)
+    raw_mapping, rename_map = _load_mapping_payload(mapping_path)
+    existing_name = rename_map.get(identifier)
+
+    context = _collect_opcode_context(
+        opcode_value, Path(args.upcodes), Path(args.guesses)
+    )
+    _print_opcode_context(opcode_value, identifier, existing_name, context)
+
+    provided = args.mnemonic.strip() if args.mnemonic else None
+    if provided:
+        new_name = _canonicalize_user_mnemonic(provided)
+        if not new_name:
+            parser.error(
+                "provided mnemonic could not be canonicalised; use letters, digits, or underscores"
+            )
+    else:
+        default = _canonicalize_user_mnemonic(existing_name)
+        if not default:
+            guess = context.get("guess")
+            if isinstance(guess, Mapping):
+                guess_name = guess.get("guess")
+                default_guess = _canonicalize_user_mnemonic(guess_name)
+                if default_guess:
+                    default = default_guess
+        new_name = _prompt_mnemonic(identifier, default)
+        if new_name is None:
+            print("Aborted without changes.")
+            return 1
+
+    payload = _update_mapping_payload(raw_mapping, identifier, new_name)
+    mapping_path.parent.mkdir(parents=True, exist_ok=True)
+    mapping_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"Updated {mapping_path} with {identifier} -> {new_name}")
+
+    if args.skip_pretty:
+        return 0
+
+    source_path = Path(args.source)
+    if not source_path.exists():
+        print(f"Source Lua not found: {source_path}", file=sys.stderr)
+        return 1
+
+    output_path = Path(args.output) if args.output else None
+    result = pretty_print_with_mapping(source_path, mapping_path, output_path=output_path)
+    print(f"Regenerated Lua at {result['output_path']}")
+    return 0
 
 
 _LPH_SIGNATURES = (b"LPH!", b"lph!", b"LPH_", b"lph_")
@@ -1053,6 +1523,10 @@ def _format_ir_arg(value: object) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arg_list = list(argv) if argv is not None else list(sys.argv[1:])
+    if arg_list and arg_list[0] == "name_opcode":
+        return _handle_name_opcode(arg_list[1:])
+
     parser = argparse.ArgumentParser(description="Decode Luraph-obfuscated Lua files")
     parser.set_defaults(report=True)
     parser.add_argument(
@@ -1090,6 +1564,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--allow-lua-run",
         action="store_true",
         help="Allow sandboxed Lua fallback during bootstrap decoding (see security notes)",
+    )
+    parser.add_argument(
+        "--sanitize-decoded",
+        dest="sanitize_decoded",
+        action="store_true",
+        help="Scan decoded payloads for potential secrets and prompt before redacting.",
+    )
+    parser.add_argument(
+        "--sanitize-auto",
+        dest="sanitize_auto",
+        action="store_true",
+        help="Automatically apply sanitisation when potential secrets are detected (implies --sanitize-decoded).",
+    )
+    parser.add_argument(
+        "--confirm-ownership",
+        action="store_true",
+        help="Confirm that you are authorised to analyse the supplied inputs.",
+    )
+    parser.add_argument(
+        "--confirm-voluntary-key",
+        action="store_true",
+        help="Confirm that any keys were provided voluntarily for this session.",
+    )
+    parser.add_argument(
+        "--operator",
+        dest="operator_name",
+        help="Optional operator name recorded in usage confirmation logs.",
+    )
+    parser.add_argument(
+        "--audit-log",
+        dest="audit_log",
+        help="Optional path to store encrypted operator confirmations.",
+    )
+    parser.add_argument(
+        "--audit-passphrase",
+        dest="audit_passphrase",
+        help="Passphrase used to encrypt operator confirmations (requires --audit-log).",
     )
     parser.add_argument(
         "--alphabet",
@@ -1161,6 +1672,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="generate intermediate artifacts without running the full reconstruction",
     )
     parser.add_argument(
+        "--safe-mode",
+        action="store_true",
+        help="capture crash reports on unexpected failures for later resume",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run static analysis steps without decoding payloads or executing Lua",
+    )
+    parser.add_argument(
+        "--quality-gate",
+        action="store_true",
+        help=(
+            "require completeness score and parity tests to meet thresholds; "
+            "useful for CI gating"
+        ),
+    )
+    parser.add_argument(
+        "--quality-threshold",
+        dest="quality_gate_threshold",
+        type=float,
+        default=0.85,
+        help=(
+            "minimum completeness score required when --quality-gate is enabled "
+            "(default: 0.85)"
+        ),
+    )
+    parser.add_argument(
+        "--quality-allow-parity-failures",
+        dest="quality_allow_parity_failures",
+        action="store_true",
+        help="do not fail the quality gate when parity tests are missing or failing",
+    )
+    parser.add_argument(
         "--run-lifter",
         action="store_true",
         help="run the VM lifter and emit reconstructed Lua artifacts",
@@ -1190,7 +1735,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--jobs", type=int, default=1, help="process inputs in parallel using N workers")
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arg_list)
+
+    env_script_key, env_variable = _consume_env_script_key()
+    if not getattr(args, "script_key", None) and env_script_key:
+        args.script_key = env_script_key
+        setattr(args, "script_key_source_hint", "override")
+        if env_variable:
+            setattr(args, "script_key_source_detail", f"env:{env_variable}")
     manual_alphabet = args.manual_alphabet.strip() if args.manual_alphabet else None
     manual_opcode_map: Optional[Dict[int, str]] = None
     if manual_alphabet:
@@ -1262,6 +1814,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.getLogger(__name__).warning("no input files discovered")
         return 0
 
+    audit_log_path: Optional[Path] = None
+    try:
+        confirmation = require_usage_confirmation(
+            confirm_ownership=bool(args.confirm_ownership),
+            confirm_voluntary_key=bool(args.confirm_voluntary_key),
+            inputs=inputs,
+            operator=args.operator_name,
+            script_key=getattr(args, "script_key", None),
+            audit_log=Path(args.audit_log) if args.audit_log else None,
+            audit_passphrase=args.audit_passphrase,
+        )
+        audit_log_path = confirmation.log_path
+        if audit_log_path:
+            logging.getLogger(__name__).info(
+                "usage confirmation recorded (%d entries) -> %s",
+                confirmation.entry_count,
+                audit_log_path,
+            )
+    except UsageConfirmationError as exc:
+        logging.getLogger(__name__).error(str(exc))
+        return 2
+
     override_raw = args.output
     override = Path(override_raw) if override_raw else None
     treat_override_as_dir = False
@@ -1316,28 +1890,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         render_target = item.lua_destination or item.destination
         if render_target is None:
             render_target = item.destination
+        script_key_source_hint = getattr(args, "script_key_source_hint", None)
+        script_key_source_detail = getattr(args, "script_key_source_detail", None)
         script_key_value = args.script_key.strip() if args.script_key else None
         script_key_available = bool(script_key_value)
         inline_script_key = None
-        script_key_source: Optional[str] = None
-        if script_key_value:
+        script_key_source: Optional[str] = script_key_source_hint
+        if script_key_value and script_key_source is None:
             if args.script_key:
                 script_key_source = "override"
             elif inline_script_key:
                 script_key_source = "literal"
-        if not script_key_available:
+        if args.dry_run:
+            script_key_available = False
+            script_key_value = None
+            script_key_source = None
+        if not script_key_available and not args.dry_run:
             inline_script_key = _detect_script_key(content)
             if inline_script_key:
                 script_key_available = True
                 script_key_value = inline_script_key
                 if script_key_source is None:
                     script_key_source = "literal"
+        allow_lua_flag = bool(args.allow_lua_run and not args.dry_run)
+        if args.dry_run and args.allow_lua_run:
+            log.info("dry-run mode ignoring --allow-lua-run for %s", item.source)
         deob = LuaDeobfuscator(
             vm_trace=args.vm_trace,
             script_key=script_key_value,
             bootstrapper=bootstrapper_path,
             debug_bootstrap=args.debug_bootstrap,
-            allow_lua_run=args.allow_lua_run,
+            allow_lua_run=allow_lua_flag,
             manual_alphabet=manual_alphabet,
             manual_opcode_map=manual_opcode_map,
             output_prefix=args.output_prefix,
@@ -1353,12 +1936,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.warning("failed to flatten JSON input %s: %s", item.source, exc)
             else:
                 previous = reconstructed_lua
-                if not script_key_available and reconstructed_lua:
+                if not args.dry_run and not script_key_available and reconstructed_lua:
                     inline_script_key = _detect_script_key(reconstructed_lua)
                     if inline_script_key:
                         script_key_available = True
                         script_key_value = inline_script_key
-        if not script_key_available:
+        if not script_key_available and not args.dry_run:
             candidate_pool = _candidate_script_keys(previous)
             if content != previous:
                 for token in _candidate_script_keys(content):
@@ -1375,7 +1958,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     script_key_source = script_key_source or "auto-lph-context"
                     break
         lph_reports: List[Dict[str, object]] = []
-        if bootstrapper_path:
+        if bootstrapper_path and not args.dry_run:
             bootstrapper_candidate = Path(bootstrapper_path)
             try:
                 blob_paths = _discover_lph_blobs(bootstrapper_candidate)
@@ -1404,10 +1987,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         final_ctx: Optional[pipeline.Context] = None
         final_timings: List[tuple[str, float]] = []
+        effective_run_lifter = bool(args.run_lifter) and not args.dry_run
+        if args.dry_run and args.run_lifter:
+            log.info("dry-run mode skipping --run-lifter for %s", item.source)
         script_key_missing_forced = False
         script_key_required = _requires_script_key(previous)
         if not script_key_available and script_key_required:
-            if args.force:
+            if args.dry_run:
+                script_key_missing_forced = True
+                log.warning(
+                    "script key missing for %s; continuing due to --dry-run",
+                    item.source,
+                )
+            elif args.force:
                 script_key_missing_forced = True
                 warning_text = (
                     f"script key missing for {item.source}; continuing due to --force"
@@ -1422,6 +2014,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(error_text, file=sys.stderr, flush=True)
                 return WorkResult(item, False, error="script key missing")
 
+        current_ctx: Optional[pipeline.Context] = None
         try:
             for iteration in range(iterations):
                 ctx = pipeline.Context(
@@ -1441,17 +2034,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     yes=args.yes,
                     force=args.force,
                     debug_bootstrap=args.debug_bootstrap,
-                    allow_lua_run=args.allow_lua_run,
+                    allow_lua_run=allow_lua_flag,
                     script_key_missing_forced=script_key_missing_forced,
                     manual_alphabet=manual_alphabet,
                     manual_opcode_map=manual_opcode_map,
                     output_prefix=args.output_prefix,
                     artifact_only=args.artifact_only,
                 )
+                current_ctx = ctx
                 if lph_summary_meta:
                     ctx.bootstrapper_metadata.update(lph_summary_meta)
                 if lph_opcode_map_int and not ctx.vm_metadata.get("opcode_map"):
                     ctx.vm_metadata["opcode_map"] = dict(lph_opcode_map_int)
+                run_lifter_flag = effective_run_lifter
                 ctx.options.update(
                     {
                         "detect_only": args.detect_only,
@@ -1462,16 +2057,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "force": args.force,
                         "script_key": script_key_value,
                         "debug_bootstrap": args.debug_bootstrap,
-                        "allow_lua_run": args.allow_lua_run,
+                        "allow_lua_run": allow_lua_flag,
                         "manual_alphabet": manual_alphabet,
                         "manual_opcode_map": manual_opcode_map,
                         "output_prefix": args.output_prefix,
                         "artifact_only": args.artifact_only,
+                        "sanitize_decoded": bool(args.sanitize_decoded or args.sanitize_auto),
+                        "sanitize_auto_apply": bool(args.sanitize_auto),
                         "chunk_lines": max(1, args.chunk_lines),
                         "render_chunk_lines": max(1, args.chunk_lines),
                         "script_key_source": script_key_source,
-                        "run_lifter": bool(args.run_lifter),
+                        "script_key_source_detail": script_key_source_detail,
+                        "usage_confirmed": True,
+                        "usage_audit_log": str(audit_log_path) if audit_log_path else None,
+                        "run_lifter": run_lifter_flag,
                         "lifter_mode": args.lifter_mode,
+                        "safe_mode": args.safe_mode,
+                        "dry_run": args.dry_run,
                     }
                 )
                 confirm_default = not (args.yes or args.force) and sys.stdin.isatty()
@@ -1489,12 +2091,62 @@ def main(argv: Sequence[str] | None = None) -> int:
                 only_selection: Optional[Iterable[str]] = only or None
                 if args.detect_only:
                     only_selection = ["detect"]
-                timings = pipeline.PIPELINE.run_passes(
-                    ctx,
-                    skip=skip,
-                    only=only_selection,
-                    profile=True,
-                )
+                try:
+                    timings = pipeline.PIPELINE.run_passes(
+                        ctx,
+                        skip=skip,
+                        only=only_selection,
+                        profile=True,
+                    )
+                except pipeline.PipelineExecutionError as err:
+                    if args.safe_mode:
+                        crash_path = _write_crash_report(
+                            item=item,
+                            ctx=ctx,
+                            iteration=iteration,
+                            failed_pass=err.pass_name,
+                            timings=err.timings,
+                            failed_duration=err.duration,
+                            exc=getattr(err, "cause", err),
+                        )
+                        log.error(
+                            "safe-mode captured crash for %s during pass %s (report: %s)",
+                            item.source,
+                            err.pass_name,
+                            crash_path,
+                        )
+                        return WorkResult(
+                            item,
+                            False,
+                            error=(
+                                f"safe-mode captured crash during pass '{err.pass_name}'. "
+                                f"report: {crash_path}"
+                            ),
+                        )
+                    raise
+                except Exception as exc:  # pragma: no cover - defensive
+                    if args.safe_mode:
+                        crash_path = _write_crash_report(
+                            item=item,
+                            ctx=ctx,
+                            iteration=iteration,
+                            failed_pass=None,
+                            timings=[],
+                            failed_duration=None,
+                            exc=exc,
+                        )
+                        log.error(
+                            "safe-mode captured crash for %s (report: %s)",
+                            item.source,
+                            crash_path,
+                            exc_info=True,
+                        )
+                        return WorkResult(
+                            item,
+                            False,
+                            error=f"safe-mode captured crash. report: {crash_path}",
+                        )
+                    raise
                 final_ctx = ctx
                 final_timings = list(timings)
 
@@ -1506,6 +2158,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     break
                 previous = produced
         except Exception as exc:  # pragma: no cover - defensive
+            if args.safe_mode:
+                crash_iteration = getattr(current_ctx, "iteration", 0) if current_ctx else 0
+                crash_path = _write_crash_report(
+                    item=item,
+                    ctx=current_ctx,
+                    iteration=crash_iteration,
+                    failed_pass=None,
+                    timings=[],
+                    failed_duration=None,
+                    exc=exc,
+                )
+                log.error(
+                    "safe-mode captured crash for %s outside pass execution (report: %s)",
+                    item.source,
+                    crash_path,
+                    exc_info=True,
+                )
+                return WorkResult(
+                    item,
+                    False,
+                    error=f"safe-mode captured crash. report: {crash_path}",
+                )
             log.exception("error processing %s", item.source)
             return WorkResult(item, False, error=str(exc))
 
@@ -1519,7 +2193,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not isinstance(bucket_value, dict):
                 final_ctx.vm_metadata[bucket_name] = {}
         lifter_summary: Dict[str, Any] = {}
-        if args.run_lifter:
+        if effective_run_lifter:
             lifter_summary = cli_reporting.run_lifter_for_cli(
                 final_ctx,
                 source_path=item.source,
@@ -1623,7 +2297,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         success = True
         error_message: Optional[str] = None
 
-        lifter_metadata_raw = lifter_summary.get("metadata") if args.run_lifter else None
+        lifter_metadata_raw = (
+            lifter_summary.get("metadata") if effective_run_lifter else None
+        )
         lifter_metadata = lifter_metadata_raw if isinstance(lifter_metadata_raw, Mapping) else None
 
         functions_lifted = None
@@ -1730,7 +2406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             trusted_count = max(0, required_mandatory - len(missing_recognized))
 
         coverage_failure = False
-        if args.run_lifter and args.lifter_mode == "accurate":
+        if effective_run_lifter and args.lifter_mode == "accurate":
             coverage_failure = bool(missing_recognized)
             if lifter_metadata is not None:
                 status_value = lifter_metadata.get("status")
@@ -1862,12 +2538,106 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary_lines.append(f"Version: {final_ctx.detected_version.name}")
         if final_timings:
             summary_lines.append(utils.format_pass_summary(final_timings))
+
+        checklist: Optional[Mapping[str, object]] = None
+        quality_gate_info: Optional[Dict[str, object]] = None
+        quality_gate_error: Optional[str] = None
+        summary_path: Optional[Path] = None
+
+        if not args.detect_only and not args.dry_run and render_target.exists():
+            try:
+                checklist = evaluate_deobfuscation_checklist(
+                    item.source,
+                    reconstructed_path=render_target,
+                    write_lock_if_high_confidence=True,
+                )
+            except Exception:  # pragma: no cover - diagnostics only
+                logging.getLogger(__name__).debug(
+                    "failed to compute completeness score for %s",
+                    item.source,
+                    exc_info=True,
+                )
+                if args.quality_gate:
+                    summary_lines.append("Quality gate: FAIL (checklist unavailable)")
+                    quality_gate_error = (
+                        "quality gate failed: unable to evaluate checklist"
+                    )
+            else:
+                completeness = checklist.get("completeness")
+                if isinstance(completeness, Mapping):
+                    score = completeness.get("score")
+                    if isinstance(score, (int, float)):
+                        summary_lines.append(f"Completeness score: {score:.3f}")
+                if args.quality_gate:
+                    quality_gate_info = evaluate_quality_gate(
+                        checklist,
+                        threshold=args.quality_gate_threshold,
+                        require_parity=not args.quality_allow_parity_failures,
+                    )
+                    gate_status = "PASS" if quality_gate_info["passed"] else "FAIL"
+                    gate_score = quality_gate_info.get("score")
+                    if isinstance(gate_score, float):
+                        score_part = f"score {gate_score:.3f}"
+                    else:
+                        score_part = "score n/a"
+                    threshold_raw = quality_gate_info.get("threshold")
+                    if isinstance(threshold_raw, float):
+                        threshold_part = f"threshold {threshold_raw:.3f}"
+                    else:
+                        threshold_part = "threshold n/a"
+                    parity_meta = quality_gate_info.get("parity", {})
+                    parity_total = parity_meta.get("total", 0)
+                    parity_passed = parity_meta.get("passed", 0)
+                    parity_desc = f", parity {parity_passed}/{parity_total}"
+                    if args.quality_allow_parity_failures:
+                        parity_desc += " (allow failures)"
+                    summary_lines.append(
+                        f"Quality gate: {gate_status} ({score_part}, {threshold_part}{parity_desc})"
+                    )
+                    if not quality_gate_info["passed"]:
+                        failures = quality_gate_info.get("failures")
+                        detail = "; ".join(
+                            entry for entry in failures if isinstance(entry, str)
+                        )
+                        quality_gate_error = (
+                            f"quality gate failed: {detail or 'requirements not met'}"
+                        )
+
+                extras_payload: Dict[str, object] = {}
+                dangerous_meta = final_ctx.result.get("dangerous_calls")
+                if isinstance(dangerous_meta, Mapping):
+                    extras_payload["dangerous_calls"] = dict(dangerous_meta)
+                try:
+                    summary_target = render_target.parent / "SUMMARY.md"
+                    summary_path = generate_run_summary(
+                        summary_target,
+                        source=item.source,
+                        report=report,
+                        checklist=checklist,
+                        extras=extras_payload,
+                    )
+                except Exception:
+                    logging.getLogger(__name__).debug(
+                        "failed to generate SUMMARY.md for %s", item.source, exc_info=True
+                    )
+                else:
+                    final_ctx.result["summary_path"] = str(summary_path)
+
+        if args.quality_gate and quality_gate_info is None and quality_gate_error is None:
+            summary_lines.append("Quality gate: SKIPPED (no output to evaluate)")
+
         summary = "\n".join(line for line in summary_lines if line)
+        if quality_gate_error and success:
+            success = False
+            if error_message:
+                error_message = f"{error_message}; {quality_gate_error}"
+            else:
+                error_message = quality_gate_error
         return WorkResult(
             item,
             success,
             output_path=item.destination,
-            summary=summary,
+            summary=(summary + (f"\nSummary: {summary_path}" if summary_path else "")).strip(),
             error=error_message,
         )
 

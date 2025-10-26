@@ -1,12 +1,47 @@
 import re
 import logging
-from typing import List, Dict, Any
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from variable_renamer import VariableRenamer
+
+
+_SHORT_STRING_RE = re.compile(r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', re.DOTALL)
+_LONG_BRACKET_RE = re.compile(r'\[(=*)\[.*?\]\1\]', re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r'--.*?(?=\n|$)')
+_LONG_COMMENT_RE = re.compile(r'--\[(=*)\[.*?\]\1\]', re.DOTALL)
+
+
+@dataclass(frozen=True)
+class NoOpEvidence:
+    """Description of a statically-proven no-op construct."""
+
+    kind: str
+    name: Optional[str]
+    snippet: str
+    start: int
+    end: int
+    proof: Dict[str, Any]
+    removable: bool = True
+
+    def to_json(self) -> Dict[str, Any]:
+        data = {
+            "kind": self.kind,
+            "name": self.name,
+            "snippet": self.snippet.strip(),
+            "proof": self.proof,
+            "removable": self.removable,
+        }
+        return data
 
 class TrapDetector:
     """Detects and removes anti-deobfuscation traps from Luraph/LuaMor obfuscated code."""
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self._function_scanner: Optional[VariableRenamer] = None
+        self.last_noop_report: List[NoOpEvidence] = []
 
         # Common trap patterns
         self.trap_patterns = {
@@ -68,7 +103,7 @@ class TrapDetector:
         """Remove detected traps from the code."""
         cleaned_code = code
         for trap_type, patterns in self.trap_patterns.items():
-            if trap_type in {"debug_hooks", "environment_checks"}:
+            if trap_type in {"debug_hooks", "environment_checks", "dummy_functions"}:
                 continue
             for pattern in patterns:
                 cleaned_code = re.sub(pattern, '', cleaned_code, flags=re.IGNORECASE | re.DOTALL)
@@ -119,15 +154,213 @@ class TrapDetector:
             }
             if characteristics['code_lines'] <= 1 and not characteristics['has_return']:
                 analysis['likely_dummies'].append(characteristics)
-            elif (characteristics['code_lines'] > 10 and 
-                  characteristics['has_loops'] and 
+            elif (characteristics['code_lines'] > 10 and
+                  characteristics['has_loops'] and
                   characteristics['has_conditionals']):
                 analysis['complex_functions'].append(characteristics)
-            elif (characteristics['calls_other_functions'] and 
-                  not characteristics['has_loops'] and 
+            elif (characteristics['calls_other_functions'] and
+                  not characteristics['has_loops'] and
                   not characteristics['has_conditionals']):
                 analysis['suspicious_functions'].append(characteristics)
         return analysis
+
+    # -- No-op detection -------------------------------------------------
+    def detect_noop_insertions(self, code: str) -> List[NoOpEvidence]:
+        """Return heuristically proven no-op helpers and junk loops."""
+
+        helpers = self._detect_noop_helpers(code)
+        loops = self._detect_noop_loops(code)
+        return helpers + loops
+
+    def _ensure_function_scanner(self) -> VariableRenamer:
+        if self._function_scanner is None:
+            self._function_scanner = VariableRenamer()
+        return self._function_scanner
+
+    def _strip_marked_noops(self, code: str, entries: List[NoOpEvidence]) -> str:
+        removable = [entry for entry in entries if entry.removable]
+        if not removable:
+            return code
+        pieces: List[str] = []
+        last_index = 0
+        for entry in sorted(removable, key=lambda item: item.start):
+            pieces.append(code[last_index:entry.start])
+            last_index = entry.end
+        pieces.append(code[last_index:])
+        return ''.join(pieces)
+
+    def _detect_noop_helpers(self, code: str) -> List[NoOpEvidence]:
+        scanner = self._ensure_function_scanner()
+        spans = scanner._scan_functions(code)
+        findings: List[NoOpEvidence] = []
+        for span in spans:
+            header = span.header
+            if not header:
+                continue
+            name = header.name
+            start_index = span.start
+            if code[max(0, start_index - 6):start_index] == 'local ':
+                start_index -= 6
+            line_start, line_end = self._expand_to_line(code, start_index, span.end)
+            body = code[header.end:span.end - 3]
+            body_no_comments = self._remove_comments(body).strip()
+            body_no_effects = self._strip_comments_and_strings(body).strip()
+            classification: Optional[str]
+            proof: Dict[str, Any]
+            removable = False
+            if not body_no_effects:
+                classification = 'empty_helper'
+                proof = {
+                    'analysis': 'function body empty after removing comments and literals',
+                    'call_count': self._count_identifier_calls(code, name, line_start, line_end) if name else 0,
+                    'params': header.params,
+                }
+            else:
+                return_expr = self._extract_simple_return(body_no_comments)
+                if return_expr is None:
+                    continue
+                expr_kind, expr_value = return_expr
+                proof = {
+                    'analysis': 'single return statement with simple expression',
+                    'expression': expr_value,
+                    'expression_kind': expr_kind,
+                    'params': header.params,
+                }
+                classification = 'identity_helper' if expr_kind == 'parameter' else 'constant_helper'
+                proof['call_count'] = self._count_identifier_calls(code, name, line_start, line_end) if name else 0
+            removable = bool(name) and proof.get('call_count', 0) == 0
+            snippet = code[line_start:line_end]
+            findings.append(
+                NoOpEvidence(
+                    kind=classification,
+                    name=name,
+                    snippet=snippet,
+                    start=line_start,
+                    end=line_end,
+                    proof=proof,
+                    removable=removable,
+                )
+            )
+        return findings
+
+    def _detect_noop_loops(self, code: str) -> List[NoOpEvidence]:
+        loop_patterns = [
+            re.compile(r'for\s+(?P<header>[^\n]*?)\s+do(?P<body>.*?)end', re.IGNORECASE | re.DOTALL),
+            re.compile(r'while\s+(?P<header>[^\n]*?)\s+do(?P<body>.*?)end', re.IGNORECASE | re.DOTALL),
+            re.compile(r'repeat(?P<body>.*?)until\s+(?P<condition>[^\n;]+)', re.IGNORECASE | re.DOTALL),
+        ]
+        matches: List[tuple[NoOpEvidence, str]] = []
+        keys: List[str] = []
+        for regex in loop_patterns:
+            for match in regex.finditer(code):
+                body = match.group('body')
+                if self._strip_comments_and_strings(body).strip():
+                    continue
+                start, end = match.span()
+                line_start, line_end = self._expand_to_line(code, start, end)
+                snippet = code[line_start:line_end]
+                normalised = self._normalise_snippet(snippet)
+                keys.append(normalised)
+                proof: Dict[str, Any] = {
+                    'analysis': 'loop body empty after removing comments and literals',
+                    'header': match.groupdict().get('header', '').strip(),
+                }
+                if 'condition' in match.groupdict():
+                    proof['condition'] = match.group('condition').strip()
+                evidence = NoOpEvidence(
+                    kind='junk_loop',
+                    name=None,
+                    snippet=snippet,
+                    start=line_start,
+                    end=line_end,
+                    proof=proof,
+                    removable=True,
+                )
+                matches.append((evidence, normalised))
+        counter = Counter(keys)
+        findings: List[NoOpEvidence] = []
+        for evidence, key in matches:
+            updated_proof = dict(evidence.proof)
+            updated_proof['duplicate_count'] = counter[key]
+            findings.append(
+                NoOpEvidence(
+                    kind=evidence.kind,
+                    name=evidence.name,
+                    snippet=evidence.snippet,
+                    start=evidence.start,
+                    end=evidence.end,
+                    proof=updated_proof,
+                    removable=True,
+                )
+            )
+        return findings
+
+    def _extract_simple_return(self, body: str) -> Optional[tuple[str, str]]:
+        stripped = body.strip()
+        if not stripped.lower().startswith('return'):
+            return None
+        remainder = stripped[len('return'):].strip()
+        if not remainder:
+            return ('constant', 'nil')
+        first_line, *rest = remainder.splitlines()
+        if any(line.strip() for line in rest):
+            return None
+        expr = first_line.rstrip(';').strip()
+        if not expr or ',' in expr:
+            return None
+        lowered = expr.lower()
+        if lowered in {'nil', 'true', 'false'}:
+            return ('constant', lowered)
+        if lowered.startswith('0x') or lowered.startswith('0b'):
+            try:
+                int(lowered[2:], 16 if lowered.startswith('0x') else 2)
+            except ValueError:
+                return None
+            return ('constant', expr)
+        if lowered.replace('.', '', 1).isdigit():
+            return ('constant', expr)
+        if expr in {'...',}:
+            return ('parameter', expr)
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', expr):
+            return ('parameter', expr)
+        if expr.startswith('"') or expr.startswith("'") or expr.startswith('['):
+            return ('constant', expr)
+        return None
+
+    def _normalise_snippet(self, snippet: str) -> str:
+        return re.sub(r'\s+', ' ', snippet.strip())
+
+    def _expand_to_line(self, text: str, start: int, end: int) -> tuple[int, int]:
+        line_start = text.rfind('\n', 0, start)
+        if line_start == -1:
+            line_start = 0
+        else:
+            line_start += 1
+        line_end = text.find('\n', end)
+        if line_end == -1:
+            line_end = len(text)
+        else:
+            line_end += 1
+        return line_start, line_end
+
+    def _strip_comments_and_strings(self, text: str) -> str:
+        text = _LONG_COMMENT_RE.sub(' ', text)
+        text = _LINE_COMMENT_RE.sub(' ', text)
+        text = _LONG_BRACKET_RE.sub(' ', text)
+        text = _SHORT_STRING_RE.sub(' ', text)
+        return text
+
+    def _remove_comments(self, text: str) -> str:
+        text = _LONG_COMMENT_RE.sub('', text)
+        text = _LINE_COMMENT_RE.sub('', text)
+        return text
+
+    def _count_identifier_calls(self, code: str, name: Optional[str], start: int, end: int) -> int:
+        if not name:
+            return 0
+        masked = code[:start] + (' ' * (end - start)) + code[end:]
+        pattern = re.compile(rf'\b{re.escape(name)}\s*\(')
+        return len(pattern.findall(masked))
 
     def detect_anti_debug_checks(self, code: str) -> List[str]:
         """Detect specific anti-debugging checks."""
@@ -144,15 +377,47 @@ class TrapDetector:
             detected_checks.extend(re.findall(pattern, code, re.IGNORECASE | re.DOTALL))
         return detected_checks
 
-    def sanitize_code(self, code: str) -> str:
-        """Perform comprehensive code sanitization."""
+    def sanitize_code(
+        self,
+        code: str,
+        *,
+        remove_noops: bool = False,
+        confirm: bool = False,
+    ) -> str:
+        """Perform comprehensive code sanitization.
+
+        Parameters
+        ----------
+        code:
+            Lua source to sanitise.
+        remove_noops:
+            When ``True`` the detector attempts to strip junk helpers and
+            no-op loops that have been proven to be side-effect free.  This
+            requires explicit confirmation via ``confirm``.
+        confirm:
+            Must be set to ``True`` when ``remove_noops`` is requested.  This
+            acts as a safety latch so callers make an intentional choice before
+            any code-removal is performed.
+        """
         self.logger.info("Starting comprehensive trap detection and removal...")
         self.detect_traps(code)
         cleaned_code = self.remove_traps(code)
         cleaned_code = self.neutralize_advanced_traps(cleaned_code)
         self.analyze_function_complexity(cleaned_code)
         self.detect_anti_debug_checks(cleaned_code)
+        self.last_noop_report = self.detect_noop_insertions(cleaned_code)
+        if remove_noops:
+            if not confirm:
+                raise ValueError(
+                    "Explicit confirmation required before removing proven no-op blocks"
+                )
+            cleaned_code = self._strip_marked_noops(cleaned_code, self.last_noop_report)
         return cleaned_code
+
+    def noop_report(self) -> List[Dict[str, Any]]:
+        """Return the last computed no-op evidence in serialisable form."""
+
+        return [entry.to_json() for entry in self.last_noop_report]
     # Advanced trap neutralisation
     def neutralize_advanced_traps(self, code: str) -> str:
         """Replace advanced anti-debug checks with benign stubs.

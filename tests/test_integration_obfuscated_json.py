@@ -43,6 +43,8 @@ def test_integration_obfuscated_json(tmp_path: Path) -> None:
         "--yes",
         "--debug-bootstrap",
         "--allow-lua-run",
+        "--confirm-ownership",
+        "--confirm-voluntary-key",
     ]
 
     proc = subprocess.run(cmd, capture_output=True, text=True)

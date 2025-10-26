@@ -45,6 +45,8 @@ def test_cli_runs_with_initv4_payload(tmp_path: Path) -> None:
         "--max-iterations",
         "1",
         "--artifact-only",
+        "--confirm-ownership",
+        "--confirm-voluntary-key",
     ]
 
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=PROJECT_ROOT)

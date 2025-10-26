@@ -17,14 +17,27 @@ to reconstruct readable Lua from simple bytecode traces.
 - **Luraph v14.4.1 (initv4)** – full bootstrap support with `--script-key`
   decoding and optional `--bootstrapper` extraction for opcode maps/alphabet
   tables supplied by `initv4.lua`.
+- **Luraph v14.4.2 – v14.4.3 (self-contained Lua)** – automatic detection of
+  inline bootstrappers and direct table payloads (e.g. `Obfuscated2.lua` –
+  `Obfuscated5.lua`) with per-file alphabet extraction that never falls back to
+  `initv4`.
+- **Luraph v14.3 family** – banner driven detection and VM lifting for bundled
+  bootstrapper payloads such as `Obfuscated4.lua`/`Obfuscated6.lua`.
 - **Earlier 14.x JSON loaders** – automatic payload recovery for the
   `luraph_v14_2_json` family and compatible builds.
 
 Heuristics in `src/deobfuscator.py` attempt to detect the Luraph version used
 in a script.  Version specific tweaks live in `src/versions/` and are applied
 automatically when the virtual machine executes embedded bytecode (currently
-covering v14.0.2 through v14.4.1, including the ``initv4`` bootstrap that ships
-encrypted script payloads).
+covering v14.0.2 through v14.4.3).  The header detector now distinguishes
+between JSON bootstraps, inline bootstrappers, and self-contained payloads, so
+alphabet recovery only touches `initv4.lua` when analysing `Obfuscated.json`.
+
+The high-level orchestrator `complete_deobfuscate` drives the entire static
+pipeline—including fragment extraction, PRGA probing, VM lifting, pretty
+printing, and the new completeness checks—without requiring interactive
+prompts.  CI and scripted workflows can therefore run end-to-end deobfuscation
+without manual confirmation beyond the opt-in ownership flags.
 
 ## Installation
 
@@ -69,13 +82,17 @@ SCRIPT_KEY=<script_key> python -m src.sandbox_runner --init initv4.lua --json Ob
 
 ### Linux / macOS
 
-Install LuaJIT and `lua-cjson`, then install the Python dependencies:
+Install LuaJIT, the reference Lua interpreter (required for helper scripts such
+as `tools/extract.lua`), and `lua-cjson`, then install the Python dependencies.
+With those prerequisites in place you can perform a local extraction run by
+streaming the session key to the helper script via stdin:
 
 ```bash
-sudo apt-get install -y luajit luarocks
+sudo apt-get install -y lua5.4 luajit luarocks
 sudo luarocks install lua-cjson
 pip install -r requirements.txt
 python -m src.sandbox_runner --init initv4.lua --json Obfuscated.json --key mm3utjoup9kq0y7b8eh37 --out out --run-lifter
+printf 'TINY-XXXX\n' | lua -e "key=io.read('*l'); dofile('tools/extract.lua')"
 ```
 
 Run `python tools/check_deps.py` at any time to confirm that both lupa and a
@@ -83,6 +100,15 @@ LuaJIT executable are available. The script automatically prefers the bundled
 `bin/luajit.exe` when present. The Lua shim logs to `out/shim_usage.txt` and
 captures fallback payloads to `out/unpacked_dump.lua.json` for post-mortem
 analysis.
+
+### VSCode reverse mapping helper
+
+If you use VSCode during analysis, install the lightweight extension under
+`tools/vscode-reverse-mapping/`. Once installed, run **Luraph: Find Original
+Identifier** from the command palette (with a readable identifier selected) to
+jump back to the original obfuscated name. The extension reads `mapping.lock`
+or `mapping.json`, never persists session keys, and opens the first matching
+occurrence inside the workspace.
 
 ### Protection detection & runtime capture
 
@@ -200,6 +226,8 @@ Frequently used flags:
 | `--bootstrapper PATH` | Load an initv4 stub to recover its alphabet/opcode table automatically |
 | `--debug-bootstrap` | Dump detailed bootstrapper extraction logs and raw regex matches |
 | `--allow-lua-run` | Permit the sandboxed Lua fallback when Python decoding fails |
+| `--sanitize-decoded` | Scan decoded payloads for secrets and prompt before redacting |
+| `--sanitize-auto` | Automatically redact detected secrets without prompting |
 | `--alphabet STRING` | Force a manual initv4 alphabet and skip bootstrap extraction |
 | `--opcode-map-json PATH` | Provide a JSON opcode dispatch map instead of extracting it |
 | `--yes` | Auto-confirm detected versions and bootstrapper prompts |
@@ -325,15 +353,18 @@ Practical combinations look like:
 
 ```bash
 # Decode a standalone payload with the script key that Luraph provided
-python main.py --script-key x5elqj5j4ibv9z3329g7b examples/v1441_hello.lua
+python main.py --confirm-ownership --confirm-voluntary-key \
+    --script-key x5elqj5j4ibv9z3329g7b examples/v1441_hello.lua
 
 # Reuse the script key embedded in the file but supply a bootstrapper directory
 # so opcode mappings and the alphabet are recovered from initv4.lua automatically
-python main.py --bootstrapper tests/fixtures/initv4_stub examples/v1441_hello.lua
+python main.py --confirm-ownership --confirm-voluntary-key \
+    --bootstrapper tests/fixtures/initv4_stub examples/v1441_hello.lua
 
 # Provide both arguments – the explicit key wins while the bootstrapper enriches
 # metadata and remaps opcodes for custom builds
-python main.py --script-key x5elqj5j4ibv9z3329g7b --bootstrapper tests/fixtures/initv4_stub/initv4.lua \
+python main.py --confirm-ownership --confirm-voluntary-key \
+    --script-key x5elqj5j4ibv9z3329g7b --bootstrapper tests/fixtures/initv4_stub/initv4.lua \
     examples/v1441_hello.lua
 ```
 
@@ -425,6 +456,20 @@ into the pipeline and bypasses automatic detection for the current run.【F:src/
 - Capture a textual VM IR listing with `--dump-ir` and attach it alongside the
   original sample when filing an issue; it helps pinpoint unsupported patterns in
   the lifter or devirtualiser.【F:src/main.py†L226-L234】
+
+### Quality gates & CI workflows
+
+For continuous integration runs the CLI can enforce minimum completeness and
+parity expectations.  Pass `--quality-gate` to enable the check, optionally
+tuning the minimum accepted score with `--quality-threshold` (defaults to
+`0.85`) and allowing missing parity data with
+`--quality-allow-parity-failures` when a sandbox cannot execute the runtime
+parity harness.【F:src/main.py†L1640-L1670】  When active, the pipeline evaluates
+the reconstructed output via `evaluate_deobfuscation_checklist`, reports the
+result, and aborts the run if the configured gate fails so CI can block the
+merge.【F:src/main.py†L2471-L2545】  The gate relies on
+`evaluate_quality_gate` to clamp the score, inspect parity results, and explain
+any unmet requirements in the failure summary.【F:version_detector.py†L3585-L3671】
 
 ## Project map
 

@@ -14,8 +14,13 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+import time
+from collections import defaultdict, deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
@@ -92,6 +97,187 @@ def save_output(content: str, output_path: str) -> None:
         handle.write(content)
 
 
+@dataclass
+class _BenchmarkStat:
+    """Aggregate statistics for a benchmark category."""
+
+    count: int = 0
+    total: float = 0.0
+    max_duration: float = 0.0
+    last_event_id: int = 0
+    events: deque[Tuple[int, float, Optional[Mapping[str, Any]]]] = field(
+        default_factory=lambda: deque(maxlen=128)
+    )
+
+
+class BenchmarkRecorder:
+    """Collects timing measurements for critical pipeline stages."""
+
+    def __init__(self) -> None:
+        self._stats: Dict[str, _BenchmarkStat] = defaultdict(_BenchmarkStat)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _coerce_metadata(metadata: Optional[Mapping[str, Any]] | Any) -> Optional[Dict[str, Any]]:
+        if metadata is None:
+            return None
+        if isinstance(metadata, Mapping):
+            result: Dict[str, Any] = {}
+            for key, value in metadata.items():
+                key_str = str(key)
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    result[key_str] = value
+                else:
+                    result[key_str] = str(value)
+            return result
+        return {"value": str(metadata)}
+
+    def record(
+        self,
+        category: str,
+        duration: float,
+        metadata: Optional[Mapping[str, Any]] | Any = None,
+    ) -> None:
+        """Record a timing measurement for *category*."""
+
+        if duration < 0:
+            return
+        meta = self._coerce_metadata(metadata)
+        with self._lock:
+            stat = self._stats[category]
+            stat.count += 1
+            stat.total += duration
+            if duration > stat.max_duration:
+                stat.max_duration = duration
+            stat.last_event_id += 1
+            stat.events.append((stat.last_event_id, duration, meta))
+
+    def take_snapshot(self) -> Dict[str, Tuple[int, float, int]]:
+        """Return a snapshot of the current aggregate counters."""
+
+        with self._lock:
+            return {
+                category: (stat.count, stat.total, stat.last_event_id)
+                for category, stat in self._stats.items()
+            }
+
+    def _iter_recent_events(
+        self,
+        stat: _BenchmarkStat,
+        threshold: int,
+    ) -> Iterable[Tuple[int, float, Optional[Mapping[str, Any]]]]:
+        for event_id, duration, meta in stat.events:
+            if event_id > threshold:
+                yield event_id, duration, meta
+
+    def summarize(
+        self,
+        snapshot: Optional[Dict[str, Tuple[int, float, int]]] = None,
+        *,
+        limit_samples: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return aggregate statistics sorted by total runtime."""
+
+        with self._lock:
+            summaries: List[Dict[str, Any]] = []
+            for category, stat in self._stats.items():
+                prev_count = prev_total = prev_event = 0
+                if snapshot:
+                    prev_count, prev_total, prev_event = snapshot.get(
+                        category, (0, 0.0, 0)
+                    )
+                count = stat.count - prev_count
+                total = stat.total - prev_total
+                recent_events = list(self._iter_recent_events(stat, prev_event))
+                if snapshot and count <= 0:
+                    count = len(recent_events)
+                    total = sum(duration for _, duration, _ in recent_events)
+                if count <= 0 or total <= 0:
+                    continue
+                max_duration = (
+                    max((duration for _, duration, _ in recent_events), default=0.0)
+                    if snapshot
+                    else stat.max_duration
+                )
+                average = total / max(count, 1)
+                samples: List[Dict[str, Any]] = []
+                for _, duration, meta in recent_events[-limit_samples:]:
+                    if meta is None:
+                        continue
+                    samples.append(
+                        {
+                            "duration": duration,
+                            "metadata": meta,
+                        }
+                    )
+                summaries.append(
+                    {
+                        "category": category,
+                        "total": total,
+                        "count": count,
+                        "average": average,
+                        "max": max_duration,
+                        "samples": samples,
+                    }
+                )
+
+        summaries.sort(key=lambda entry: entry["total"], reverse=True)
+        return summaries
+
+    def render_report(
+        self,
+        snapshot: Optional[Dict[str, Tuple[int, float, int]]] = None,
+        *,
+        limit_samples: int = 3,
+    ) -> str:
+        """Return a human-readable hotspot report."""
+
+        summaries = self.summarize(snapshot, limit_samples=limit_samples)
+        if not summaries:
+            return "No benchmark data recorded."
+
+        lines = ["Benchmark hotspots (sorted by total time):"]
+        for entry in summaries:
+            lines.append(
+                "- {category}: {total:.6f}s over {count} events (avg {average:.6f}s, max {max:.6f}s)".format(
+                    **entry
+                )
+            )
+            for sample in entry.get("samples", []):
+                metadata = sample.get("metadata") or {}
+                if isinstance(metadata, dict):
+                    meta_str = ", ".join(
+                        f"{key}={value}" for key, value in sorted(metadata.items())
+                    )
+                else:
+                    meta_str = str(metadata)
+                lines.append(
+                    f"    • {sample['duration']:.6f}s ({meta_str})"
+                )
+        return "\n".join(lines)
+
+
+_BENCHMARK_RECORDER = BenchmarkRecorder()
+
+
+def benchmark_recorder() -> BenchmarkRecorder:
+    """Return the global :class:`BenchmarkRecorder` instance."""
+
+    return _BENCHMARK_RECORDER
+
+
+@contextmanager
+def benchmark(category: str, metadata: Optional[Mapping[str, Any]] | Any = None):
+    """Context manager that records execution time for ``category``."""
+
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        duration = time.perf_counter() - start
+        benchmark_recorder().record(category, duration, metadata)
+
+
 def print_banner() -> None:
     """Print a small banner used by the legacy CLI."""
 
@@ -162,6 +348,59 @@ def safe_exec(code: str, globals_dict: Optional[Dict[str, Any]] = None) -> Any:
         return None
 
 
+def byte_diff(
+    a: bytes | bytearray | memoryview | None,
+    b: bytes | bytearray | memoryview | None,
+    *,
+    context: int = 8,
+) -> Dict[str, Any]:
+    """Return structured information describing the first differing byte."""
+
+    buf_a = bytes(a or b"")
+    buf_b = bytes(b or b"")
+
+    min_len = min(len(buf_a), len(buf_b))
+    diff_index: int | None = None
+    for index in range(min_len):
+        if buf_a[index] != buf_b[index]:
+            diff_index = index
+            break
+    else:
+        if len(buf_a) != len(buf_b):
+            diff_index = min_len
+
+    if diff_index is None:
+        return {
+            "match": True,
+            "index": None,
+            "a_len": len(buf_a),
+            "b_len": len(buf_b),
+            "a_byte": None,
+            "b_byte": None,
+            "a_context": buf_a[-context:].hex() if buf_a else "",
+            "b_context": buf_b[-context:].hex() if buf_b else "",
+        }
+
+    start = max(0, diff_index - context)
+    end = min(max(len(buf_a), len(buf_b)), diff_index + context + 1)
+    slice_a = buf_a[start:end]
+    slice_b = buf_b[start:end]
+
+    a_byte = buf_a[diff_index] if diff_index < len(buf_a) else None
+    b_byte = buf_b[diff_index] if diff_index < len(buf_b) else None
+
+    return {
+        "match": False,
+        "index": diff_index,
+        "a_len": len(buf_a),
+        "b_len": len(buf_b),
+        "a_byte": a_byte,
+        "b_byte": b_byte,
+        "a_context": slice_a.hex(),
+        "b_context": slice_b.hex(),
+    }
+
+
 __all__ = [
     "create_output_path",
     "extract_nested_loadstrings",
@@ -172,6 +411,7 @@ __all__ = [
     "print_banner",
     "read_file_content",
     "safe_exec",
+    "byte_diff",
     "save_output",
     "setup_logging",
     "validate_input",

@@ -49,7 +49,13 @@ def test_complex_examples_cli_outputs_are_clean(tmp_path: Path) -> None:
     copied = _copy_example_tree(source_root, tmp_path)
 
     proc = subprocess.run(
-        [sys.executable, str(CLI_ENTRY), str(copied)],
+        [
+            sys.executable,
+            str(CLI_ENTRY),
+            str(copied),
+            "--confirm-ownership",
+            "--confirm-voluntary-key",
+        ],
         cwd=tmp_path,
         capture_output=True,
         text=True,

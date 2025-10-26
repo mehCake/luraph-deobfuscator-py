@@ -12,6 +12,7 @@ from src.cli.reporting import run_lifter_for_cli
 from src.pipeline import PIPELINE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIRM_FLAGS = ["--confirm-ownership", "--confirm-voluntary-key"]
 
 
 class _FakeVMIR:
@@ -68,6 +69,7 @@ def test_cli_lifter_artifacts_and_metadata(tmp_path, monkeypatch, lifter_fixture
             "json",
             "--out",
             str(out_dir),
+            *CONFIRM_FLAGS,
         ]
     )
     assert exit_code == 0
@@ -155,6 +157,7 @@ def test_cli_lifter_debug_outputs(tmp_path, monkeypatch, lifter_fixture_data):
             "json",
             "--out",
             str(out_dir),
+            *CONFIRM_FLAGS,
         ]
     )
     assert exit_code == 0
@@ -270,6 +273,7 @@ def test_cli_fails_when_mandatory_opcodes_low_trust(tmp_path, monkeypatch):
             "json",
             "--out",
             str(out_dir),
+            *CONFIRM_FLAGS,
         ]
     )
 
@@ -321,6 +325,7 @@ def test_cli_force_allows_mandatory_gap_with_warning(tmp_path, monkeypatch):
             "--out",
             str(out_dir),
             "--force",
+            *CONFIRM_FLAGS,
         ]
     )
 
@@ -377,6 +382,7 @@ def test_cli_emits_placeholder_warning(tmp_path, monkeypatch, capsys):
             "json",
             "--out",
             str(out_dir),
+            *CONFIRM_FLAGS,
         ]
     )
 

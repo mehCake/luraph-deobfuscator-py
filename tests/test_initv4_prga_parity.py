@@ -12,6 +12,7 @@ from lupa import LuaRuntime
 
 from src.decoders.initv4_prga import apply_prga
 from src.decoders.lph85 import decode_lph85
+from utils import byte_diff
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,30 +50,30 @@ def _extract_lph_sample(n_bytes: int) -> bytes:
 
 
 def _assert_byte_parity(py_bytes: bytes, lua_bytes: bytes) -> None:
-    if len(py_bytes) != len(lua_bytes):
-        raise AssertionError(
-            f"Length mismatch: py={len(py_bytes)} bytes lu={len(lua_bytes)} bytes"
-        )
+    diff = byte_diff(py_bytes, lua_bytes)
+    if diff["match"]:
+        return
 
-    for index, (py_val, lua_val) in enumerate(zip(py_bytes, lua_bytes)):
-        if py_val != lua_val:
-            start = max(0, index - 8)
-            end = min(len(py_bytes), index + 9)
-            context_py = py_bytes[start:end].hex()
-            context_lu = lua_bytes[start:end].hex()
-            raise AssertionError(
-                "Mismatch at byte {idx}: py={py:02x} lu={lu:02x}\n"
-                "py[{start}:{end}]: {py_ctx}\n"
-                "lu[{start}:{end}]: {lu_ctx}".format(
-                    idx=index,
-                    py=py_val,
-                    lu=lua_val,
-                    start=start,
-                    end=end,
-                    py_ctx=context_py,
-                    lu_ctx=context_lu,
-                )
-            )
+    index = diff["index"]
+    if index is None:
+        index = 0
+    a_len = diff["a_len"]
+    b_len = diff["b_len"]
+    start = max(0, index - 8)
+    end = min(max(a_len, b_len), index + 9)
+    raise AssertionError(
+        "Mismatch at byte {idx}: py={py} lu={lu}\n"
+        "py[{start}:{end}]: {py_ctx}\n"
+        "lu[{start}:{end}]: {lu_ctx}".format(
+            idx=index,
+            py=f"{diff['a_byte']:02x}" if diff["a_byte"] is not None else "None",
+            lu=f"{diff['b_byte']:02x}" if diff["b_byte"] is not None else "None",
+            start=start,
+            end=end,
+            py_ctx=diff["a_context"],
+            lu_ctx=diff["b_context"],
+        )
+    )
 
 
 def test_prga_parity_byte_exact() -> None:

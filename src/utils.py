@@ -14,7 +14,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
     as_completed,
 )
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar, cast
 
@@ -238,6 +238,130 @@ def decode_simple_obfuscations(text: str) -> str:
     text = decode_base64_strings(text)
     text = decode_numeric_escapes(text)
     return text
+
+
+@dataclass(frozen=True)
+class SecretFinding:
+    """Record describing a potential secret discovered in decoded text."""
+
+    category: str
+    value: str
+    start: int
+    end: int
+    pattern: str
+
+    def masked(self) -> str:
+        """Return a masked preview that avoids leaking the raw secret."""
+
+        return mask_secret_value(self.value)
+
+    def replacement(self) -> str:
+        """Return the placeholder inserted when sanitising the value."""
+
+        return f"<redacted:{self.category}>"
+
+
+_SECRET_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "aws_access_key"),
+    (re.compile(r"ASIA[0-9A-Z]{16}"), "aws_temp_access_key"),
+    (re.compile(r"(?i)(?P<value>sk_live_[0-9a-z]{16,})"), "stripe_secret_key"),
+    (re.compile(r"(?i)(?P<value>bearer\s+[A-Za-z0-9\-._~+/]+=*)"), "bearer_token"),
+    (re.compile(r"(?i)(?P<value>TINY-[0-9A-F]{8,})"), "luraph_script_key"),
+    (
+        re.compile(
+            r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?(?P<value>[A-Za-z0-9._\-+/]{16,})"
+        ),
+        "keyword_assignment",
+    ),
+    (
+        re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+        "google_api_key",
+    ),
+)
+
+
+def mask_secret_value(value: str) -> str:
+    """Return a masked representation suitable for logs and metadata."""
+
+    if not value:
+        return "<redacted>"
+    length = len(value)
+    if length <= 6:
+        return "<redacted>"
+    head = value[:4]
+    tail = value[-2:] if length > 6 else ""
+    if tail:
+        return f"{head}…{tail} (len={length})"
+    return f"{head}… (len={length})"
+
+
+def detect_secret_candidates(text: str) -> List[SecretFinding]:
+    """Return potential secret values detected within *text*."""
+
+    findings: List[SecretFinding] = []
+    if not text:
+        return findings
+    seen: set[Tuple[int, int, str, str]] = set()
+    for pattern, category in _SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            groupdict = match.groupdict()
+            raw_value = groupdict.get("value") or match.group(0)
+            if not raw_value:
+                continue
+            start = (
+                match.start("value")
+                if "value" in groupdict and groupdict.get("value")
+                else match.start()
+            )
+            end = (
+                match.end("value")
+                if "value" in groupdict and groupdict.get("value")
+                else match.end()
+            )
+            key = (start, end, raw_value, category)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                SecretFinding(
+                    category=category,
+                    value=raw_value,
+                    start=start,
+                    end=end,
+                    pattern=pattern.pattern,
+                )
+            )
+    findings.sort(key=lambda finding: (finding.start, finding.end))
+    return findings
+
+
+def sanitize_secret_candidates(
+    text: str, findings: Sequence[SecretFinding]
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return a sanitised copy of ``text`` and metadata for ``findings``."""
+
+    if not text or not findings:
+        return text, []
+    ordered = sorted(findings, key=lambda finding: finding.start)
+    parts: List[str] = []
+    cursor = 0
+    metadata: List[Dict[str, Any]] = []
+    for finding in ordered:
+        parts.append(text[cursor:finding.start])
+        replacement = finding.replacement()
+        parts.append(replacement)
+        metadata.append(
+            {
+                "category": finding.category,
+                "masked_value": finding.masked(),
+                "replacement": replacement,
+                "span": [finding.start, finding.end],
+                "pattern": finding.pattern,
+            }
+        )
+        cursor = finding.end
+    parts.append(text[cursor:])
+    return "".join(parts), metadata
 
 
 class LuaFormatter:

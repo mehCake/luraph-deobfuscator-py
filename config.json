@@ -24,6 +24,9 @@
     "detailed_errors": true,
     "performance_metrics": false
   },
+  "performance": {
+    "use_native_crypto": false
+  },
   "patterns": {
     "opcode_patterns": {
       "min_length": 2,

@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y \
     build-essential curl wget unzip git python3 python3-venv python3-pip \
-    luajit libluajit-5.1-dev luarocks ca-certificates \
+    lua5.4 luajit libluajit-5.1-dev luarocks ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # Lua JSON (optional but helpful)

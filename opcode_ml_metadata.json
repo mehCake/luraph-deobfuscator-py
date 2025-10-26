@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "source": "builtin heuristics derived from common Luraph VM handlers",
+  "samples": [
+    {
+      "label": "control flow",
+      "features": [
+        "handler:repeat",
+        "handler:continue",
+        "handler:break",
+        "handler:then",
+        "handler_snip:repeat",
+        "handler_snip:continue",
+        "handler_snip:break"
+      ]
+    },
+    {
+      "label": "SET/GET",
+      "features": [
+        "call:function",
+        "handler:return",
+        "handler_snip:return",
+        "handler_snip:function",
+        "handler_snip:end",
+        "call:helper_push",
+        "handler_snip:helper_push"
+      ]
+    },
+    {
+      "label": "bit ops",
+      "features": [
+        "call:bit32.band",
+        "call:bit32.bxor",
+        "call:bit32.bor",
+        "handler_snip:bit32",
+        "call:helper_band",
+        "handler:helper_band",
+        "handler_snip:helper_band"
+      ]
+    },
+    {
+      "label": "string ops",
+      "features": [
+        "call:string.byte",
+        "call:string.char",
+        "handler_snip:string",
+        "handler_snip:byte"
+      ]
+    },
+    {
+      "label": "math ops",
+      "features": [
+        "call:math.floor",
+        "call:math.abs",
+        "handler_snip:math",
+        "handler:math"
+      ]
+    },
+    {
+      "label": "table ops",
+      "features": [
+        "call:table.insert",
+        "call:table.remove",
+        "handler_snip:table",
+        "handler:table"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "luraph-reverse-mapping",
+  "displayName": "Luraph Reverse Mapping",
+  "description": "Jump from deobfuscated identifiers back to their obfuscated counterparts using mapping.lock metadata.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "activationEvents": [
+    "onCommand:luraph-reverse-mapping.lookupOriginal"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "luraph-reverse-mapping.lookupOriginal",
+        "title": "Luraph: Find Original Identifier",
+        "category": "Luraph"
+      }
+    ]
+  }
+}

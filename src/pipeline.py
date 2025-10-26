@@ -51,6 +51,18 @@ _VERSION_BOOTSTRAPPERS = {
     "v14.4.1": "initv4",
 }
 
+_DRY_RUN_SKIP_PASSES: frozenset[str] = frozenset(
+    {
+        "payload_decode",
+        "vm_lift",
+        "vm_devirtualize",
+        "cleanup",
+        "string_folding",
+        "string_reconstruction",
+        "render",
+    }
+)
+
 PassFn = Callable[["Context"], None]
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -171,6 +183,14 @@ def _collect_chunk_entries(report: DeobReport, metadata: Dict[str, Any]) -> List
         entries.append(entry)
 
     return entries
+
+
+def _should_skip_for_dry_run(ctx: Context, name: str) -> bool:
+    """Return ``True`` if *name* should be skipped because of dry-run mode."""
+
+    if not ctx.options.get("dry_run"):
+        return False
+    return name in _DRY_RUN_SKIP_PASSES
 
 
 @dataclass
@@ -315,6 +335,25 @@ class Context:
         safe_name = name.replace(" ", "_")
         path = self.artifacts / f"{safe_name}{extension}"
         write_text(path, content)
+
+
+class PipelineExecutionError(RuntimeError):
+    """Raised when a pipeline pass fails unexpectedly."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        timings: Sequence[Tuple[str, float]],
+        duration: float,
+        cause: BaseException,
+    ) -> None:
+        message = f"pipeline pass '{name}' failed: {cause}"
+        super().__init__(message)
+        self.pass_name = name
+        self.timings = list(timings)
+        self.duration = duration
+        self.cause = cause
 
 
 def _is_interactive() -> bool:
@@ -494,7 +533,16 @@ class PassRegistry:
         timings: List[Tuple[str, float]] = []
         for _, name, fn in selected:
             start = time.perf_counter()
-            fn(ctx)
+            try:
+                fn(ctx)
+            except Exception as exc:  # pragma: no cover - propagated for safe-mode handling
+                duration = time.perf_counter() - start
+                raise PipelineExecutionError(
+                    name=name,
+                    timings=list(timings),
+                    duration=duration,
+                    cause=exc,
+                ) from exc
             duration = time.perf_counter() - start
             timings.append((name, duration))
             metadata = ctx.pass_metadata.get(name)
@@ -593,6 +641,9 @@ def _ensure_vm_metadata_bucket(ctx: Context, key: str) -> Dict[str, Any]:
 
 
 def _pass_payload_decode(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "payload_decode"):
+        ctx.record_metadata("payload_decode", {"skipped": True, "reason": "dry_run"})
+        return
     metadata = payload_decode_run(ctx)
     report = ctx.report
     if report is not None and isinstance(metadata, dict):
@@ -608,7 +659,80 @@ def _pass_payload_decode(ctx: Context) -> None:
         ctx.write_artifact("payload_decode", ctx.stage_output)
 
 
+def _pass_sanitize_decoded(ctx: Context) -> None:
+    if not ctx.options.get("sanitize_decoded"):
+        ctx.record_metadata("sanitize_decoded", {"enabled": False})
+        return
+    payloads = list(ctx.decoded_payloads)
+    if not payloads:
+        ctx.record_metadata("sanitize_decoded", {"enabled": True, "findings": 0})
+        return
+
+    details: List[Dict[str, Any]] = []
+    sanitized_payloads = payloads[:]
+    category_counts: Dict[str, int] = {}
+    total_findings = 0
+
+    for index, payload in enumerate(payloads):
+        if not isinstance(payload, str) or not payload.strip():
+            continue
+        findings = utils.detect_secret_candidates(payload)
+        if not findings:
+            continue
+        total_findings += len(findings)
+        sanitized_text, replacements = utils.sanitize_secret_candidates(payload, findings)
+        sanitized_payloads[index] = sanitized_text
+        for replacement in replacements:
+            category = replacement.get("category", "unknown")
+            category_counts[category] = category_counts.get(category, 0) + 1
+        details.append(
+            {
+                "index": index,
+                "count": len(replacements),
+                "categories": sorted({rep.get("category") for rep in replacements if rep.get("category")}),
+                "replacements": replacements,
+            }
+        )
+
+    metadata: Dict[str, Any] = {"enabled": True, "findings": total_findings}
+    if category_counts:
+        metadata["categories"] = category_counts
+
+    if not details:
+        ctx.record_metadata("sanitize_decoded", metadata)
+        return
+
+    metadata["details"] = details
+    auto_apply = bool(ctx.options.get("sanitize_auto_apply"))
+    applied = auto_apply
+
+    if not applied:
+        prompt = (
+            f"Detected {total_findings} potential secret value(s) in decoded payloads. "
+            "Apply sanitisation before writing artifacts?"
+        )
+        applied = ask_confirm(ctx, prompt)
+
+    metadata["applied"] = bool(applied)
+    if applied:
+        ctx.decoded_payloads = sanitized_payloads
+        if ctx.report is not None:
+            ctx.report.warnings.append(
+                f"Sanitised {total_findings} potential secret value(s) from decoded payloads."
+            )
+    else:
+        if ctx.report is not None:
+            ctx.report.warnings.append(
+                f"Potential secret value(s) detected ({total_findings}) but left unmodified."
+            )
+
+    ctx.record_metadata("sanitize_decoded", metadata)
+
+
 def _pass_vm_lift(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "vm_lift"):
+        ctx.record_metadata("vm_lift", {"skipped": True, "reason": "dry_run"})
+        return
     metadata = vm_lift_run(ctx)
     module = ctx.ir_module
     if module is not None:
@@ -677,6 +801,9 @@ def _pass_vm_lift(ctx: Context) -> None:
 
 
 def _pass_vm_devirtualize(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "vm_devirtualize"):
+        ctx.record_metadata("vm_devirtualize", {"skipped": True, "reason": "dry_run"})
+        return
     if ctx.ir_module is None:
         ctx.record_metadata("vm_devirtualize", {"skipped": True})
         return
@@ -709,6 +836,9 @@ def _pass_vm_devirtualize(ctx: Context) -> None:
 
 
 def _pass_cleanup(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "cleanup"):
+        ctx.record_metadata("cleanup", {"skipped": True, "reason": "dry_run"})
+        return
     metadata = cleanup_run(ctx)
     report = ctx.report
     if report is not None:
@@ -750,6 +880,9 @@ def _pass_cleanup(ctx: Context) -> None:
 
 
 def _pass_string_folding(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "string_folding"):
+        ctx.record_metadata("string_folding", {"skipped": True, "reason": "dry_run"})
+        return
     metadata = string_folding_run(ctx)
     report = ctx.report
     if report is not None:
@@ -762,6 +895,11 @@ def _pass_string_folding(ctx: Context) -> None:
 
 
 def _pass_string_reconstruction(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "string_reconstruction"):
+        ctx.record_metadata(
+            "string_reconstruction", {"skipped": True, "reason": "dry_run"}
+        )
+        return
     metadata = string_reconstruction_run(ctx)
     report = ctx.report
     if report is not None:
@@ -774,6 +912,9 @@ def _pass_string_reconstruction(ctx: Context) -> None:
 
 
 def _pass_render(ctx: Context) -> None:
+    if _should_skip_for_dry_run(ctx, "render"):
+        ctx.record_metadata("render", {"skipped": True, "reason": "dry_run"})
+        return
     metadata = render_run(ctx)
     report = ctx.report
     if report is not None:
@@ -791,6 +932,7 @@ def _pass_render(ctx: Context) -> None:
 PIPELINE.register_pass("detect", _pass_detect, 10)
 PIPELINE.register_pass("preprocess", _pass_preprocess, 20)
 PIPELINE.register_pass("payload_decode", _pass_payload_decode, 30)
+PIPELINE.register_pass("sanitize_decoded", _pass_sanitize_decoded, 35)
 PIPELINE.register_pass("vm_lift", _pass_vm_lift, 40)
 PIPELINE.register_pass("vm_devirtualize", _pass_vm_devirtualize, 50)
 PIPELINE.register_pass("cleanup", _pass_cleanup, 60)
@@ -799,4 +941,4 @@ PIPELINE.register_pass("string_reconstruction", _pass_string_reconstruction, 65)
 PIPELINE.register_pass("render", _pass_render, 70)
 
 
-__all__ = ["Context", "PassRegistry", "PIPELINE"]
+__all__ = ["Context", "PassRegistry", "PIPELINE", "PipelineExecutionError"]
