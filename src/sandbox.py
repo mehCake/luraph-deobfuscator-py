@@ -12,7 +12,7 @@ import sys
 import time
 import re
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
 from src.runtime_capture.luajit_paths import build_luajit_command
 from src.utils import write_json, write_text
@@ -87,6 +87,96 @@ def _looks_like_vm_data(lua_table) -> bool:
         )
     except Exception:
         return False
+
+
+def _table_get(table: Any, key: str, default: Any = None) -> Any:
+    try:
+        if hasattr(table, "get"):
+            return table.get(key, default)
+    except Exception:
+        pass
+    try:
+        return table[key]
+    except Exception:
+        return default
+
+
+def _table_set(table: Any, key: str, value: Any) -> None:
+    try:
+        table[key] = value
+    except Exception as exc:  # pragma: no cover - defensive for exotic runtimes
+        raise RuntimeError(f"failed to assign sandbox global '{key}': {exc}") from exc
+
+
+def _snapshot_restrictions(env: Any) -> dict[str, bool]:
+    result: dict[str, bool] = {}
+    for name in ("os", "io", "package", "require", "dofile", "loadfile"):
+        value = _table_get(env, name)
+        result[name] = value in (None, False)
+    return result
+
+
+def _prepare_restricted_environment(
+    lua: Any, *, allow_debug: bool = False
+) -> Tuple[Any, Any]:
+    if hasattr(lua, "globals"):
+        globals_table = lua.globals()
+    else:
+        globals_table = getattr(lua, "_globals", None)
+    if globals_table is None:
+        raise RuntimeError("Lua runtime does not expose a globals table")
+
+    try:
+        env = lua.table()
+    except Exception:
+        env = {}
+
+    allowed_names = {
+        "assert",
+        "bit",
+        "bit32",
+        "error",
+        "ipairs",
+        "math",
+        "next",
+        "pairs",
+        "pcall",
+        "select",
+        "string",
+        "table",
+        "tonumber",
+        "tostring",
+        "type",
+        "xpcall",
+    }
+
+    for name in allowed_names:
+        value = _table_get(globals_table, name)
+        if value is not None:
+            _table_set(env, name, value)
+
+    _table_set(env, "_G", env)
+
+    for banned in ("os", "io", "package", "require", "dofile", "loadfile"):
+        _table_set(env, banned, None)
+
+    if allow_debug:
+        debug_table = _table_get(globals_table, "debug")
+        if debug_table is not None:
+            try:
+                limited_debug = lua.table()
+            except Exception:
+                limited_debug = {}
+
+            for attr in ("getinfo", "sethook", "traceback"):
+                value = _table_get(debug_table, attr)
+                if value is not None:
+                    _table_set(limited_debug, attr, value)
+
+            if limited_debug:
+                _table_set(env, "debug", limited_debug)
+
+    return globals_table, env
 
 
 def _install_safe_globals(
@@ -291,6 +381,85 @@ def _install_safe_globals(
 
     if actions:
         _log_action("Sandbox neutralizers applied: " + ", ".join(actions))
+
+
+def run_fragment_safely(
+    fragment_text: str,
+    *,
+    expected: Optional[Sequence[Any]] = None,
+    inputs: Optional[Sequence[Any]] = None,
+    allow_debug: bool = False,
+) -> dict[str, Any]:
+    """Execute ``fragment_text`` inside a restricted Lua sandbox.
+
+    The helper compiles the supplied fragment using ``load`` (or ``loadstring``)
+    against a whitelisted global environment, executes it via ``pcall`` and
+    reports the outcome.  When ``expected`` values are provided the helper also
+    records whether the Lua result matches the emulator-provided baseline.
+    Setting ``allow_debug`` exposes a trimmed ``debug`` table containing only
+    ``sethook``/``getinfo``/``traceback`` so instrumentation can capture
+    execution coverage without granting broader sandbox escape primitives.
+    """
+
+    if LuaRuntime is None:
+        raise RuntimeError("lupa is not available; cannot execute Lua fragments")
+
+    lua = LuaRuntime(unpack_returned_tuples=True, register_eval=False)
+    if getattr(lua, "is_fallback", False):
+        raise RuntimeError("fallback Lua runtime cannot execute arbitrary fragments")
+
+    globals_table, env = _prepare_restricted_environment(lua, allow_debug=allow_debug)
+
+    loader = _table_get(globals_table, "load") or _table_get(globals_table, "loadstring")
+    if loader is None:
+        raise RuntimeError("Lua runtime does not expose load/loadstring")
+
+    load_result = loader(fragment_text, "fragment", "t", env)
+    chunk: Optional[Callable[..., Any]]
+    compile_error: Optional[Any] = None
+
+    if isinstance(load_result, tuple):
+        chunk = load_result[0]
+        if len(load_result) > 1:
+            compile_error = load_result[1]
+    else:
+        chunk = load_result
+
+    if chunk is None:
+        return {
+            "success": False,
+            "values": [],
+            "error": compile_error or "failed to compile fragment",
+            "matches_expected": False if expected is not None else None,
+            "environment": _snapshot_restrictions(env),
+        }
+
+    pcall = _table_get(globals_table, "pcall")
+    if not callable(pcall):
+        raise RuntimeError("Lua runtime does not expose pcall")
+
+    call_args: Sequence[Any] = tuple(inputs or ())
+    result = pcall(chunk, *call_args)
+
+    if not isinstance(result, tuple) or not result:
+        raise RuntimeError("pcall returned unexpected result")
+
+    success = bool(result[0])
+    values: list[Any] = list(result[1:]) if success and len(result) > 1 else []
+    error_value = None if success else (result[1] if len(result) > 1 else None)
+
+    matches_expected: Optional[bool] = None
+    if expected is not None:
+        expected_values = list(expected) if isinstance(expected, (list, tuple)) else [expected]
+        matches_expected = success and values == expected_values
+
+    return {
+        "success": success,
+        "values": values,
+        "error": error_value,
+        "matches_expected": matches_expected,
+        "environment": _snapshot_restrictions(env),
+    }
 
 
 def capture_unpacked(

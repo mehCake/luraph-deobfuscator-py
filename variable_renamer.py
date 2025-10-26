@@ -28,10 +28,13 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import logging
 import re
-from typing import Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple, cast
+
+from utils import benchmark
 
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_IDENTIFIER_ONLY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CANDIDATE_RE = re.compile(r"\b(?:R|T|UPVAL)\d+\b")
 _NUMERIC_FOR_RE = re.compile(r"for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _GENERIC_FOR_RE = re.compile(
@@ -39,6 +42,11 @@ _GENERIC_FOR_RE = re.compile(
 )
 _LENGTH_RE = re.compile(r"#\s*([A-Za-z_][A-Za-z0-9_]*)")
 _INDEX_RE = re.compile(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]")
+_STRING_BYTE_RE = re.compile(r'string\.byte\s*\(')
+_BIT32_CALL_RE = re.compile(r'bit32\.(?:band|bor|bxor|bnot|lshift|rshift|arshift)\s*\(')
+_NUMERIC_LITERAL_RE = re.compile(
+    r"^(?:0x[0-9a-fA-F]+|0b[01]+|\d+(?:\.\d+)?)(?:[eE][+-]?\d+)?$"
+)
 _LOCAL_DECL_RE = re.compile(r"\blocal\s+(?!function)([RT]\d+(?:\s*,\s*[RT]\d+)*)")
 _LOCAL_FUNC_RE = re.compile(r"\blocal\s+function\s+([RT]\d+)")
 _FUNCTION_DECL_RE = re.compile(r"\bfunction\s+([RT]\d+)\s*\(")
@@ -174,16 +182,26 @@ class VariableRenamer:
         self._reserved_words = set(LUA_KEYWORDS)
         self._reserved_words.update(LUA_GLOBALS)
         self._replacement_count = 0
-        self.last_stats: Dict[str, int] = {}
+        self._score_total = 0
+        self._score_sum = 0.0
+        self.last_stats: Dict[str, float] = {}
 
     # -- Public API -----------------------------------------------------
     def rename_variables(self, lua_src: str) -> str:
         """Return ``lua_src`` with registers renamed to human friendly names."""
 
         self._replacement_count = 0
+        self._score_total = 0
+        self._score_sum = 0.0
         state = ScopeState.root()
         result = self._rename_scope(lua_src, state, header=None)
-        self.last_stats = {"replacements": self._replacement_count}
+        readability = 100.0
+        if self._score_total:
+            readability = round(100.0 * (self._score_sum / self._score_total), 2)
+        self.last_stats = {
+            "replacements": int(self._replacement_count),
+            "readability": readability,
+        }
         return result
 
     # -- Recursive scope processing ------------------------------------
@@ -280,10 +298,58 @@ class VariableRenamer:
             if name in info:
                 info[name].tags.add("length")
 
+        indexed_names: Set[str] = set()
         for match in _INDEX_RE.finditer(text):
             name = match.group(1)
             if name in info:
                 info[name].tags.add("key")
+                indexed_names.add(name)
+
+        for byte_index in self._scan_string_byte_indices(text):
+            if byte_index in info:
+                info[byte_index].tags.add("string_byte_arg")
+
+        for name in indexed_names:
+            details = info.get(name)
+            if details and "string_byte_arg" in details.tags:
+                details.tags.add("byte_indexer")
+
+        for mask_name in self._scan_bit_masks(text):
+            if mask_name in info:
+                info[mask_name].tags.add("mask")
+
+    def _scan_string_byte_indices(self, text: str) -> Set[str]:
+        names: Set[str] = set()
+        for match in _STRING_BYTE_RE.finditer(text):
+            paren_index = text.find("(", match.start())
+            if paren_index == -1:
+                continue
+            args, _ = self._extract_call_arguments(text, paren_index + 1)
+            if len(args) < 2:
+                continue
+            for arg in args[1:]:
+                candidate = self._strip_identifier(arg)
+                if candidate:
+                    names.add(candidate)
+        return names
+
+    def _scan_bit_masks(self, text: str) -> Set[str]:
+        names: Set[str] = set()
+        for match in _BIT32_CALL_RE.finditer(text):
+            paren_index = text.find("(", match.start())
+            if paren_index == -1:
+                continue
+            args, _ = self._extract_call_arguments(text, paren_index + 1)
+            if not args:
+                continue
+            numeric_present = any(self._is_numeric_literal(arg) for arg in args)
+            if not numeric_present:
+                continue
+            for arg in args:
+                candidate = self._strip_identifier(arg)
+                if candidate:
+                    names.add(candidate)
+        return names
 
     def _mark_definitions(
         self,
@@ -337,10 +403,14 @@ class VariableRenamer:
 
         if name.startswith("UPVAL"):
             alias = self._assign_upvalue(name, state)
+        elif "byte_indexer" in info.tags:
+            alias = self._assign_role("byte_indexer", state, plain_first=True)
+        elif "mask" in info.tags:
+            alias = self._assign_role("mask", state, plain_first=True)
         elif "parameter" in info.tags:
             alias = self._assign_parameter(info, state)
         elif "loop_index" in info.tags:
-            alias = self._assign_role("idx", state, plain_first=True)
+            alias = self._assign_role("i_cnt", state, plain_first=True)
         elif "length" in info.tags:
             alias = self._assign_role("len", state, plain_first=True)
         elif "key" in info.tags:
@@ -351,6 +421,7 @@ class VariableRenamer:
             alias = self._assign_register(state)
 
         state.remember(name, alias)
+        self._record_alias_quality(alias, info)
         return alias
 
     def _assign_upvalue(self, name: str, state: ScopeState) -> str:
@@ -400,6 +471,91 @@ class VariableRenamer:
             if candidate not in state.used_names and candidate not in self._reserved_words:
                 state.used_names.add(candidate)
                 return candidate
+
+    def _strip_identifier(self, token: str) -> Optional[str]:
+        candidate = token.strip()
+        if candidate.startswith("(") and candidate.endswith(")"):
+            candidate = candidate[1:-1].strip()
+        return candidate if _IDENTIFIER_ONLY_RE.fullmatch(candidate) else None
+
+    def _is_numeric_literal(self, token: str) -> bool:
+        candidate = token.strip()
+        if candidate.startswith("(") and candidate.endswith(")"):
+            candidate = candidate[1:-1].strip()
+        return bool(_NUMERIC_LITERAL_RE.fullmatch(candidate))
+
+    def _extract_call_arguments(self, text: str, start: int) -> Tuple[List[str], int]:
+        depth = 1
+        args: List[str] = []
+        current: List[str] = []
+        i = start
+        length = len(text)
+        while i < length:
+            ch = text[i]
+            if ch in {'"', '\''}:
+                end = self._skip_short_string(text, i)
+                current.append(text[i:end])
+                i = end
+                continue
+            if text.startswith("[[", i) or text.startswith("[=", i):
+                end = self._skip_long_bracket(text, i)
+                current.append(text[i:end])
+                i = end
+                continue
+            if text.startswith("--", i):
+                newline = text.find("\n", i)
+                if newline == -1:
+                    break
+                current.append(text[i:newline])
+                i = newline
+                continue
+            if ch == "(":
+                depth += 1
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ")":
+                depth -= 1
+                if depth == 0:
+                    argument = "".join(current).strip()
+                    if argument:
+                        args.append(argument)
+                    return args, i + 1
+                current.append(ch)
+                i += 1
+                continue
+            if ch == "," and depth == 1:
+                argument = "".join(current).strip()
+                if argument:
+                    args.append(argument)
+                current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+        return args, i
+
+    def _record_alias_quality(self, alias: str, details: SymbolInfo) -> None:
+        if not alias:
+            return
+        self._score_total += 1
+        self._score_sum += self._alias_score(alias, details)
+
+    def _alias_score(self, alias: str, details: SymbolInfo) -> float:
+        if not alias:
+            return 0.0
+        base = 0.25 if len(alias) == 1 else 0.6
+        if "byte_indexer" in details.tags:
+            base = 1.0
+        elif alias.startswith("mask"):
+            base = max(base, 0.9)
+        elif alias.startswith("i_cnt"):
+            base = max(base, 0.85)
+        elif "length" in details.tags or "key" in details.tags or "value" in details.tags:
+            base = max(base, 0.75)
+        if "_" in alias:
+            base = min(1.0, base + 0.1)
+        return min(base, 1.0)
 
     # -- Helpers --------------------------------------------------------
     def _sort_key(self, name: str) -> Tuple[int, int, str]:
@@ -596,5 +752,268 @@ class VariableRenamer:
     # -- End helpers ----------------------------------------------------
 
 
-__all__ = ["VariableRenamer"]
+def safe_rename(src: str, rename_map: Mapping[str, str]) -> str:
+    """Rename identifiers in ``src`` according to ``rename_map``.
+
+    The implementation relies on :mod:`luaparser` to build an AST, mutate the
+    identifier nodes safely (avoiding strings, comments, or long-bracket
+    literals), and then re-render the source using the formatter bundled with
+    the parser.
+    """
+
+    if not rename_map:
+        return src
+
+    try:
+        from luaparser import ast
+        from luaparser import astnodes
+    except ImportError as exc:  # pragma: no cover - import guarded in tests
+        raise RuntimeError("safe_rename requires luaparser to be installed") from exc
+
+    _validate_rename_map(rename_map)
+
+    class _ScopeFrame:
+        __slots__ = ("locals", "renames")
+
+        def __init__(self) -> None:
+            self.locals: Set[str] = set()
+            self.renames: Dict[str, str] = {}
+
+    class _SafeRenameVisitor(ast.ASTRecursiveVisitor):
+        """AST visitor that applies identifier renames with scope tracking."""
+
+        def __init__(self, rename_map: Mapping[str, str]) -> None:
+            super().__init__()
+            self._stack: List[object] = []
+            self._pending: Dict[str, List[str]] = {
+                key: [value]
+                for key, value in rename_map.items()
+                if value and key
+            }
+            self._global_defaults: Dict[str, str] = {
+                key: value
+                for key, value in rename_map.items()
+                if value and key
+            }
+            self._scopes: List[_ScopeFrame] = []
+            self._skip_blocks: Set[int] = set()
+
+        # -- Generic traversal helpers ---------------------------------
+        def visit(self, node):  # type: ignore[override]
+            if isinstance(node, list):
+                for child in node:
+                    self.visit(child)
+                return node
+            if node is None:
+                return node
+            self._stack.append(node)
+            result = super().visit(node)
+            self._stack.pop()
+            return result
+
+        # Scope management ---------------------------------------------
+        def _push_scope(self) -> None:
+            self._scopes.append(_ScopeFrame())
+
+        def _pop_scope(self) -> None:
+            if self._scopes:
+                self._scopes.pop()
+
+        def _current_scope(self) -> _ScopeFrame:
+            if not self._scopes:
+                raise RuntimeError("scope stack is empty")
+            return self._scopes[-1]
+
+        def _lookup(self, identifier: str) -> Optional[str]:
+            for frame in reversed(self._scopes):
+                if identifier in frame.renames:
+                    return frame.renames[identifier]
+                if identifier in frame.locals:
+                    return None
+            replacement = self._global_defaults.get(identifier)
+            if replacement:
+                return replacement
+            return None
+
+        def _consume_rename(self, identifier: str) -> Optional[str]:
+            values = self._pending.get(identifier)
+            if not values:
+                return None
+            replacement = values.pop(0)
+            if not values:
+                self._pending.pop(identifier, None)
+            return replacement
+
+        def _register_local(self, name_node: astnodes.Name) -> None:
+            identifier = getattr(name_node, "id", None)
+            if not identifier:
+                return
+            replacement = self._consume_rename(identifier)
+            frame = self._current_scope()
+            frame.locals.add(identifier)
+            if replacement:
+                name_node.id = replacement
+                frame.renames[identifier] = replacement
+
+        def _register_locals(self, names: Sequence[object]) -> None:
+            for item in names:
+                if isinstance(item, astnodes.Name):
+                    self._register_local(item)
+
+        def _is_dot_property(self, node: object) -> bool:
+            if len(self._stack) < 2:
+                return False
+            parent = self._stack[-2]
+            if isinstance(parent, astnodes.Index):
+                notation = getattr(parent, "notation", None)
+                if notation == astnodes.IndexNotation.DOT and parent.idx is node:
+                    return True
+            return False
+
+        def _is_binding_context(self, node: astnodes.Name) -> bool:
+            if len(self._stack) < 2:
+                return False
+            parent = self._stack[-2]
+            if isinstance(parent, astnodes.LocalAssign) and node in parent.targets:
+                return True
+            if isinstance(parent, astnodes.LocalFunction) and parent.name is node:
+                return True
+            if isinstance(parent, astnodes.Function) and parent.name is node:
+                return True
+            if isinstance(parent, astnodes.Forin) and node in getattr(parent, "targets", []):
+                return True
+            if isinstance(parent, astnodes.Fornum) and parent.target is node:
+                return True
+            if isinstance(parent, astnodes.AnonymousFunction) and node in getattr(parent, "args", []):
+                return True
+            if isinstance(parent, astnodes.Function) and node in getattr(parent, "args", []):
+                return True
+            if isinstance(parent, astnodes.LocalFunction) and node in getattr(parent, "args", []):
+                return True
+            return False
+
+        # Chunk / block scopes ----------------------------------------
+        def enter_Chunk(self, node):  # type: ignore[override]
+            self._push_scope()
+            body = getattr(node, "body", None)
+            if isinstance(body, astnodes.Block):
+                self._skip_blocks.add(id(body))
+
+        def exit_Chunk(self, node):  # type: ignore[override]
+            self._pop_scope()
+
+        def enter_Block(self, node):  # type: ignore[override]
+            if id(node) in self._skip_blocks:
+                return
+            self._push_scope()
+            self._register_enclosing_bindings(node)
+
+        def exit_Block(self, node):  # type: ignore[override]
+            if id(node) in self._skip_blocks:
+                self._skip_blocks.discard(id(node))
+                return
+            self._pop_scope()
+
+        def _register_enclosing_bindings(self, block: astnodes.Block) -> None:
+            if len(self._stack) < 2:
+                return
+            parent = self._stack[-2]
+            if isinstance(parent, astnodes.Fornum):
+                target = getattr(parent, "target", None)
+                if isinstance(target, astnodes.Name):
+                    self._register_local(target)
+            elif isinstance(parent, astnodes.Forin):
+                self._register_locals(getattr(parent, "targets", []))
+
+        # Function scopes ----------------------------------------------
+        def enter_Function(self, node):  # type: ignore[override]
+            name = getattr(node, "name", None)
+            if isinstance(name, astnodes.Name):
+                self._register_local(name)
+            self._push_scope()
+            body = getattr(node, "body", None)
+            if isinstance(body, astnodes.Block):
+                self._skip_blocks.add(id(body))
+            self._register_locals(getattr(node, "args", []))
+
+        def exit_Function(self, node):  # type: ignore[override]
+            self._pop_scope()
+
+        def enter_LocalFunction(self, node):  # type: ignore[override]
+            name = getattr(node, "name", None)
+            if isinstance(name, astnodes.Name):
+                self._register_local(name)
+            self._push_scope()
+            body = getattr(node, "body", None)
+            if isinstance(body, astnodes.Block):
+                self._skip_blocks.add(id(body))
+            self._register_locals(getattr(node, "args", []))
+
+        def exit_LocalFunction(self, node):  # type: ignore[override]
+            self._pop_scope()
+
+        def enter_AnonymousFunction(self, node):  # type: ignore[override]
+            self._push_scope()
+            body = getattr(node, "body", None)
+            if isinstance(body, astnodes.Block):
+                self._skip_blocks.add(id(body))
+            self._register_locals(getattr(node, "args", []))
+
+        def exit_AnonymousFunction(self, node):  # type: ignore[override]
+            self._pop_scope()
+
+        # Local declarations ------------------------------------------
+        def enter_LocalAssign(self, node):  # type: ignore[override]
+            self._register_locals(getattr(node, "targets", []))
+
+        def enter_Forin(self, node):  # type: ignore[override]
+            # The loop variables belong to the block scope handled in _register_enclosing_bindings.
+            pass
+
+        def enter_Fornum(self, node):  # type: ignore[override]
+            # The control variable is handled when the body block scope is entered.
+            pass
+
+        # Identifier rewriting ---------------------------------------
+        # pylint: disable=unused-argument
+        def enter_Name(self, node):  # type: ignore[override]
+            identifier = getattr(node, "id", None)
+            if not identifier:
+                return
+            if self._is_dot_property(node) or self._is_binding_context(node):
+                return
+            replacement = self._lookup(identifier)
+            if replacement:
+                node.id = replacement
+
+    with benchmark(
+        "ast_transform",
+        {"operation": "safe_rename", "renames": len(rename_map)},
+    ):
+        tree = ast.parse(src)
+        visitor = _SafeRenameVisitor(rename_map)
+        visitor.visit(tree)
+        renamed = ast.to_lua_source(tree)
+    return renamed
+
+
+def _validate_rename_map(rename_map: Mapping[str, str]) -> None:
+    invalid_sources: List[str] = []
+    invalid_targets: List[str] = []
+
+    for source, target in rename_map.items():
+        if source in LUA_KEYWORDS:
+            invalid_sources.append(source)
+        if target in LUA_KEYWORDS or target in LUA_GLOBALS:
+            invalid_targets.append(target)
+        if not _IDENTIFIER_RE.fullmatch(target):
+            invalid_targets.append(target)
+
+    if invalid_sources:
+        raise ValueError(f"Cannot rename reserved identifiers: {sorted(set(invalid_sources))}")
+    if invalid_targets:
+        raise ValueError(f"Invalid rename targets: {sorted(set(invalid_targets))}")
+
+
+__all__ = ["VariableRenamer", "safe_rename"]
 

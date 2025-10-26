@@ -25,6 +25,7 @@ V1441_GOLDEN = GOLDEN_DIR / "v1441_hello.lua.out"
 INITV4_STUB = PROJECT_ROOT / "tests" / "fixtures" / "initv4_stub" / "initv4.lua"
 COMPLEX_SOURCE = PROJECT_ROOT / "examples" / "complex_obfuscated"
 SCRIPT_KEY = "x5elqj5j4ibv9z3329g7b"
+DEFAULT_CONFIRM_ARGS = ("--confirm-ownership", "--confirm-voluntary-key")
 
 
 def _prepare_v1441_source(
@@ -72,8 +73,12 @@ def _run_cli(
     workdir: Path,
     *extra: str,
     check: bool = True,
+    include_confirmation: bool = True,
 ) -> subprocess.CompletedProcess:
-    cmd = [sys.executable, str(PROJECT_ROOT / "main.py"), str(target), *extra]
+    cmd = [sys.executable, str(PROJECT_ROOT / "main.py"), str(target)]
+    if include_confirmation:
+        cmd.extend(DEFAULT_CONFIRM_ARGS)
+    cmd.extend(extra)
     return subprocess.run(cmd, cwd=workdir, check=check, capture_output=True)
 
 
@@ -91,6 +96,15 @@ def test_cli_emits_output_for_single_file(tmp_path):
     assert output_json.exists()
     data = json.loads(output_json.read_text())
     assert data["output"].strip()
+
+
+def test_cli_requires_usage_confirmation(tmp_path):
+    source = PROJECT_ROOT / "example_obfuscated.lua"
+    target = tmp_path / source.name
+    target.write_text(source.read_text())
+
+    proc = _run_cli(target, tmp_path, include_confirmation=False, check=False)
+    assert proc.returncode == 2
 
 
 def test_cli_accepts_directory(tmp_path):
@@ -151,7 +165,8 @@ def test_cli_reports_multi_chunk_payload(tmp_path):
     lua_sidecar = local_copy.with_name("complex_obfuscated_deob.lua")
     assert output_path.exists()
     produced = sorted(local_copy.parent.glob("complex_obfuscated_deob.*"))
-    assert produced == [output_path, lua_sidecar], "expected JSON and Lua outputs"
+    filtered = [path for path in produced if not path.name.endswith(".top_level.json")]
+    assert filtered == [output_path, lua_sidecar], "expected JSON and Lua outputs"
 
     data = json.loads(output_path.read_text(encoding="utf-8"))
     payload_meta = (
@@ -178,6 +193,33 @@ def test_cli_reports_multi_chunk_payload(tmp_path):
     output_text = data.get("output", "")
     for marker in ("Aimbot", "ESP", "KillAll"):
         assert marker in output_text, f"expected {marker} in merged output"
+
+
+def test_cli_audit_log_encrypted(tmp_path):
+    source = PROJECT_ROOT / "example_obfuscated.lua"
+    target = tmp_path / source.name
+    target.write_text(source.read_text())
+
+    log_path = tmp_path / "confirm.log"
+    secret = "passphrase"
+    _run_cli(
+        target,
+        tmp_path,
+        "--audit-log",
+        str(log_path),
+        "--audit-passphrase",
+        secret,
+        "--operator",
+        "tester",
+    )
+
+    from src.usage_audit import load_audit_entries
+
+    entries = load_audit_entries(log_path, secret)
+    assert entries, "expected at least one confirmation entry"
+    assert entries[-1]["operator"] == "tester"
+    key_meta = entries[-1].get("key", {})
+    assert key_meta.get("present") is False
 
 
 def test_cli_supports_json_format(tmp_path):
@@ -292,6 +334,24 @@ def test_cli_v1441_script_key_only(tmp_path):
     bootstrap_meta = payload_meta.get("bootstrapper")
     assert isinstance(bootstrap_meta, dict)
     assert "path" in bootstrap_meta
+
+
+def test_cli_env_script_key(tmp_path, monkeypatch):
+    target = _prepare_v1441_source(tmp_path)
+    monkeypatch.setenv("LURAPH_SESSION_KEY", SCRIPT_KEY)
+
+    _run_cli(target, tmp_path, "--format", "json")
+
+    output = target.with_name(f"{target.stem}_deob.json")
+    data = json.loads(output.read_text(encoding="utf-8"))
+
+    payload_meta = (
+        data.get("passes", {})
+        .get("payload_decode", {})
+        .get("handler_payload_meta", {})
+    )
+    assert payload_meta.get("script_key_provider") == "override"
+    assert payload_meta.get("script_key_length") == len(SCRIPT_KEY)
 
 
 def test_cli_report_metrics_v1441(tmp_path):
@@ -557,6 +617,72 @@ def test_cli_force_allows_missing_script_key(tmp_path):
     assert any("script key" in warning.lower() for warning in warnings)
 
 
+def test_cli_safe_mode_writes_crash_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "safe_mode.lua"
+    source.write_text("print('hi')\n", encoding="utf-8")
+
+    def crash_passes(ctx, skip=None, only=None, profile=False):
+        raise cli_main.pipeline.PipelineExecutionError(
+            name="payload_decode",
+            timings=[("detect", 0.01)],
+            duration=0.02,
+            cause=RuntimeError("boom"),
+        )
+
+    monkeypatch.setattr(cli_main.pipeline.PIPELINE, "run_passes", crash_passes)
+
+    exit_code = cli_main.main(
+        [
+            str(source),
+            "--safe-mode",
+            "--format",
+            "lua",
+            "--confirm-ownership",
+            "--confirm-voluntary-key",
+        ]
+    )
+    assert exit_code == 1
+
+    crash_dir = tmp_path / "out" / "crash_reports"
+    reports = sorted(crash_dir.glob("*.json"))
+    assert reports, "expected crash report to be written"
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["safe_mode"] is True
+    assert payload["failed_pass"] == "payload_decode"
+    assert "TINY" not in json.dumps(payload)
+
+
+def test_cli_dry_run_allows_missing_script_key(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "needs_key.lua"
+    source.write_text("local payload = ''\nlocal initv4 = {}\n", encoding="utf-8")
+
+    def stub_passes(ctx, skip=None, only=None, profile=False):
+        assert ctx.options.get("dry_run") is True
+        return [("detect", 0.001)]
+
+    monkeypatch.setattr(cli_main.pipeline.PIPELINE, "run_passes", stub_passes)
+
+    exit_code = cli_main.main(
+        [
+            str(source),
+            "--dry-run",
+            "--format",
+            "lua",
+            "--confirm-ownership",
+            "--confirm-voluntary-key",
+        ]
+    )
+    assert exit_code == 0
+
+    output_path = source.with_name("needs_key_deob.lua")
+    assert output_path.exists()
+    crash_dir = tmp_path / "out" / "crash_reports"
+    if crash_dir.exists():
+        assert not any(crash_dir.iterdir())
+
+
 def test_cli_complex_initv4_with_key_and_bootstrapper(tmp_path):
     source = _prepare_complex_json(tmp_path)
     stub_dir = _prepare_bootstrapper(tmp_path)
@@ -620,3 +746,81 @@ def test_bootstrap_summary_instructions_when_no_fallback() -> None:
     combined = " ".join(instructions).lower()
     assert "--allow-lua-run" in combined
     assert "metadata" in combined or "bootstrapper" in combined
+
+
+def test_name_opcode_command_updates_mapping(tmp_path: Path) -> None:
+    pytest.importorskip("luaparser")
+
+    reconstructed = tmp_path / "reconstructed.lua"
+    reconstructed.write_text(
+        "local function OP_42(value)\n    return value\nend\n",
+        encoding="utf-8",
+    )
+
+    mapping_path = tmp_path / "mapping.json"
+    output_path = tmp_path / "pretty.lua"
+    upcodes = tmp_path / "upcodes.json"
+    guesses = tmp_path / "guesses.json"
+
+    upcodes.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "opcode": 42,
+                        "mnemonic": "OP_42",
+                        "frequency": 3,
+                        "handler_table": "return_table",
+                        "semantic": "unknown",
+                        "sample_usage": [
+                            {
+                                "snippet": "handler=function() return value + 1 end",
+                                "source": "handler_snippet",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    guesses.write_text(
+        json.dumps(
+            {
+                "guesses": {
+                    "42": {
+                        "guess": "add_loop",
+                        "confidence": 0.6,
+                        "evidence": "frequency analysis",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = cli_main.main(
+        [
+            "name_opcode",
+            "0x2A",
+            "--name",
+            "add_loop",
+            "--mapping",
+            str(mapping_path),
+            "--source",
+            str(reconstructed),
+            "--output",
+            str(output_path),
+            "--upcodes",
+            str(upcodes),
+            "--guesses",
+            str(guesses),
+        ]
+    )
+
+    assert exit_code == 0
+    mapping_payload = json.loads(mapping_path.read_text(encoding="utf-8"))
+    assert mapping_payload["OP_42"] == "ADD_LOOP"
+    rendered = output_path.read_text(encoding="utf-8")
+    assert "function ADD_LOOP" in rendered

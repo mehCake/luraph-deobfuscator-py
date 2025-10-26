@@ -110,6 +110,8 @@ def integration_test_obfuscated_json(tmp_path: Path) -> None:
         "--bootstrapper",
         str(INITV4_PATH),
         "--yes",
+        "--confirm-ownership",
+        "--confirm-voluntary-key",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr

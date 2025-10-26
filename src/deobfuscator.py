@@ -1280,8 +1280,11 @@ class LuaDeobfuscator:
                 stats = getattr(renamer, "last_stats", {})
                 if isinstance(stats, dict):
                     count_value = stats.get("replacements")
-                    if isinstance(count_value, int):
-                        rename_count = max(count_value, 0)
+                    if isinstance(count_value, (int, float)):
+                        rename_count = max(int(count_value), 0)
+                    readability_value = stats.get("readability")
+                    if isinstance(readability_value, (int, float)):
+                        chunk_detail["readability_score"] = float(readability_value)
             else:
                 try:
                     decoded_text = chunk_bytes.decode("utf-8")

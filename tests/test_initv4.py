@@ -30,6 +30,8 @@ def test_initv4_cli_round_trip(tmp_path):
         SCRIPT_KEY,
         "--allow-lua-run",
         "--yes",
+        "--confirm-ownership",
+        "--confirm-voluntary-key",
     ]
 
     subprocess.run(cmd, cwd=tmp_path, check=True, capture_output=True)
