@@ -6,15 +6,19 @@ recover high level structures from the intermediate representation (IR)."""
 
 from __future__ import annotations
 
+import csv
+import json
 import logging
 import re
+from html import escape
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Mapping, Union
 
 from copy import deepcopy
 
 from collections import defaultdict, Counter
+from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 
 
 @dataclass
@@ -337,7 +341,225 @@ class PatternAnalyzer:
                 })
         
         return patterns
-    
+
+    def generate_upcode_table(
+        self,
+        raw_entries: Optional[Mapping[int, Any]] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Return a normalised opcode table with ``OP_``-prefixed mnemonics.
+
+        Parameters
+        ----------
+        raw_entries:
+            Mapping of opcode numbers to metadata dictionaries.  Non-dictionary
+            values are interpreted as shorthand for the mnemonic field.
+
+        The function guarantees that every returned entry contains a
+        ``mnemonic`` key whose value is an upper-case string beginning with the
+        ``OP_`` prefix.  Missing or false-y mnemonics are replaced with the
+        fallback ``OP_{opcode:02X}`` format.
+        """
+
+        if raw_entries is None:
+            raw_entries = {}
+
+        helper_pattern = re.compile(r"\bhelper[A-Za-z0-9_]*\b", re.IGNORECASE)
+
+        def detect_helper_name(value: Any) -> Optional[str]:
+            """Return the first helper name embedded in ``value`` if present."""
+
+            if isinstance(value, str):
+                match = helper_pattern.search(value)
+                if match:
+                    return match.group(0)
+                return None
+
+            if isinstance(value, MappingABC):
+                for candidate in value.values():
+                    found = detect_helper_name(candidate)
+                    if found:
+                        return found
+                return None
+
+            if (
+                isinstance(value, IterableABC)
+                and not isinstance(value, (bytes, bytearray, str, MappingABC))
+            ):
+                for candidate in value:
+                    found = detect_helper_name(candidate)
+                    if found:
+                        return found
+
+            return None
+
+        def normalise_mnemonic(
+            raw: Optional[Any], opcode: int, payload: Any
+        ) -> str:
+            """Normalise ``raw`` to the canonical ``OP_`` prefixed form."""
+
+            candidate: Optional[str]
+            if raw is not None and str(raw).strip():
+                candidate = str(raw)
+            else:
+                candidate = detect_helper_name(payload)
+                if not candidate:
+                    return f"OP_{opcode:02X}"
+
+            upper = str(candidate).strip().upper()
+            cleaned = re.sub(r"[^A-Z0-9_]", "", upper)
+            cleaned = cleaned.lstrip("_")
+
+            if not cleaned:
+                return f"OP_{opcode:02X}"
+
+            if cleaned.startswith("OP_"):
+                canonical = cleaned
+            elif cleaned.startswith("OP"):
+                suffix = cleaned[2:].lstrip("_")
+                canonical = f"OP_{suffix}" if suffix else f"OP_{opcode:02X}"
+            else:
+                canonical = f"OP_{cleaned}"
+
+            if canonical in {"OP", "OP_"}:
+                return f"OP_{opcode:02X}"
+
+            return canonical
+
+        def validate_entry(entry: Mapping[str, Any]) -> None:
+            """Ensure ``entry`` satisfies the expected opcode schema."""
+
+            required_fields = ("opcode", "mnemonic", "operand_types", "sample_usage")
+            missing = [field for field in required_fields if field not in entry]
+            if missing:
+                opcode_value = entry.get("opcode", "<unknown>")
+                try:
+                    opcode_display = f"0x{int(opcode_value):02X}"
+                except (TypeError, ValueError):
+                    opcode_display = opcode_value
+                missing_display = ", ".join(sorted(missing))
+                raise ValueError(
+                    f"Opcode {opcode_display} entry missing required fields: {missing_display}"
+                )
+
+        table: Dict[int, Dict[str, Any]] = {}
+        for opcode, entry in raw_entries.items():
+            opcode_int = int(opcode)
+            if isinstance(entry, dict):
+                processed = dict(entry)
+                payload = processed
+            else:
+                processed = {}
+                if entry is not None:
+                    processed["mnemonic"] = entry
+                payload = entry
+
+            canonical = normalise_mnemonic(
+                processed.get("mnemonic"), opcode_int, payload
+            )
+            processed["mnemonic"] = canonical
+
+            frequency_raw = processed.get("frequency", 0)
+            try:
+                frequency_value = int(frequency_raw)
+            except (TypeError, ValueError):
+                frequency_value = 0
+            if frequency_value < 0:
+                frequency_value = 0
+            processed["frequency"] = frequency_value
+
+            processed.setdefault("opcode", opcode_int)
+
+            validate_entry(processed)
+
+            table[opcode_int] = processed
+
+        return table
+
+    def generate_upcode_table_outputs_docs(
+        self,
+        raw_entries: Optional[Mapping[int, Any]] = None,
+        output_dir: Union[str, Path] = Path("out") / "pattern_analyzer",
+    ) -> Dict[str, Path]:
+        """Serialise the opcode table into multiple documentation formats.
+
+        Parameters
+        ----------
+        raw_entries:
+            Optional mapping of opcode numbers to raw metadata.  When omitted
+            the method behaves as if an empty mapping was supplied.
+        output_dir:
+            Directory where the documentation artefacts should be written.  The
+            directory will be created if it does not already exist.
+        """
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        table = self.generate_upcode_table(raw_entries)
+        rows: List[Dict[str, Any]] = []
+        for opcode, entry in sorted(table.items()):
+            mnemonic = entry.get("mnemonic", "")
+            frequency_value = entry.get("frequency", 0)
+            try:
+                frequency_int = int(frequency_value)
+            except (TypeError, ValueError):
+                frequency_int = 0
+            if frequency_int < 0:
+                frequency_int = 0
+            rows.append(
+                {
+                    "opcode": f"0x{int(opcode) & 0x3F:02X}",
+                    "mnemonic": str(mnemonic),
+                    "frequency": frequency_int,
+                }
+            )
+
+        json_path = output_path / "upcode_table.json"
+        json_path.write_text(json.dumps(rows, indent=2, sort_keys=False))
+
+        markdown_lines = [
+            "| Opcode | Mnemonic | Frequency |",
+            "| --- | --- | --- |",
+        ]
+        markdown_lines.extend(
+            f"| {row['opcode']} | {row['mnemonic']} | {row['frequency']} |" for row in rows
+        )
+        md_path = output_path / "upcode_table.md"
+        md_path.write_text("\n".join(markdown_lines) + "\n")
+
+        csv_path = output_path / "upcode_table.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["opcode", "mnemonic", "frequency"])
+            for row in rows:
+                writer.writerow([row["opcode"], row["mnemonic"], row["frequency"]])
+
+        html_rows = [
+            "<table>",
+            "  <thead>",
+            "    <tr><th>Opcode</th><th>Mnemonic</th><th>Frequency</th></tr>",
+            "  </thead>",
+            "  <tbody>",
+        ]
+        for row in rows:
+            html_rows.append(
+                "    <tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                    escape(row["opcode"]),
+                    escape(row["mnemonic"]),
+                    escape(str(row["frequency"])),
+                )
+            )
+        html_rows.extend(["  </tbody>", "</table>"])
+        html_path = output_path / "upcode_table.html"
+        html_path.write_text("\n".join(html_rows) + "\n")
+
+        return {
+            "json": json_path,
+            "md": md_path,
+            "csv": csv_path,
+            "html": html_path,
+        }
+
     def analyze(self, content: str) -> Dict[str, Any]:
         """Perform comprehensive pattern analysis."""
         self.logger.info("Starting comprehensive pattern analysis...")
