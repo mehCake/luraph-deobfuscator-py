@@ -19,7 +19,7 @@ _HEX_PAIR = re.compile(r"([0-9A-Fa-f]{2})")
 def _strip_lph_prefix(literal: str) -> str:
     """Return ``literal`` without the ``LPH!`` prefix if present."""
 
-    prefix_candidates = ("LPH!", "lph!", "LPH_", "lph_")
+    prefix_candidates = ("LPH!", "lph!", "LPH@", "lph@", "LPH_", "lph_")
     for prefix in prefix_candidates:
         if literal.startswith(prefix):
             return literal[len(prefix) :]
@@ -88,7 +88,7 @@ def parse_escaped_lua_string(literal: str) -> bytes:
     literal = literal or ""
 
     # Handle dedicated LPH payloads before considering generic escaping.
-    if literal.startswith(("LPH!", "lph!", "LPH_", "lph_")):
+    if literal.startswith(("LPH!", "lph!", "LPH@", "lph@", "LPH_", "lph_")):
         return decode_lph_payload(literal)
 
     # Fast-path: decimal / octal escape sequences like ``\57`` or ``\166``.

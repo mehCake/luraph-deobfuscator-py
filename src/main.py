@@ -172,7 +172,7 @@ def _split_list(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-_LPH_SIGNATURES = (b"LPH!", b"lph!", b"LPH_", b"lph_")
+_LPH_SIGNATURES = (b"LPH!", b"lph!", b"LPH@", b"lph@", b"LPH_", b"lph_")
 _LPH_SIGNATURE_TEXT = tuple(sig.decode("ascii", errors="ignore") for sig in _LPH_SIGNATURES)
 _LPH_SUFFIXES = {".lph", ".b64", ".bin", ".payload", ".dat"}
 _LPH_NAME_HINTS = ("lph", "payload", "bootstrap", "blob")

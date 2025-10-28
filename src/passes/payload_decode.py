@@ -25,6 +25,7 @@ from ..versions.luraph_v14_4_1 import looks_like_vm_bytecode
 from ..versions.luraph_v14_4_initv4 import (
     DEFAULT_ALPHABET as INITV4_DEFAULT_ALPHABET,
     decode_blob as initv4_decode_blob,
+    normalise_payload_literal,
 )
 from ..utils.luraph_vm import canonicalise_opcode_name
 from ..utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
@@ -424,12 +425,7 @@ def _strip_json_quotes_and_escapes(blob: str) -> str:
     stripped = blob.strip()
     if not stripped:
         return stripped
-    if stripped.startswith("\"") and stripped.endswith("\""):
-        try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
-            stripped = stripped[1:-1]
-    return stripped
+    return normalise_payload_literal(stripped)
 
 
 def _detect_source_kind(text: str, *, default: str = "lua") -> str:
@@ -446,7 +442,7 @@ def _extract_chunk_header(body: str) -> Optional[str]:
         return None
     prefix = body[:4]
     upper = prefix.upper()
-    if upper in {"LPH!", "LPH~"}:
+    if upper in {"LPH!", "LPH~", "LPH@"}:
         return upper
     return prefix
 

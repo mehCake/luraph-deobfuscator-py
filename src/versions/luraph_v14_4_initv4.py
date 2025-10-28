@@ -25,7 +25,12 @@ import logging
 import re
 import string
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+
+import codecs
+import json
+
+from . import OpSpec
 
 from ..vm.opcode_constants import MANDATORY_CONFIDENCE_THRESHOLD
 from .initv4 import InitV4Bootstrap
@@ -45,6 +50,12 @@ _DEFAULT_BASE = len(DEFAULT_ALPHABET)
 
 _PRINTABLE = re.escape(DEFAULT_ALPHABET)
 _PAYLOAD_RE = re.compile(rf'(["\'])([{_PRINTABLE}]{{32,}})\1')
+_HEX_ESCAPE_SEQUENCE_RE = re.compile(r'(?:\\x[0-9A-Fa-f]{2}){16,}')
+_HEX_LITERAL_RE = re.compile(r'(["\'])(?:\\x[0-9A-Fa-f]{2}){16,}\1')
+_STRING_CHAR_TOKEN_RE = re.compile(r'string\.char', re.IGNORECASE)
+_NUMBER_TOKEN_RE = re.compile(r'0x[0-9A-Fa-f]+|\d+')
+_NUMERIC_ARRAY_CLEAN_RE = re.compile(r'[\s,;]')
+_MIN_PACKED_SEQUENCE = 32
 _SCRIPT_KEY_LITERAL_RE = re.compile(
     r"script_key\s*=\s*script_key\s*or\s*['\"]([^'\"]+)['\"]",
     re.IGNORECASE,
@@ -165,11 +176,23 @@ _DEFAULT_OPCODE_MAP.update(
 def _normalise_opcode_map(mapping: Mapping[Any, Any]) -> Dict[int, str]:
     result: Dict[int, str] = {}
     for key, value in mapping.items():
+        opcode: Optional[int] = None
+        name: Optional[str] = None
+
         try:
             opcode = int(key, 0) if isinstance(key, str) else int(key)
         except (TypeError, ValueError):
-            continue
-        name = str(value).strip()
+            opcode = None
+        else:
+            name = str(value).strip()
+
+        if opcode is None:
+            try:
+                opcode = int(value, 0) if isinstance(value, str) else int(value)
+            except (TypeError, ValueError):
+                continue
+            name = str(key).strip()
+
         if not name:
             continue
         result[opcode] = name.upper()
@@ -270,15 +293,34 @@ class InitV4Decoder:
 
     # ------------------------------------------------------------------
     def locate_payload(self, text: str) -> List[str]:
-        return [match.group(0) for match in _PAYLOAD_RE.finditer(text)]
+        if not text:
+            return []
+
+        candidates: List[Tuple[int, str]] = []
+        seen: set[str] = set()
+
+        for match in _PAYLOAD_RE.finditer(text):
+            candidates.append((match.start(), match.group(0)))
+        for match in _HEX_LITERAL_RE.finditer(text):
+            candidates.append((match.start(), match.group(0)))
+        for start, literal in _iter_string_char_literals(text):
+            candidates.append((start, literal))
+        for start, literal in _iter_numeric_array_literals(text):
+            candidates.append((start, literal))
+
+        candidates.sort(key=lambda item: item[0])
+
+        payloads: List[str] = []
+        for _, literal in candidates:
+            if literal not in seen:
+                seen.add(literal)
+                payloads.append(literal)
+
+        return payloads
 
     # ------------------------------------------------------------------
     def extract_bytecode(self, literal: str) -> bytes:
-        stripped = literal.strip()
-        if len(stripped) >= 2 and stripped[0] in {'"', "'"} and stripped[0] == stripped[-1]:
-            blob = stripped[1:-1]
-        else:
-            blob = stripped
+        blob = normalise_payload_literal(literal)
         return decode_blob(blob, alphabet=self.alphabet, key_bytes=self._script_key_bytes)
 
     # ------------------------------------------------------------------
@@ -295,7 +337,31 @@ class InitV4Decoder:
             LOG.debug("bootstrap metadata extraction failed: %s", exc)
             return
 
-        self._bootstrap_summary = dict(summary)
+        summary_dict = dict(summary) if isinstance(summary, Mapping) else {}
+
+        bootstrap_summary: Dict[str, Any] = {}
+        bootstrap_path = getattr(bootstrap, "path", None)
+        if bootstrap_path:
+            bootstrap_summary["path"] = str(bootstrap_path)
+        for key in (
+            "alphabet_length",
+            "opcode_table_entries",
+            "opcode_table_trusted",
+            "opcode_table_mandatory_missing",
+            "opcode_map_entries",
+            "constant_entries",
+        ):
+            value = summary_dict.get(key)
+            if value:
+                bootstrap_summary[key] = value
+        self._bootstrap_summary = bootstrap_summary
+
+        extraction = summary_dict.get("extraction") if isinstance(summary_dict, Mapping) else {}
+        meta: Dict[str, Any] = {}
+        if isinstance(extraction, Mapping):
+            meta.update(extraction)
+        else:
+            extraction = {}
 
         literal_key = self._extract_script_key_literal(bootstrap.text)
         if literal_key:
@@ -306,39 +372,85 @@ class InitV4Decoder:
             meta.setdefault("script_key_length", len(literal_key))
             meta.setdefault("script_key_source", "bootstrap")
 
-        if not self._manual_override_alphabet and alphabet:
+        if not self._manual_override_alphabet and alphabet and _is_alphabet(alphabet):
             self._alphabet = alphabet
             self._alphabet_source = "bootstrap"
+        elif self._alphabet is None:
+            self._alphabet = DEFAULT_ALPHABET
 
-        table_map = {opcode: spec.mnemonic for opcode, spec in table.items()}
-        if table_map:
-            self._opcode_table.update(table_map)
+        dispatch_info = (
+            extraction.get("opcode_dispatch") if isinstance(extraction, Mapping) else {}
+        )
+        if not isinstance(dispatch_info, Mapping):
+            dispatch_info = {}
+        dispatch_map = (
+            dispatch_info.get("mapping") if isinstance(dispatch_info, Mapping) else {}
+        )
+
+        allowed_keys: Optional[set[int]] = None
+        opcode_table: Dict[int, str] = {}
+
+        if isinstance(dispatch_map, Mapping) and dispatch_map:
+            allowed_keys = set()
+            for key, name in dispatch_map.items():
+                try:
+                    opcode_id = int(key, 0) if isinstance(key, str) else int(key)
+                except (TypeError, ValueError):
+                    continue
+                mnemonic = str(name).strip()
+                if not mnemonic:
+                    continue
+                opcode_table[opcode_id] = mnemonic.upper()
+                allowed_keys.add(opcode_id)
+            if allowed_keys:
+                self._custom_opcodes = True
+
+        bootstrap_opcodes: Dict[int, str] = {}
+        if isinstance(table, Mapping):
+            for opcode, spec in table.items():
+                if not isinstance(spec, OpSpec):
+                    continue
+                bootstrap_opcodes[opcode] = spec.mnemonic.upper()
 
         opcode_map = _normalise_opcode_map(mapping)
         if opcode_map:
             self.opcode_map = dict(sorted(opcode_map.items()))
-            self._opcode_table.update(self.opcode_map)
             self._custom_opcodes = True
+        elif not self._manual_override_opcode_map:
+            self.opcode_map = {}
 
-        # Ensure canonical operations remain present even if the bootstrap
-        # emits a reduced or reordered table.  Some stripped bootstrappers drop
-        # rarely used opcodes (such as ``CONCAT``) from the dispatch metadata;
-        # the pipeline relies on their presence when rebuilding bytecode, so we
-        # re-introduce the defaults when necessary.
-        existing_names = {name.upper() for name in self._opcode_table.values()}
-        if "CONCAT" not in existing_names:
-            fallback = _DEFAULT_OPCODE_MAP.get(0x22) or "CONCAT"
-            self._opcode_table[0x22] = fallback
-            existing_names.add("CONCAT")
-        if "CALL" not in existing_names:
-            self._opcode_table.setdefault(0x1C, "CALL")
-        if "RETURN" not in existing_names:
-            self._opcode_table.setdefault(0x1D, "RETURN")
+        if opcode_map:
+            for opcode_id, mnemonic in opcode_map.items():
+                if allowed_keys is not None and opcode_id not in allowed_keys:
+                    continue
+                opcode_table[opcode_id] = mnemonic.upper()
+        elif bootstrap_opcodes:
+            for opcode_id, mnemonic in bootstrap_opcodes.items():
+                if allowed_keys is not None and opcode_id not in allowed_keys:
+                    continue
+                opcode_table.setdefault(opcode_id, mnemonic)
 
-        extraction = summary.get("extraction") if isinstance(summary, dict) else {}
-        meta: Dict[str, Any] = {}
-        if isinstance(extraction, Mapping):
-            meta.update(extraction)
+        if not opcode_table:
+            for opcode_id, mnemonic in _DEFAULT_OPCODE_MAP.items():
+                opcode_table[opcode_id] = mnemonic
+        else:
+            if allowed_keys is not None:
+                for opcode_id in allowed_keys:
+                    if opcode_id not in opcode_table and opcode_id in _DEFAULT_OPCODE_MAP:
+                        opcode_table[opcode_id] = _DEFAULT_OPCODE_MAP[opcode_id]
+            else:
+                existing_names = {name.upper() for name in opcode_table.values()}
+                if "CONCAT" not in existing_names:
+                    fallback = _DEFAULT_OPCODE_MAP.get(0x22) or "CONCAT"
+                    opcode_table[0x22] = fallback
+                    existing_names.add("CONCAT")
+                if "CALL" not in existing_names:
+                    opcode_table.setdefault(0x1C, "CALL")
+                if "RETURN" not in existing_names:
+                    opcode_table.setdefault(0x1D, "RETURN")
+
+        self._opcode_table = dict(sorted(opcode_table.items()))
+
         opcode_table_meta = (
             extraction.get("opcode_table") if isinstance(extraction, Mapping) else {}
         )
@@ -468,4 +580,142 @@ def decode_blob_with_metadata(
     }
 
 
-__all__ = ["DEFAULT_ALPHABET", "InitV4Decoder", "decode_blob", "decode_blob_with_metadata"]
+# ---------------------------------------------------------------------------
+# Payload helpers
+
+
+def _find_balanced(text: str, start: int, open_char: str, close_char: str) -> int:
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _parse_numeric_sequence(body: str) -> Optional[List[int]]:
+    tokens = _NUMBER_TOKEN_RE.findall(body)
+    if len(tokens) < _MIN_PACKED_SEQUENCE:
+        return None
+
+    scrubbed = _NUMBER_TOKEN_RE.sub('', body)
+    scrubbed = _NUMERIC_ARRAY_CLEAN_RE.sub('', scrubbed)
+    if scrubbed.strip():
+        return None
+
+    values: List[int] = []
+    for token in tokens:
+        try:
+            number = int(token, 0)
+        except ValueError:
+            return None
+        values.append(number & 0xFF)
+    return values
+
+
+def _decode_numeric_values(values: Sequence[int]) -> str:
+    return bytes(int(value) & 0xFF for value in values).decode('latin-1')
+
+
+def _iter_string_char_literals(text: str) -> Iterator[Tuple[int, str]]:
+    lower = text.lower()
+    search = 0
+    while True:
+        match = _STRING_CHAR_TOKEN_RE.search(lower, search)
+        if not match:
+            break
+        call_start = match.start()
+        paren_index = lower.find('(', match.end())
+        if paren_index == -1:
+            break
+        close_index = _find_balanced(text, paren_index, '(', ')')
+        if close_index == -1:
+            break
+        body = text[paren_index + 1 : close_index]
+        values = _parse_numeric_sequence(body)
+        if values:
+            yield call_start, text[call_start : close_index + 1]
+        search = close_index + 1
+
+
+def _iter_numeric_array_literals(text: str) -> Iterator[Tuple[int, str]]:
+    lower = text
+    search = 0
+    while True:
+        brace_index = lower.find('{', search)
+        if brace_index == -1:
+            break
+        close_index = _find_balanced(lower, brace_index, '{', '}')
+        if close_index == -1:
+            break
+        body = lower[brace_index + 1 : close_index]
+        values = _parse_numeric_sequence(body)
+        if values:
+            yield brace_index, text[brace_index : close_index + 1]
+        search = close_index + 1
+
+
+def _decode_hex_escapes(value: str) -> Optional[str]:
+    if not _HEX_ESCAPE_SEQUENCE_RE.search(value):
+        return None
+    try:
+        decoded = codecs.decode(value, 'unicode_escape')
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return decoded
+
+
+def normalise_payload_literal(literal: str) -> str:
+    stripped = literal.strip()
+    if not stripped:
+        return stripped
+
+    if stripped.startswith('"') and stripped.endswith('"'):
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            inner = stripped[1:-1]
+            hex_decoded = _decode_hex_escapes(inner)
+            return hex_decoded if hex_decoded is not None else inner
+        else:
+            candidate = _decode_hex_escapes(decoded)
+            return candidate if candidate is not None else decoded
+
+    if stripped.startswith("'") and stripped.endswith("'"):
+        inner = stripped[1:-1]
+        decoded = _decode_hex_escapes(inner)
+        return decoded if decoded is not None else inner
+
+    hex_decoded = _decode_hex_escapes(stripped)
+    if hex_decoded is not None:
+        return hex_decoded
+
+    char_match = _STRING_CHAR_TOKEN_RE.match(stripped)
+    if char_match:
+        open_index = stripped.find('(', char_match.end())
+        if open_index != -1:
+            close_index = _find_balanced(stripped, open_index, '(', ')')
+            if close_index != -1:
+                values = _parse_numeric_sequence(stripped[open_index + 1 : close_index])
+                if values:
+                    return _decode_numeric_values(values)
+
+    if stripped.startswith('{') and stripped.endswith('}'):
+        values = _parse_numeric_sequence(stripped[1:-1])
+        if values:
+            return _decode_numeric_values(values)
+
+    return stripped
+
+
+__all__ = [
+    "DEFAULT_ALPHABET",
+    "InitV4Decoder",
+    "decode_blob",
+    "decode_blob_with_metadata",
+    "normalise_payload_literal",
+]

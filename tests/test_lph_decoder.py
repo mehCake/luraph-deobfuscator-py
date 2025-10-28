@@ -19,6 +19,7 @@ INITV4_PATH = os.path.join(PROJECT_ROOT, "initv4.lua")
         ("\\57\\166\\86", b"9\xa6V"),
         ("3AF01", bytes.fromhex("AF AF AF 01".replace(" ", ""))),
         ("LPH!3AF01", bytes.fromhex("AF AF AF 01".replace(" ", ""))),
+        ("LPH@3AF01", bytes.fromhex("AF AF AF 01".replace(" ", ""))),
     ],
 )
 def test_parse_known_sequences(literal: str, expected_prefix: bytes) -> None:

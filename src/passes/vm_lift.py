@@ -380,7 +380,7 @@ def run(ctx: "Context") -> Dict[str, object]:
 
     if not bytecode:
         ctx.ir_module = None
-        return {"skipped": True}
+        return {"available": False, "skipped": True}
 
     if not const_pool and ctx.vm.const_pool:
         const_pool = ctx.vm.const_pool
@@ -397,13 +397,15 @@ def run(ctx: "Context") -> Dict[str, object]:
     except Exception as exc:
         LOG.exception("vm lift failed: %s", exc)
         ctx.ir_module = None
-        return {"error": str(exc), "skipped": True}
+        return {"available": False, "error": str(exc), "skipped": True}
 
     ctx.ir_module = module
     metadata: Dict[str, object] = {
         "instructions": module.instruction_count,
         "blocks": module.block_count,
         "bytecode_size": module.bytecode_size,
+        "available": True,
+        "skipped": False,
     }
     if module.warnings:
         metadata["warnings"] = list(module.warnings)
