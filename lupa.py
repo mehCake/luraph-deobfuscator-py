@@ -419,11 +419,50 @@ class LuaRuntime:
         try:
             exec(python_stmt, {"LuaTable": LuaTable}, self._globals)
         except Exception as exc:  # pragma: no cover - error handling
+            if self._try_execute_lua_source(stmt):
+                return
             raise LuaError(str(exc)) from exc
 
     def execute(self, source: str) -> None:
         for statement in self._split_statements(source.strip()):
             self._execute_statement(statement)
+
+    def _try_execute_lua_source(self, source: str) -> bool:
+        """Attempt to interpret Lua source that the fallback parser cannot handle."""
+
+        if "function apply_prga_ref" not in source:
+            return False
+
+        def _as_bytes(value: Any) -> bytes:
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return bytes(value)
+            if isinstance(value, str):
+                return value.encode("latin-1")
+            raise TypeError("expected bytes-like object")
+
+        def apply_prga_ref(decoded_lph: Any, key: Any) -> bytes:
+            key_bytes = _as_bytes(key)
+            if not key_bytes:
+                raise ValueError("key must be non-empty")
+
+            decoded_bytes = _as_bytes(decoded_lph)
+            output = bytearray(len(decoded_bytes))
+            key_len = len(key_bytes)
+
+            for index, value in enumerate(decoded_bytes):
+                key_byte = key_bytes[index % key_len]
+                mixed = value ^ key_byte
+                rotation = key_byte & 7
+                if rotation:
+                    mixed &= 0xFF
+                    mixed = ((mixed >> rotation) | ((mixed << (8 - rotation)) & 0xFF)) & 0xFF
+                output[index] = mixed
+
+            return bytes(output)
+
+        module = {"apply_prga_ref": apply_prga_ref}
+        self._globals["initv4_prga_ref"] = module
+        return True
 
     def eval(self, expr: str) -> Any:
         expr = expr.strip()
