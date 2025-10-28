@@ -19,9 +19,9 @@ class LPHBlock:
     span: Tuple[int, int]
 
 
-_LONG_STRING_RE = re.compile(r"\[(?P<eq>=*)\[(?P<body>LPH[!~][\s\S]*?)\]\1\]", re.MULTILINE)
-_INLINE_DOUBLE_RE = re.compile(r'"(?P<body>LPH[!~][^"\n\r]{80,})"')
-_INLINE_SINGLE_RE = re.compile(r"'(?P<body>LPH[!~][^'\n\r]{80,})'")
+_LONG_STRING_RE = re.compile(r"\[(?P<eq>=*)\[(?P<body>LPH[!~@][\s\S]*?)\]\1\]", re.MULTILINE)
+_INLINE_DOUBLE_RE = re.compile(r'"(?P<body>LPH[!~@][^"\n\r]{80,})"')
+_INLINE_SINGLE_RE = re.compile(r"'(?P<body>LPH[!~@][^'\n\r]{80,})'")
 
 
 def _iter_matches(pattern: re.Pattern[str], text: str) -> Iterable[Tuple[str, Tuple[int, int]]]:

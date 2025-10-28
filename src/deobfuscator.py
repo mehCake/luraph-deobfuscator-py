@@ -1151,7 +1151,7 @@ class LuaDeobfuscator:
             if len(header_source) >= 4:
                 prefix = header_source[:4]
                 upper = prefix.upper()
-                header_value = upper if upper in {"LPH!", "LPH~"} else prefix
+                header_value = upper if upper in {"LPH!", "LPH~", "LPH@"} else prefix
 
             decoded_length = 0
             cleaned_flag = False
@@ -1384,27 +1384,40 @@ class LuaDeobfuscator:
         iteration_hint = discovered_chunks or len(decoded_parts)
         merged_lower = merged_source.lower() if merged_source else ""
         needs_placeholder = False
-        if not merged_lower.strip():
+        if placeholder_only:
+            needs_placeholder = True
+        elif not merged_lower.strip():
             needs_placeholder = True
         elif "function" not in merged_lower:
             if placeholder_only or (not combined_script and not actual_sources):
                 needs_placeholder = True
             elif merged_lower.startswith("--[[") or "undecoded" in merged_lower:
                 needs_placeholder = True
+        elif merged_lower.startswith("--[[") or "undecoded" in merged_lower:
+            needs_placeholder = True
         if needs_placeholder:
             comments = ["failed to decode initv4 chunks", f"size: {total_decoded} bytes"]
             if iteration_hint:
                 comments.append(f"iterations: {iteration_hint}")
+            comment_lines = ["--[[ undecoded initv4 chunk"]
+            for line in comments:
+                comment_lines.append(f"    {line}")
+            comment_lines.append("]]" )
+            comment_block = normalise_lua_newlines("\n".join(comment_lines) + "\n")
             placeholder_text = lua_placeholder_function(
                 "__deob_initv4_placeholder__",
                 comments,
                 newline="\n",
             )
             placeholder_stub = placeholder_text.strip()
+            segments = [comment_block.strip()]
+            if placeholder_stub:
+                segments.append(placeholder_stub)
+            placeholder_combined = "\n\n".join(segments)
             if merged_source.strip():
-                merged_source = "\n\n".join([merged_source.strip(), placeholder_stub])
+                merged_source = "\n\n".join([placeholder_combined, merged_source.strip()])
             else:
-                merged_source = placeholder_stub
+                merged_source = placeholder_combined
             placeholder_only = placeholder_only or not actual_sources
 
         analysis: Dict[str, Any] = {}

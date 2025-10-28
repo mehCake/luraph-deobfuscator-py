@@ -7,7 +7,7 @@ import re
 import struct
 from typing import Iterable
 
-_PREFIXES = ("LPH!", "LPH~", "lph!", "lph~")
+_PREFIXES = ("LPH!", "LPH~", "LPH@", "lph!", "lph~", "lph@")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -49,7 +49,7 @@ def _iter_chunks(text: str) -> Iterable[str]:
 
 
 def decode_lph85(text: str) -> bytes:
-    """Decode an ``LPH!`` or ``LPH~`` payload into raw bytes."""
+    """Decode an ``LPH`` payload (``LPH!``, ``LPH~`` or ``LPH@``) into raw bytes."""
 
     if text is None:
         raise TypeError("text must be a string")

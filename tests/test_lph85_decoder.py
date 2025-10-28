@@ -42,6 +42,13 @@ def test_lph85_output_is_non_trivial(tmp_path: Path) -> None:
     assert output.startswith(b"\x00\x00") is True
 
 
+def test_lph85_supports_at_header() -> None:
+    body = "ABCDE" * 3
+    classic = decode_lph85("LPH!" + body)
+    variant = decode_lph85("LPH@" + body)
+    assert variant == classic
+
+
 def test_candidate_script_keys_detects_contextual_tokens() -> None:
     text = (
         "--[[\n"

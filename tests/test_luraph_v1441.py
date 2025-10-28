@@ -227,6 +227,62 @@ def test_initv4_decoder_extracts_metadata(tmp_path: Path) -> None:
     assert opcode_table.get(0x22) == "CONCAT"
 
 
+def test_initv4_decoder_locates_string_char_payload() -> None:
+    script, raw, script_key, blob = _make_sample()
+    byte_args = ",".join(str(ord(char)) for char in blob)
+    script = script.replace(
+        f'local payload = "{blob}"',
+        f"local payload = string.char({byte_args})",
+    )
+
+    decoder = InitV4Decoder(SimpleNamespace(script_key=script_key))
+
+    payloads = decoder.locate_payload(script)
+    string_char_literal = next(
+        (entry for entry in payloads if entry.lstrip().lower().startswith("string.char")),
+        None,
+    )
+    assert string_char_literal is not None
+
+    decoded = decoder.extract_bytecode(string_char_literal)
+    assert decoded == raw
+
+
+def test_initv4_decoder_locates_numeric_array_payload() -> None:
+    _, raw, script_key, blob = _make_sample()
+    values = ",".join(str(ord(char)) for char in blob)
+    array_literal = "{" + values + "}"
+
+    script = "\n".join(
+        [
+            "-- Luraph v14.4.1 bootstrap",
+            f"local script_key = script_key or \"{script_key}\"",
+            "local init_fn = function(blob)",
+            "    return blob",
+            "end",
+            f"local payload_bytes = {array_literal}",
+            "local function build_blob(data)",
+            "    local out = {}",
+            "    for i = 1, #data do",
+            "        out[i] = string.char(data[i])",
+            "    end",
+            "    return table.concat(out)",
+            "end",
+            "local payload = build_blob(payload_bytes)",
+            "return init_fn(payload)",
+        ]
+    )
+
+    decoder = InitV4Decoder(SimpleNamespace(script_key=script_key))
+
+    payloads = decoder.locate_payload(script)
+    array_payload = next((entry for entry in payloads if entry.lstrip().startswith("{")), None)
+    assert array_payload is not None
+
+    decoded = decoder.extract_bytecode(array_payload)
+    assert decoded == raw
+
+
 def test_v1441_handler_decodes_chunked_payload() -> None:
     script, raw, script_key, encoded_chunks = _make_chunked_sample(chunk_count=4)
     handler = LuraphV1441()

@@ -30,7 +30,7 @@ def _decode_literal(token: str) -> Tuple[str, str] | None:
         return None
     quote = token[0]
     body = token[1:-1]
-    needs_decode = body.startswith(("LPH!", "lph!", "LPH_", "lph_")) or "\\" in body
+    needs_decode = body.startswith(("LPH!", "lph!", "LPH@", "lph@", "LPH_", "lph_")) or "\\" in body
     if needs_decode:
         try:
             raw = parse_escaped_lua_string(body)
