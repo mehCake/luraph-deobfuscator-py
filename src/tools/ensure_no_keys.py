@@ -176,14 +176,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        help="Optional positional directory to scan (overrides --base-dir)",
+    )
+
+    strict_group = parser.add_mutually_exclusive_group()
+    strict_group.add_argument(
+        "--strict",
+        dest="strict",
+        action="store_true",
+        default=None,
+        help="Exit with a non-zero status when violations are detected (default)",
+    )
+    strict_group.add_argument(
+        "--no-strict",
+        dest="strict",
+        action="store_false",
+        help="Return success even if violations are discovered",
+    )
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     patterns = tuple(args.patterns) if args.patterns else DEFAULT_PATTERNS
+    base_dir = args.path or args.base_dir
+    if args.strict is None:
+        raise_on_violation = True
+    else:
+        raise_on_violation = args.strict
 
     try:
-        violations = ensure_no_keys(args.base_dir, patterns=patterns)
+        violations = ensure_no_keys(
+            base_dir,
+            patterns=patterns,
+            raise_on_violation=raise_on_violation,
+        )
     except KeyLeakError as exc:
         for violation in exc.violations:
             LOGGER.error(_format_violation(violation))
@@ -197,7 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for violation in violations:
             LOGGER.warning(_format_violation(violation))
     else:
-        LOGGER.info("No forbidden key fields detected beneath %s", args.base_dir)
+        LOGGER.info("No forbidden key fields detected beneath %s", base_dir)
     return 0
 
 

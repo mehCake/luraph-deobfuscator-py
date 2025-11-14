@@ -52,3 +52,31 @@ def test_cli_returns_error_code(
     assert exit_code == 1
     messages = "\n".join(record.getMessage() for record in caplog.records)
     assert "profile.json" in messages
+
+
+def test_cli_supports_positional_directory_with_strict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out_dir = tmp_path / "out"
+    _write_json(out_dir / "report.json", {"token": "value"})
+
+    caplog.set_level(logging.ERROR)
+    exit_code = ensure_no_keys_main(["--strict", str(out_dir)])
+
+    assert exit_code == 1
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "report.json" in messages
+
+
+def test_cli_no_strict_allows_warnings(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out_dir = tmp_path / "out"
+    _write_json(out_dir / "report.json", {"token": "value"})
+
+    caplog.set_level(logging.WARNING)
+    exit_code = ensure_no_keys_main(["--no-strict", str(out_dir)])
+
+    assert exit_code == 0
+    warnings = "\n".join(record.getMessage() for record in caplog.records)
+    assert "report.json" in warnings
