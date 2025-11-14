@@ -1,0 +1,637 @@
+"""Utility helpers for interpreting extracted Lua payload data."""
+
+from .safe_eval_stub import eval_expr
+from .annotate_output import (
+    AnnotationContext,
+    AnnotationResult,
+    annotate_output,
+    main as run_annotate_output,
+)
+from .byte_extractor import (
+    extract_bytes,
+    from_escaped_string,
+    from_numeric_table,
+    from_string_char,
+)
+from .auto_docstring import (
+    PublicSymbol as DocstringPublicSymbol,
+    generate_module_documentation,
+    main as run_auto_docstring,
+)
+from .auto_documentation_index import (
+    DocumentEntry as DocumentationIndexEntry,
+    DocumentationIndex as DocumentationIndexSummary,
+    generate_documentation_index,
+    main as run_auto_documentation_index,
+)
+from .annotate_opcodes import (
+    OpcodeAnnotation,
+    OpcodeAnnotationEntry,
+    generate_opcode_annotations,
+    load_instruction_samples as load_opcode_instruction_samples,
+    render_annotation_block as render_opcode_annotation_block,
+    write_opcode_annotations,
+    main as run_annotate_opcodes,
+)
+from .emit_examples_for_documentation import (
+    ExampleArtefact as DocumentationExampleArtefact,
+    ExampleGenerationError as DocumentationExampleGenerationError,
+    ExampleSummary as DocumentationExampleSummary,
+    emit_documentation_examples,
+    main as run_emit_examples_for_documentation,
+)
+from .generate_ci_smoke_test import (
+    SmokeScenario as CiSmokeScenario,
+    SmokeTestReport as CiSmokeTestReport,
+    SmokeTestResult as CiSmokeTestResult,
+    default_scenarios as ci_smoke_default_scenarios,
+    main as run_generate_ci_smoke_test,
+    run_smoke_tests as run_ci_smoke_tests,
+)
+from .auto_profile_builder import (
+    AutoProfile,
+    AutoProfileBuilderError,
+    build_auto_profile,
+    write_auto_profile,
+)
+from .export_for_machine_learning import (
+    TrainingExample as MLTrainingExample,
+    export_training_data,
+    main as run_export_for_machine_learning,
+)
+from .plugin_hooks import (
+    PluginContext,
+    PluginDescriptor,
+    PluginDiscoveryResult,
+    PluginError,
+    PluginExecutionError,
+    PluginKeyRequestError,
+    PluginValidationError,
+    discover_plugins,
+    execute_plugins,
+)
+from .collector import ChunkAnalysis, collect_pipeline_candidates
+from .hypothesis_scoring import (
+    HypothesisScore,
+    estimate_english_likeliness,
+    estimate_lua_token_density,
+    score_mapping_coherence,
+    score_parity_outcome,
+    score_pipeline_hypothesis,
+)
+from .heuristics import (
+    ChecksumResult,
+    classify_operation_markers,
+    detect_checksums,
+    detect_endianness,
+    detect_vm_style,
+    score_base64_string,
+    score_lph_header,
+    score_operation_sequence,
+    score_permutation_sequence,
+    VMStyleScore,
+)
+from .parser_tracer import (
+    FunctionTrace,
+    HandlerMatch,
+    TransformOperation,
+    FunctionAnalysis,
+    analyse_transform_snippet,
+    emit_trace_reports,
+    match_handler_patterns,
+    trace_pipeline_functions,
+)
+from .mapping_verifier import VerificationOutcome, verify_inline_snippet
+from .diff_mappings import (
+    MappingCandidate as DiffMappingCandidate,
+    MappingDiffEntry,
+    MappingDiffResult,
+    diff_opcode_maps,
+    load_mapping as load_diff_mapping,
+    main as run_diff_mappings,
+)
+from .visualize_pipeline import (
+    classify_operation,
+    generate_pipeline_graphs,
+    load_pipeline_report,
+    render_pipeline_graph,
+)
+from .visualize_cfg_dot import (
+    CFG as DispatcherCFG,
+    CFGBlock as DispatcherCFGBlock,
+    load_cfg as load_dispatcher_cfg,
+    main as run_visualize_cfg,
+    render_cfg_dot,
+    write_cfg_visualisation,
+)
+from .parity_test import run_prga_parity
+from .generate_handler_tests import (
+    HandlerTestCase,
+    HandlerTestSuite,
+    generate_handler_tests,
+    main as run_generate_handler_tests,
+)
+from .parity_reporter import (
+    ParityReport,
+    ParitySuggestionReport,
+    build_suggestion_report,
+    generate_parity_suggestions,
+    load_parity_report,
+    write_suggestion_markdown,
+)
+from .visual_inspector import VisualInspector, InspectorShell, main as run_visual_inspector
+from .interactive_map_editor import (
+    HandlerEntry,
+    MapEditorSession,
+    MapEditorShell,
+    build_parser as build_map_editor_parser,
+    create_session as create_map_editor_session,
+    load_handler_entries,
+    load_candidate_mapping,
+    load_base_mapping,
+    run_editor as run_map_editor,
+)
+from .interactive_review_web import (
+    ReviewComment,
+    InMemoryCommentStore as ReviewCommentStore,
+    create_app as create_review_app,
+    build_arg_parser as build_interactive_review_parser,
+    main as run_interactive_review_web,
+)
+from .backup_manager import BackupPlan, snapshot_analysis_inputs
+from .cleanup_on_exit import CleanupManager, get_cleanup_manager
+from .cleanup_temp import (
+    CleanupPlan as TempCleanupPlan,
+    cleanup_intermediate_artifacts,
+    collect_cleanup_candidates,
+    main as run_cleanup_temp,
+)
+from .metrics_collector import (
+    MetricsCollector,
+    MetricsReport,
+    collect_metrics,
+)
+from .sanity_checks import SanityCheckResult, run_sanity_checks
+from .compatibility_adapter import apply_version_adaptations
+from .retry_on_error import retry_on_error
+from .transform_profile import TransformProfile, load_profile, save_profile
+from .upgrade_profile import (
+    MigrationEntry as ProfileMigrationEntry,
+    UpgradeResult as ProfileUpgradeResult,
+    main as run_upgrade_profile,
+    upgrade_profile,
+)
+from .fuzzy_param_search import (
+    FuzzyCandidate,
+    FuzzySearchResult,
+    guided_search as run_fuzzy_search,
+)
+from .param_tuner import (
+    ParamCandidate as TunerParamCandidate,
+    TuningResult as ParamTuningResult,
+    TuningStep as ParamTuningStep,
+    hill_climb_parameters,
+    main as run_param_tuner,
+)
+from .auto_bruteforce_small_keys import (
+    BruteforceAttempt,
+    BruteforceReport,
+    bruteforce_small_keys,
+    write_report as write_bruteforce_report,
+)
+from .trace_recorder import (
+    TraceEvent,
+    TraceRecording,
+    TraceRecorderError,
+    build_arg_parser as build_trace_recorder_parser,
+    main as run_trace_recorder,
+    record_trace,
+    write_trace,
+)
+from .recorded_trace_analyzer import (
+    RegisterLifetime,
+    HotHandlerStats,
+    PatternInsight,
+    TraceAnalysisReport,
+    analyze_trace,
+    build_arg_parser as build_trace_analyzer_parser,
+    main as run_trace_analyzer,
+    write_csvs as write_trace_analysis_csvs,
+    write_markdown as write_trace_analysis_markdown,
+)
+from .replay_trace import (
+    ReplayDifference,
+    ReplayReport,
+    ReplaySuggestion,
+    ReplayError,
+    build_arg_parser as build_replay_trace_parser,
+    load_opcode_map as load_replay_opcode_map,
+    load_trace as load_replay_trace,
+    main as run_replay_trace,
+    replay_trace,
+    write_report as write_replay_report,
+)
+from .snapshotter import (
+    Snapshot,
+    SnapshotDiff,
+    SnapshotRun,
+    SnapshotterError,
+    build_arg_parser as build_snapshotter_parser,
+    capture_bootstrap_snapshots,
+    diff_snapshots,
+    main as run_snapshotter,
+    write_snapshot_run,
+)
+from .restore_backup import (
+    RestoredFile,
+    RestoredRun,
+    RestoreBackupError,
+    build_arg_parser as build_restore_backup_parser,
+    main as run_restore_backup,
+    restore_backup,
+)
+from .ci_runner import CiRunResult, CiSampleResult
+from .report_to_user import (
+    UserSummary,
+    build_user_summary,
+    write_user_summary,
+    main as run_report_to_user,
+)
+from .automated_notes import (
+    AutomatedNotes,
+    build_automated_notes,
+    write_notes as write_automated_notes,
+    main as run_automated_notes,
+)
+from .preview_deobf import (
+    PreviewConfig,
+    PreviewError,
+    generate_preview,
+    preview_files,
+    main as run_preview_deobf,
+)
+from .prune_low_confidence import (
+    PruneResult,
+    RestoreResult as PruneRestoreResult,
+    main as run_prune_low_confidence,
+    prune_low_confidence,
+    restore_from_archive,
+)
+from .recommendations import (
+    RecommendationChecklist,
+    build_recommendation_checklist,
+    write_recommendation_markdown,
+    main as run_recommendations,
+)
+from .replace_insecure_patterns import (
+    PatternMatch,
+    SuspiciousPattern,
+    build_arg_parser as build_replace_insecure_parser,
+    main as run_replace_insecure_patterns,
+    scan_paths as scan_insecure_paths,
+    write_warning_report,
+)
+from .uid_generator import generate_run_id, reserve_artifact_path, sanitise_token
+from .generate_run_manifest import (
+    RunManifest,
+    RunManifestError,
+    build_run_manifest,
+    load_run_manifest,
+    write_run_manifest,
+)
+from .export_results_zip import (
+    ExportResultsError,
+    ExportSummary,
+    build_arg_parser as build_export_results_parser,
+    export_results_zip,
+    main as run_export_results_zip,
+)
+from .export_for_reviewers import (
+    ExportForReviewersError,
+    ReviewerExportSummary,
+    build_arg_parser as build_export_for_reviewers_parser,
+    export_for_reviewers,
+    main as run_export_for_reviewers,
+)
+from .export_json_for_review import (
+    ExportJsonForReviewError,
+    JsonExportSummary,
+    build_arg_parser as build_export_json_for_review_parser,
+    export_json_for_review,
+    main as run_export_json_for_review,
+)
+from .ensure_license import (
+    LicenseReport as LicenseEnsureReport,
+    ensure_license,
+    ensure_license_file,
+    ensure_license_headers,
+    ensure_output_license,
+    main as run_ensure_license,
+)
+from .ensure_no_keys import (
+    EnsureNoKeysError,
+    KeyLeakError,
+    KeyViolation,
+    ensure_no_keys,
+    main as run_ensure_no_keys,
+    scan_for_leaked_keys,
+)
+from .validate_json_schema import (
+    SchemaValidationError,
+    SchemaValidationIssue,
+    main as run_validate_json_schema,
+    validate_json_directory,
+)
+from .compare_outputs import (
+    DiffEntry,
+    ComparisonResult,
+    build_arg_parser as build_compare_outputs_parser,
+    compare_outputs,
+    main as run_compare_outputs,
+)
+from .ambiguous_reporter import (
+    AmbiguousOpcode,
+    AmbiguousIRNode,
+    AmbiguousReport,
+    build_ambiguous_report,
+    write_markdown as write_ambiguous_markdown,
+    write_json as write_ambiguous_json,
+    main as run_ambiguous_reporter,
+)
+from .resolve_with_testcases import (
+    ResolveSummary,
+    TestcaseDefinition,
+    TestcaseObservation,
+    ResolveWithTestcasesError,
+    load_testcases as load_testcase_definitions,
+    resolve_with_testcases,
+    write_summary as write_testcase_summary,
+    main as run_resolve_with_testcases,
+)
+from .auto_instrumenter import (
+    AutoInstrumenterError,
+    InstrumentationConfig,
+    InstrumentationLogEntry,
+    InstrumentationResult,
+    InstrumentationSummary,
+    build_arg_parser as build_auto_instrumenter_parser,
+    instrument_bootstrap,
+    main as run_auto_instrumenter,
+)
+
+
+def run_detection(*args, **kwargs):
+    from .run_all_detection import run_detection as _run_detection
+
+    return _run_detection(*args, **kwargs)
+
+
+def run_ci_pipeline(*args, **kwargs):
+    from .ci_runner import run_ci_pipeline as _run_ci_pipeline
+
+    return _run_ci_pipeline(*args, **kwargs)
+
+__all__ = [
+    "eval_expr",
+    "AnnotationContext",
+    "AnnotationResult",
+    "annotate_output",
+    "extract_bytes",
+    "from_escaped_string",
+    "from_numeric_table",
+    "from_string_char",
+    "ChunkAnalysis",
+    "collect_pipeline_candidates",
+    "HypothesisScore",
+    "estimate_english_likeliness",
+    "estimate_lua_token_density",
+    "score_mapping_coherence",
+    "score_parity_outcome",
+    "score_pipeline_hypothesis",
+    "ChecksumResult",
+    "classify_operation_markers",
+    "detect_checksums",
+    "detect_endianness",
+    "detect_vm_style",
+    "score_base64_string",
+    "score_lph_header",
+    "score_operation_sequence",
+    "score_permutation_sequence",
+    "VMStyleScore",
+    "FunctionTrace",
+    "HandlerMatch",
+    "TransformOperation",
+    "FunctionAnalysis",
+    "analyse_transform_snippet",
+    "emit_trace_reports",
+    "match_handler_patterns",
+    "trace_pipeline_functions",
+    "VerificationOutcome",
+    "verify_inline_snippet",
+    "classify_operation",
+    "generate_pipeline_graphs",
+    "load_pipeline_report",
+    "render_pipeline_graph",
+    "DispatcherCFG",
+    "DispatcherCFGBlock",
+    "load_dispatcher_cfg",
+    "run_visualize_cfg",
+    "render_cfg_dot",
+    "write_cfg_visualisation",
+    "run_prga_parity",
+    "ParityReport",
+    "ParitySuggestionReport",
+    "build_suggestion_report",
+    "generate_parity_suggestions",
+    "load_parity_report",
+    "write_suggestion_markdown",
+    "VisualInspector",
+    "InspectorShell",
+    "run_visual_inspector",
+    "ReviewComment",
+    "ReviewCommentStore",
+    "create_review_app",
+    "build_interactive_review_parser",
+    "run_interactive_review_web",
+    "run_detection",
+    "CiSampleResult",
+    "CiRunResult",
+    "run_ci_pipeline",
+    "HandlerEntry",
+    "MapEditorSession",
+    "MapEditorShell",
+    "build_map_editor_parser",
+    "create_map_editor_session",
+    "load_handler_entries",
+    "load_candidate_mapping",
+    "load_base_mapping",
+    "run_map_editor",
+    "BackupPlan",
+    "snapshot_analysis_inputs",
+    "MetricsCollector",
+    "MetricsReport",
+    "collect_metrics",
+    "SanityCheckResult",
+    "run_sanity_checks",
+    "apply_version_adaptations",
+    "TransformProfile",
+    "load_profile",
+    "save_profile",
+    "ProfileMigrationEntry",
+    "ProfileUpgradeResult",
+    "upgrade_profile",
+    "run_upgrade_profile",
+    "AutoProfile",
+    "AutoProfileBuilderError",
+    "build_auto_profile",
+    "write_auto_profile",
+    "PluginContext",
+    "PluginDescriptor",
+    "PluginDiscoveryResult",
+    "PluginError",
+    "PluginExecutionError",
+    "PluginKeyRequestError",
+    "PluginValidationError",
+    "discover_plugins",
+    "execute_plugins",
+    "FuzzyCandidate",
+    "FuzzySearchResult",
+    "run_fuzzy_search",
+    "BruteforceAttempt",
+    "BruteforceReport",
+    "bruteforce_small_keys",
+    "write_bruteforce_report",
+    "TraceEvent",
+    "TraceRecording",
+    "TraceRecorderError",
+    "build_trace_recorder_parser",
+    "run_trace_recorder",
+    "record_trace",
+    "write_trace",
+    "RegisterLifetime",
+    "HotHandlerStats",
+    "PatternInsight",
+    "TraceAnalysisReport",
+    "analyze_trace",
+    "build_trace_analyzer_parser",
+    "run_trace_analyzer",
+    "write_trace_analysis_csvs",
+    "write_trace_analysis_markdown",
+    "ReplayDifference",
+    "ReplayReport",
+    "ReplaySuggestion",
+    "ReplayError",
+    "build_replay_trace_parser",
+    "load_replay_opcode_map",
+    "load_replay_trace",
+    "run_replay_trace",
+    "replay_trace",
+    "write_replay_report",
+    "Snapshot",
+    "SnapshotDiff",
+    "SnapshotRun",
+    "SnapshotterError",
+    "build_snapshotter_parser",
+    "capture_bootstrap_snapshots",
+    "diff_snapshots",
+    "run_snapshotter",
+    "write_snapshot_run",
+    "RestoredFile",
+    "RestoredRun",
+    "RestoreBackupError",
+    "build_restore_backup_parser",
+    "run_restore_backup",
+    "restore_backup",
+    "UserSummary",
+    "build_user_summary",
+    "write_user_summary",
+    "run_report_to_user",
+    "AutomatedNotes",
+    "build_automated_notes",
+    "write_automated_notes",
+    "run_automated_notes",
+    "PreviewConfig",
+    "PreviewError",
+    "generate_preview",
+    "preview_files",
+    "run_preview_deobf",
+    "PruneResult",
+    "PruneRestoreResult",
+    "prune_low_confidence",
+    "restore_from_archive",
+    "run_prune_low_confidence",
+    "RecommendationChecklist",
+    "build_recommendation_checklist",
+    "write_recommendation_markdown",
+    "run_recommendations",
+    "SuspiciousPattern",
+    "PatternMatch",
+    "scan_insecure_paths",
+    "write_warning_report",
+    "build_replace_insecure_parser",
+    "run_replace_insecure_patterns",
+    "RunManifest",
+    "RunManifestError",
+    "build_run_manifest",
+    "write_run_manifest",
+    "load_run_manifest",
+    "ExportResultsError",
+    "ExportSummary",
+    "build_export_results_parser",
+    "export_results_zip",
+    "run_export_results_zip",
+    "build_export_for_reviewers_parser",
+    "export_for_reviewers",
+    "run_export_for_reviewers",
+    "ExportJsonForReviewError",
+    "JsonExportSummary",
+    "build_export_json_for_review_parser",
+    "export_json_for_review",
+    "run_export_json_for_review",
+    "ExportForReviewersError",
+    "ReviewerExportSummary",
+    "LicenseEnsureReport",
+    "ensure_license",
+    "ensure_license_file",
+    "ensure_license_headers",
+    "ensure_output_license",
+    "run_ensure_license",
+    "EnsureNoKeysError",
+    "KeyLeakError",
+    "KeyViolation",
+    "scan_for_leaked_keys",
+    "ensure_no_keys",
+    "run_ensure_no_keys",
+    "SchemaValidationIssue",
+    "SchemaValidationError",
+    "validate_json_directory",
+    "run_validate_json_schema",
+    "DiffEntry",
+    "ComparisonResult",
+    "build_compare_outputs_parser",
+    "compare_outputs",
+    "run_compare_outputs",
+    "AmbiguousOpcode",
+    "AmbiguousIRNode",
+    "AmbiguousReport",
+    "build_ambiguous_report",
+    "write_ambiguous_markdown",
+    "write_ambiguous_json",
+    "run_ambiguous_reporter",
+    "ResolveSummary",
+    "TestcaseDefinition",
+    "TestcaseObservation",
+    "ResolveWithTestcasesError",
+    "load_testcase_definitions",
+    "resolve_with_testcases",
+    "write_testcase_summary",
+    "run_resolve_with_testcases",
+    "AutoInstrumenterError",
+    "InstrumentationConfig",
+    "InstrumentationLogEntry",
+    "InstrumentationResult",
+    "InstrumentationSummary",
+    "build_auto_instrumenter_parser",
+    "instrument_bootstrap",
+    "run_auto_instrumenter",
+]

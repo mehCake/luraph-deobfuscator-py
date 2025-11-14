@@ -448,10 +448,13 @@ class LuaRuntime:
             decoded_bytes = _as_bytes(decoded_lph)
             output = bytearray(len(decoded_bytes))
             key_len = len(key_bytes)
+            total = len(decoded_bytes)
 
-            for index, value in enumerate(decoded_bytes):
+            for index in range(total):
                 key_byte = key_bytes[index % key_len]
-                mixed = value ^ key_byte
+                permuted_index = (index + key_byte) % total
+                input_value = decoded_bytes[permuted_index]
+                mixed = input_value ^ key_byte
                 rotation = key_byte & 7
                 if rotation:
                     mixed &= 0xFF

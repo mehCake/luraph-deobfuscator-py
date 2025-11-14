@@ -1,0 +1,83 @@
+name: "Static Analysis Example (Local Only)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "requirements.txt"
+      - "requirements-dev.txt"
+      - ".github/workflows/ci_example.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "requirements.txt"
+      - "requirements-dev.txt"
+      - ".github/workflows/ci_example.yml"
+
+jobs:
+  luraph-static-scan:
+    name: "Run sample detection pipeline"
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "Install dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: "Run synthetic detection pipeline"
+        run: |
+          echo "⚠️  Do not store real Luraph session keys in CI secrets."
+          echo "⚠️  This workflow is for synthetic samples only."
+          python -m src.tools.ci_runner \
+            --output-dir out/ci_results/github \
+            --nightly \
+            --threshold 1024
+
+      - name: "List generated artefacts"
+        run: |
+          ls -R out/ci_results || echo "No artefacts produced"
+
+      - name: "Archive CI artefacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-results
+          path: |
+            out/ci_results
+          if-no-files-found: warn
+
+      - name: "Ensure no keys leaked"
+        if: always()
+        run: |
+          python -m src.tools.ensure_no_keys --strict out
+
+      - name: "Provide local run instructions"
+        run: |
+          cat <<'MSG'
+          To reproduce locally without CI:
+            python -m src.tools.ci_runner --output-dir out/ci_results/local
+          Never embed session keys in config files or repository artefacts.
+          When a key is required (for example Obfuscated3.lua), pass it via
+          CLI or stdin during the parity harness step and wipe buffers after use.
+          MSG
+
+    # This example workflow intentionally avoids any secrets configuration.
+    # If you fork it, do NOT add real Luraph keys to repository or CI secrets.
+    # All payloads processed here must be synthetic test fixtures.
