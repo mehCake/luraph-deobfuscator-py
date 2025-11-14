@@ -4,3 +4,4 @@ pycryptodome
 networkx==3.1
 frida==16.1.4
 unicorn==2.0.1
+Flask==3.0.3

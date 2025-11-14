@@ -438,16 +438,15 @@ class InitV4Decoder:
                 for opcode_id in allowed_keys:
                     if opcode_id not in opcode_table and opcode_id in _DEFAULT_OPCODE_MAP:
                         opcode_table[opcode_id] = _DEFAULT_OPCODE_MAP[opcode_id]
-            else:
-                existing_names = {name.upper() for name in opcode_table.values()}
-                if "CONCAT" not in existing_names:
-                    fallback = _DEFAULT_OPCODE_MAP.get(0x22) or "CONCAT"
-                    opcode_table[0x22] = fallback
-                    existing_names.add("CONCAT")
-                if "CALL" not in existing_names:
-                    opcode_table.setdefault(0x1C, "CALL")
-                if "RETURN" not in existing_names:
-                    opcode_table.setdefault(0x1D, "RETURN")
+            existing_names = {name.upper() for name in opcode_table.values()}
+            if "CONCAT" not in existing_names:
+                fallback = _DEFAULT_OPCODE_MAP.get(0x22) or "CONCAT"
+                opcode_table[0x22] = fallback
+                existing_names.add("CONCAT")
+            if "CALL" not in existing_names:
+                opcode_table.setdefault(0x1C, "CALL")
+            if "RETURN" not in existing_names:
+                opcode_table.setdefault(0x1D, "RETURN")
 
         self._opcode_table = dict(sorted(opcode_table.items()))
 

@@ -1,4 +1,4 @@
-# Lua Deobfuscator (Doesn't work yet as of now but keep in mind, developement should be going through the course of up to a year or so.)
+# Lua Deobfuscator (Active development is still ongoing—expect rapid changes as the toolkit matures.)
 # Dev #ishowgoat on discord
 
 Utilities for decoding Lua scripts obfuscated with Luraph/Luarmor styles.  The
@@ -14,16 +14,21 @@ to reconstruct readable Lua from simple bytecode traces.
 
 ## Supported releases
 
-- **Luraph v14.4.1 (initv4)** – full bootstrap support with `--script-key`
-  decoding and optional `--bootstrapper` extraction for opcode maps/alphabet
-  tables supplied by `initv4.lua`.
+- **Luraph v14.4.1 – v14.4.3 (initv4 family)** – full bootstrap support through
+  the manifest-driven pipeline (`src/tools/run_all_detection.py`) with
+  `--script-key` guarded decoding, opcode/alphabet extraction, opcode map
+  proposal, and VM lifter integration.  The detection stage automatically
+  chooses between initv4 variants when processing files such as
+  `Obfuscated3.lua` (v14.4.2) and the other bundled samples.
 - **Earlier 14.x JSON loaders** – automatic payload recovery for the
-  `luraph_v14_2_json` family and compatible builds.
+  `luraph_v14_2_json` family and compatible builds remains available via the
+  legacy path in `main.py`/`src/deobfuscator.py`.
 
-Heuristics in `src/deobfuscator.py` attempt to detect the Luraph version used
-in a script.  Version specific tweaks live in `src/versions/` and are applied
+Heuristics in both `src/deobfuscator.py` and the manifest collector
+(`src/tools/collector.py`) attempt to detect the Luraph version used in a
+script.  Version specific tweaks live in `src/versions/` and are applied
 automatically when the virtual machine executes embedded bytecode (currently
-covering v14.0.2 through v14.4.1, including the ``initv4`` bootstrap that ships
+covering v14.0.2 through v14.4.3, including the `initv4` bootstrap that ships
 encrypted script payloads).
 
 ## Installation
@@ -166,12 +171,29 @@ The pipeline can now load `initv4.lua` and capture `unpackedData` via `src/sandb
 
 ## Usage
 
-The modern CLI drives the pass-based pipeline and emits a timing summary for
-every processed file.  Inputs can be provided either positionally or with the
-`--in` flag.  Outputs default to `<name>_deob.lua` *and* `<name>_deob.json`,
-providing both the cleaned Lua script and a merged JSON report.  Use
-`--format lua` to suppress the JSON sidecar or `--format json` to route the
-report to the primary output path while still emitting the Lua file.
+Two entry points now exist, depending on how much automation you need:
+
+1. **`python -m src.tools.run_all_detection <payload>`** – the recommended path
+   for the new manifest workflow.  It chains the loader, bootstrap extractor,
+   byte extractor, pipeline collector, hypothesis scoring, opcode analysis, and
+   reporting utilities (including Markdown/Graphviz/JSON artefacts under
+   `out/`).  Use `--debug` for verbose logging, `--use-key` together with
+   `--key` (or stdin) to supply the session key safely, and `--finalize`
+   afterwards via `tools/finalize_and_archive.py` to package artefacts once you
+   review the detection output.  This flow is tuned for the bundled
+   v14.4.1–v14.4.3 samples and should be your first stop for `Obfuscated3.lua`
+   work.
+2. **`python main.py …`** – the original pass-based pipeline that still powers
+   the legacy documentation below.  It remains useful for bespoke experiments
+   or when you want granular control over which passes run.
+
+The modern CLI described in the next section continues to drive the pass-based
+pipeline and emits a timing summary for every processed file.  Inputs can be
+provided either positionally or with the `--in` flag.  Outputs default to
+`<name>_deob.lua` *and* `<name>_deob.json`, providing both the cleaned Lua
+script and a merged JSON report.  Use `--format lua` to suppress the JSON
+sidecar or `--format json` to route the report to the primary output path while
+still emitting the Lua file.
 
 ```bash
 # Quick start against the bundled v14.4.1 sample

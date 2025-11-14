@@ -1,0 +1,40 @@
+# WARNING: Example workflow only. Do not commit real session keys or secrets.
+# Replace placeholders with organisation-specific paths and secrets, and ensure
+# session keys are supplied via ephemeral secrets when running parity checks.
+name: luraph-local-ci-example
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'  # nightly example; adjust as needed
+
+jobs:
+  local-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run local CI pipeline (no real keys!)
+        env:
+          # Placeholder only – never hard-code production keys in CI.
+          SESSION_KEY_PLACEHOLDER: "${{ secrets.LURAPH_SESSION_KEY || '' }}"
+        run: |
+          echo "::warning::Ensure SESSION_KEY_PLACEHOLDER is provided via GitHub secrets when required."
+          python -m src.tools.ci_runner --output-dir out/ci_results --no-parity
+
+      - name: Upload CI artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-results
+          path: out/ci_results

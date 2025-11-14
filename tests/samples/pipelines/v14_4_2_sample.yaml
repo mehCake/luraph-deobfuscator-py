@@ -1,0 +1,32 @@
+{
+  "name": "synthetic_v14_4_2",
+  "description": "Synthetic pipeline approximating Luraph v14.4.2 transforms for regression tests.",
+  "base_payload": {
+    "kind": "text",
+    "value": "return function(a, b) return (a ~ b) + 1 end"
+  },
+  "operations": [
+    {
+      "type": "prga",
+      "key": [18, 52, 86, 120],
+      "rotate": 3,
+      "xor": 165
+    },
+    {
+      "type": "permute",
+      "table": [2, 0, 3, 1],
+      "block": 4,
+      "pad": 0
+    },
+    {
+      "type": "pack",
+      "style": "string_char",
+      "chunk": 12,
+      "variable": "payload",
+      "provenance": "v14.4.2-regression"
+    }
+  ],
+  "outputs": {
+    "base_name": "synthetic_v14_4_2"
+  }
+}

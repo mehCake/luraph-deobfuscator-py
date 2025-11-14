@@ -2041,7 +2041,14 @@ def _populate_payload_summary(
         }
         return mapping.get(lowered, lowered)
 
+    manual_alphabet_value = getattr(ctx, "manual_alphabet", None)
+    manual_override_requested = bool(
+        isinstance(manual_alphabet_value, str) and manual_alphabet_value.strip()
+    )
+
     alphabet_source = _normalise_source_label(payload_meta.get("alphabet_source"))
+    if manual_override_requested:
+        alphabet_source = "manual_override"
     if alphabet_source is None:
         sources = metadata.get("chunk_alphabet_sources")
         if isinstance(sources, list):
@@ -2050,17 +2057,14 @@ def _populate_payload_summary(
                     alphabet_source = _normalise_source_label(candidate)
                     if alphabet_source:
                         break
-        manual_alphabet = getattr(ctx, "manual_alphabet", None)
         if alphabet_source is None:
-            if isinstance(manual_alphabet, str) and manual_alphabet.strip():
+            if manual_override_requested:
                 alphabet_source = "manual_override"
             elif getattr(ctx, "bootstrapper_path", None):
                 alphabet_source = "bootstrap"
             else:
                 alphabet_source = "heuristic"
-        payload_meta["alphabet_source"] = alphabet_source
-    else:
-        payload_meta["alphabet_source"] = alphabet_source
+    payload_meta["alphabet_source"] = alphabet_source
 
     opcode_source = _normalise_source_label(payload_meta.get("opcode_source"))
     if opcode_source is None:
