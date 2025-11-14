@@ -1,6 +1,7 @@
 import base64
+from pathlib import Path
 
-from string_decryptor import StringDecryptor
+from string_decryptor import StringDecryptor, detect_v14_3_string_decoder
 
 
 def test_layered_xor_base64_hex_round_trip():
@@ -35,3 +36,14 @@ def test_inline_closure_and_loadstring_are_folded():
     assert "loadstring" not in decrypted
     assert '"hello world"' in decrypted
     assert "'ok'" in decrypted
+
+
+def test_detect_v14_3_string_decoder_profile() -> None:
+    source = Path('Obfuscated4.lua').read_text()
+    descriptor = detect_v14_3_string_decoder(source)
+    assert descriptor is not None
+    assert descriptor.token_length == 5
+    assert descriptor.local_variable_count >= 5
+    assert descriptor.caches_results is True
+    assert descriptor.invocation.replace(" ", "") == "N(u,0x5)"
+    assert descriptor.gsub_alias != descriptor.metatable_alias

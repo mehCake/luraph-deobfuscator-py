@@ -3,8 +3,10 @@ from typing import Iterable
 
 import base64
 import json
+import logging
 
-from version_detector import VersionDetector
+from luraph_deobfuscator import EnhancedLuraphDeobfuscator
+from version_detector import VersionDetector, VersionFeature
 from src import pipeline
 from src.deobfuscator import LuaDeobfuscator
 from src.vm.emulator import LuraphVM
@@ -38,6 +40,21 @@ def test_detect_version_banner_in_json() -> None:
     sample = '{"banner": "Luraph v14.2"}'
     detected = detector.detect(sample, from_json=True)
     assert detected.name == 'luraph_v14_2_json'
+
+
+def test_detect_version_luraph_v143_vm() -> None:
+    detector = VersionDetector()
+    sample = Path('Obfuscated4.lua').read_text()
+    detected = detector.detect(sample)
+    assert detected.name == VersionFeature.LURAPH_V14_3_VM.value
+    assert VersionFeature.LURAPH_V14_3_VM.value in detected.features
+    assert detected.profile
+    assert detected.profile.get('double_packed_constants') is True
+    decoder_profile = detected.profile.get('string_decoder')
+    assert isinstance(decoder_profile, dict)
+    assert decoder_profile.get('token_length') == 5
+    assert decoder_profile.get('local_variable_count', 0) >= 5
+    assert decoder_profile.get('caches_results') is True
 
 
 def test_v142_pcall_bypass() -> None:
@@ -123,3 +140,13 @@ def test_version_detector_initv4_heuristics_trigger() -> None:
 
     detected = detector.detect(script)
     assert detected.name == "luraph_v14_4_initv4"
+
+
+def test_legacy_summary_reports_v14_3_detection(caplog) -> None:
+    sample = Path('Obfuscated4.lua').read_text(encoding='utf-8', errors='ignore')
+    deob = EnhancedLuraphDeobfuscator()
+    with caplog.at_level(logging.INFO, logger='LuraphDeobfuscator'):
+        summary = deob.summarise_detection(sample, filename='Obfuscated4.lua')
+    expected = "Luraph v14.3 (VM, Real Life HIGH, strings encrypted, double-packed constants)"
+    assert summary == expected
+    assert expected in caplog.text

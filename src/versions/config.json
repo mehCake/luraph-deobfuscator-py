@@ -51,6 +51,22 @@
       },
       "known_traps": []
     },
+    "luraph_v14_3_vm": {
+      "priority": 80,
+      "heuristics": {
+        "signatures": [
+          "protected\\s+using\\s+Luraph\\s+Obfuscator\\s+v14\\.3"
+        ],
+        "prologues": [
+          "return\\s*\\(\\s*function\\s*\\(K\\s*,\\s*e\\s*,\\s*n\\s*,\\s*a"
+        ],
+        "dispatch": [
+          "local\\s+function\\s+N\\s*\\(\\s*Y\\s*,\\s*g\\s*\\)",
+          "D\\s*\\[\\s*_\\s*\\]"
+        ]
+      },
+      "known_traps": []
+    },
     "v14.0.2": {
       "module": "v14_0",
       "opcode_map": {

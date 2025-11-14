@@ -37,3 +37,22 @@ def test_scan_files_multiple(tmp_path: Path) -> None:
     assert report["protection_detected"] is True
     assert set(report["types"]) >= {"xor", "anti_trace"}
     assert any(item["filename"].endswith("a.lua") for item in report["evidence"])
+
+
+def test_real_life_profile_for_v14_3_vm() -> None:
+    sample = Path("Obfuscated4.lua").read_text(encoding="utf-8", errors="ignore")
+    report = detect_protections.scan_lua(sample, filename="Obfuscated4.lua")
+    profile = report.get("profile")
+    assert profile is not None
+    assert profile["vm_mode"] == "full"
+    assert profile["string_encryption"] is True
+    assert profile["real_life_score"] == pytest.approx(15.17, rel=0.05)
+    assert profile["double_packed_constants"] is True
+
+
+def test_scan_files_carries_profile() -> None:
+    report = detect_protections.scan_files([Path("Obfuscated4.lua")])
+    profile = report.get("profile")
+    assert profile is not None
+    assert profile["vm_mode"] == "full"
+    assert profile["double_packed_constants"] is True

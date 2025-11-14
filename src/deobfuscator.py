@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 from lph_handler import extract_vm_ir
-from version_detector import VersionDetector, VersionInfo
+from version_detector import VersionDetector, VersionFeature, VersionInfo
 
 from opcode_lifter import OpcodeLifter
 from lua_vm_simulator import LuaVMSimulator
@@ -148,6 +148,17 @@ class LuaDeobfuscator:
         active_features = self._normalise_features(features)
         if active_features is not None:
             metadata["active_features"] = sorted(active_features)
+
+        variant_value = VersionFeature.LURAPH_V14_3_VM.value
+        variant_flags: set[str] = set()
+        if version.features and variant_value in version.features:
+            variant_flags.add(variant_value)
+        if active_features and variant_value in active_features:
+            variant_flags.add(variant_value)
+        if variant_flags:
+            ordered_variants = sorted(variant_flags)
+            metadata["vm_variants"] = ordered_variants
+            metadata.setdefault("primary_vm_variant", ordered_variants[0])
 
         override_token = "_script_key_override"
         provided_key = (script_key or "").strip()
@@ -869,6 +880,7 @@ class LuaDeobfuscator:
                 features=features,
                 confidence=confidence,
                 matched_categories=info.matched_categories,
+                profile=dict(info.profile),
             )
         return self.detect_version(text, from_json=from_json)
 

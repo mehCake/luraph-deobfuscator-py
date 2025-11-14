@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping, Tuple, FrozenSet
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, Iterable, Mapping, Tuple, FrozenSet
 
 from src.versions import iter_descriptors
+from string_decryptor import detect_v14_3_string_decoder
+
+
+_V14_3_DOUBLE_PACK_HEADER_RE = re.compile(
+    r"\bo\s*=\s*\(function\(\).*?I\(\s*['\"]<I\\52",
+    re.IGNORECASE | re.DOTALL,
+)
+_V14_3_DOUBLE_PACK_HELPER_RE = re.compile(
+    r"\bt3\s*=\s*function\(\).*?I\(\s*['\"]<\\z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 _JSON_INIT_RE = re.compile(r"(?:do\s+)?local\s+init_fn\s*=\s*function", re.IGNORECASE)
@@ -44,6 +56,20 @@ _VERSION_BANNER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_LURAPH_V14_3_BANNER_RE = re.compile(
+    r"protected\s+using\s+Luraph\s+Obfuscator\s+v14\.3",
+    re.IGNORECASE,
+)
+_LURAPH_V14_3_WRAPPER_RE = re.compile(
+    r"return\s*\(\s*function\s*\(K\s*,\s*e\s*,\s*n\s*,\s*a",
+    re.IGNORECASE,
+)
+_LURAPH_V14_3_DISPATCH_DECL_RE = re.compile(
+    r"local\s+function\s+N\s*\(\s*Y\s*,\s*g\s*\)",
+    re.IGNORECASE,
+)
+_LURAPH_V14_3_DISPATCH_TABLE_RE = re.compile(r"D\s*\[\s*_\s*\]", re.IGNORECASE)
+
 _BANNER_VERSION_MAP = {
     "14.4.1": "luraph_v14_4_initv4",
     "14.4": "luraph_v14_4_initv4",
@@ -52,6 +78,12 @@ _BANNER_VERSION_MAP = {
     "14.0.2": "v14.0.2",
     "14.0": "v14.0.2",
 }
+
+
+class VersionFeature(str, Enum):
+    """Feature flags exposed by :class:`VersionDetector`."""
+
+    LURAPH_V14_3_VM = "luraph_v14_3_vm"
 
 @dataclass(frozen=True)
 class VersionInfo:
@@ -63,10 +95,23 @@ class VersionInfo:
     features: frozenset[str]
     confidence: float
     matched_categories: Tuple[str, ...] = ()
+    profile: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_unknown(self) -> bool:
         return self.name == "unknown"
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.name,
+                self.major,
+                self.minor,
+                self.features,
+                round(self.confidence, 9),
+                self.matched_categories,
+            )
+        )
 
 
 class VersionDetector:
@@ -79,6 +124,7 @@ class VersionDetector:
         "long_strings": "container",
         "constants": "constants",
         "prologues": "prologue",
+        "dispatch": "vm_dispatch",
     }
 
     def __init__(self, descriptors: Mapping[str, Mapping[str, object]] | None = None) -> None:
@@ -88,6 +134,10 @@ class VersionDetector:
         self._all_features: FrozenSet[str] = self._collect_all_features()
 
     def detect(self, content: str, *, from_json: bool = False) -> VersionInfo:
+        manual = _detect_luraph_v14_3_vm(content)
+        if manual is not None:
+            return manual
+
         banner_version = _resolve_banner_version(content)
         if banner_version:
             return self.info_for_name(banner_version)
@@ -174,6 +224,10 @@ class VersionDetector:
                     categories.append(category)
                     feature = self._CATEGORY_FEATURE_MAP.get(category) or category
                     features.add(feature)
+        if name == VersionFeature.LURAPH_V14_3_VM.value:
+            categories.append("standalone_vm")
+            categories.append("vm_dispatch")
+            features.add(VersionFeature.LURAPH_V14_3_VM.value)
         major, minor = _parse_version_numbers(name)
         return VersionInfo(
             name=name,
@@ -193,6 +247,7 @@ class VersionDetector:
             for category in heuristics.keys():
                 feature = self._CATEGORY_FEATURE_MAP.get(category) or category
                 features.add(feature)
+        features.add(VersionFeature.LURAPH_V14_3_VM.value)
         return frozenset(features)
 
 
@@ -241,6 +296,35 @@ def _looks_like_initv4(content: str) -> bool:
     return False
 
 
+def _detect_luraph_v14_3_vm(content: str) -> VersionInfo | None:
+    if not _LURAPH_V14_3_BANNER_RE.search(content):
+        return None
+    if not _LURAPH_V14_3_WRAPPER_RE.search(content):
+        return None
+    if not _LURAPH_V14_3_DISPATCH_DECL_RE.search(content):
+        return None
+    if not _LURAPH_V14_3_DISPATCH_TABLE_RE.search(content):
+        return None
+    features = frozenset(
+        {VersionFeature.LURAPH_V14_3_VM.value, "vm_dispatch", "banner", "prologue"}
+    )
+    profile: Dict[str, Any] = {}
+    if detect_v14_3_double_packed_constants(content):
+        profile["double_packed_constants"] = True
+    decoder = detect_v14_3_string_decoder(content)
+    if decoder is not None:
+        profile["string_decoder"] = decoder.to_dict()
+    return VersionInfo(
+        name=VersionFeature.LURAPH_V14_3_VM.value,
+        major=14,
+        minor=3,
+        features=features,
+        confidence=1.0,
+        matched_categories=("signatures", "prologues", "dispatch"),
+        profile=profile,
+    )
+
+
 def _resolve_banner_version(content: str) -> str | None:
     matches = list(_VERSION_BANNER_RE.findall(content))
     if not matches:
@@ -270,4 +354,21 @@ def _map_banner_version(raw: str) -> str | None:
     return _BANNER_VERSION_MAP.get(candidate)
 
 
-__all__ = ["VersionDetector", "VersionInfo"]
+def detect_v14_3_double_packed_constants(content: str) -> bool:
+    """Return ``True`` if *content* contains the v14.3 double-pack helpers."""
+
+    if not _LURAPH_V14_3_BANNER_RE.search(content):
+        return False
+    if not _V14_3_DOUBLE_PACK_HEADER_RE.search(content):
+        return False
+    if not _V14_3_DOUBLE_PACK_HELPER_RE.search(content):
+        return False
+    return True
+
+
+__all__ = [
+    "VersionDetector",
+    "VersionInfo",
+    "VersionFeature",
+    "detect_v14_3_double_packed_constants",
+]

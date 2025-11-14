@@ -22,7 +22,7 @@ from typing import (
     cast,
 )
 
-from version_detector import VersionInfo
+from version_detector import VersionFeature, VersionInfo
 
 from . import utils
 from .utils import write_json, write_text
@@ -568,8 +568,18 @@ def _pass_detect(ctx: Context) -> None:
         "confidence": version.confidence,
         "features": sorted(version.features) if version.features else [],
     }
+    variant_value = VersionFeature.LURAPH_V14_3_VM.value
+    if variant_value in metadata["features"]:
+        metadata["vm_variants"] = [variant_value]
+        variant_bucket = ctx.vm_metadata.setdefault("variants", [])
+        if variant_value not in variant_bucket:
+            variant_bucket.append(variant_value)
     if version.matched_categories:
         metadata["matched_categories"] = list(version.matched_categories)
+    if getattr(version, "profile", None):
+        profile = dict(version.profile)
+        if profile:
+            metadata["profile"] = profile
     if ctx.bootstrapper_path:
         metadata["bootstrapper_path"] = str(ctx.bootstrapper_path)
     ctx.record_metadata("detect", metadata)

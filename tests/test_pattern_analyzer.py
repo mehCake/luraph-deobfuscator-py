@@ -268,3 +268,102 @@ def test_generate_upcode_table_requires_schema_fields():
         )
 
     assert "sample_usage" in str(exc.value)
+
+
+def test_locate_serialized_chunk_v14_3():
+    analyzer = PatternAnalyzer()
+    source = Path("Obfuscated4.lua").read_text(encoding="utf8")
+
+    chunk = analyzer.locate_serialized_chunk(source)
+    assert chunk is not None
+    assert chunk.buffer_name == "E"
+    assert chunk.initial_offset == 1
+
+    helpers = chunk.helper_functions
+    assert set(helpers) == {"o", "t3", "a3", "M", "r"}
+    assert helpers["o"] == "o"
+    assert helpers["t3"] == "t3"
+    assert helpers["a3"] == "a3"
+    assert helpers["M"] == "M"
+    assert helpers["r"] == "r"
+
+
+def test_detect_bootstrap_state_machine_recognises_v14_3_dispatcher():
+    analyzer = PatternAnalyzer()
+    source = Path("Obfuscated4.lua").read_text(encoding="utf8")
+
+    machine = analyzer.detect_bootstrap_state_machine(source)
+
+    assert machine is not None, "Expected bootstrap state machine to be detected"
+    assert machine.variable == "x"
+    assert len(machine.states) >= 2
+
+    first_state = machine.states[0]
+    assert first_state.state_id.lower() in {"85", "0x55"}
+    assert any(op.startswith("F3[") for op in first_state.operations)
+    assert any(tr.expression for tr in first_state.transitions)
+
+    break_state = next(
+        (state for state in machine.states if any(tr.expression == "break" for tr in state.transitions)),
+        None,
+    )
+    assert break_state is not None
+
+
+def test_analyze_cache_slots_classifies_v14_3_cache_usage():
+    analyzer = PatternAnalyzer()
+    source = Path("Obfuscated4.lua").read_text(encoding="utf8")
+
+    payload = analyzer.analyze_cache_slots(source)
+
+    assert payload["slot_count"] >= 5
+    assert "slots" in payload and payload["slots"], "Expected cache slot summary"
+
+    # ensure the payload is JSON serialisable and mirrored in the side-band store
+    serialised = json.dumps(payload)
+    assert serialised, "Serialised cache slot payload should not be empty"
+    assert analyzer.side_band.get("cache_slots") == payload
+
+    slots = {slot["index_literal"].lower(): slot for slot in payload["slots"]}
+
+    assert "0x42d" in slots
+    assert slots["0x42d"]["classification"] == "table reference"
+
+    assert "6056" in slots
+    assert slots["6056"]["semantic_role"] == "double mantissa mask"
+
+    passthrough = slots.get("0x16e7")
+    assert passthrough is not None
+    assert passthrough["classification"] == "passthrough"
+
+    # At least one slot should describe string limits to support constant evaluation downstream
+    assert any(
+        slot["semantic_role"] == "string length limit" for slot in payload["slots"]
+    )
+
+
+def test_identify_c3_primitives_extracts_v14_3_mapping():
+    analyzer = PatternAnalyzer()
+    source = Path("Obfuscated4.lua").read_text(encoding="utf8")
+
+    payload = analyzer.identify_c3_primitives(source)
+
+    assert payload is not None, "Expected primitive table metadata to be detected"
+    assert payload["count"] == len(payload["entries"])
+    assert payload["count"] >= 5
+    assert analyzer.side_band.get("c3_primitives") == payload
+
+    modules = set(payload["modules"])
+    assert {"bit32", "string", "table"} <= modules
+
+    entries = payload["entries"]
+    assert entries[0]["slot"] == "n"
+    assert entries[0]["builtin"] == "string.unpack"
+    assert entries[0]["accessor"] == "C3.n"
+
+    keyed = {entry["slot"]: entry for entry in entries if entry["slot_type"] == "key"}
+    assert keyed["u"]["builtin"] == "bit32.bxor"
+    assert keyed["K"]["builtin"] == "string.sub"
+    assert keyed["Y"]["builtin"] == "table.create"
+
+    assert entries[-1]["builtin"] == "bit32.band"

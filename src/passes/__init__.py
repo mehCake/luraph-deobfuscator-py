@@ -10,6 +10,7 @@ from . import (
     string_folding,
     string_reconstruction,
     render,
+    runtime_ir_annotations,
 )
 from .devirtualizer import Devirtualizer
 
@@ -22,4 +23,5 @@ __all__ = [
     "string_folding",
     "string_reconstruction",
     "render",
+    "runtime_ir_annotations",
 ]

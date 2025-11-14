@@ -16,6 +16,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from lua_literal_parser import LuaTable, parse_lua_expression
 from .luraph_api import LuraphAPI
 from .utils import write_json, write_text
+from version_detector import (
+    VersionDetector,
+    VersionFeature,
+    detect_v14_3_double_packed_constants,
+)
 
 # Regular expression patterns for each protection type. Patterns are compiled lazily at
 # module import so unit tests pay a fixed cost.
@@ -92,6 +97,17 @@ _CATEGORY_PATTERNS = {
 _MACRO_REGEX = re.compile(r"\b(LPH_[A-Z0-9_]+)\b")
 _MACRO_COMMENT_REGEX = re.compile(r"--\s*@?(lph[_-]?[a-z0-9_]+)")
 
+_STATE_MACHINE_RE = re.compile(
+    r"local\s+x\s*,\s*N\s*=\s*\([^)]*\);\s*repeat(.*?)until\s+false",
+    re.IGNORECASE | re.DOTALL,
+)
+_BIT32_CALL_RE = re.compile(r"\bbit32\.", re.IGNORECASE)
+_OPCODE_COMPARE_RE = re.compile(r"a\s*(?:[<>=]=?|~=|==)\s*[0-9A-Za-z_]+")
+_DISPATCH_BLOCK_RE = re.compile(
+    r"(local\s+function\s+N\s*\([^)]*\).*?end);\s*local",
+    re.IGNORECASE | re.DOTALL,
+)
+
 _COMMENT_MACRO_CANONICAL = {
     "LPH_NOVIRTUALIZE": "LPH_NO_VIRTUALIZE",
     "LPH_NO_VIRT": "LPH_NO_VIRTUALIZE",
@@ -130,6 +146,89 @@ class DetectionEvidence:
             "snippet": self.snippet,
             "filename": self.filename,
         }
+
+
+@dataclass(frozen=True)
+class ProtectionProfile:
+    """Structured summary of VM-related protection heuristics."""
+
+    vm_mode: str | None = None
+    real_life_score: float | None = None
+    string_encryption: bool | None = None
+    double_packed_constants: bool | None = None
+
+    def to_json(self) -> dict:
+        payload: Dict[str, Any] = {}
+        if self.vm_mode is not None:
+            payload["vm_mode"] = self.vm_mode
+        if self.real_life_score is not None:
+            payload["real_life_score"] = self.real_life_score
+        if self.string_encryption is not None:
+            payload["string_encryption"] = self.string_encryption
+        if self.double_packed_constants is not None:
+            payload["double_packed_constants"] = self.double_packed_constants
+        return payload
+
+
+_VERSION_DETECTOR: VersionDetector | None = None
+
+
+def _get_version_detector() -> VersionDetector:
+    global _VERSION_DETECTOR
+    if _VERSION_DETECTOR is None:
+        _VERSION_DETECTOR = VersionDetector()
+    return _VERSION_DETECTOR
+
+
+def _extract_state_machine(source: str) -> str | None:
+    match = _STATE_MACHINE_RE.search(source)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _estimate_real_life_score(source: str) -> float | None:
+    state_machine = _extract_state_machine(source)
+    dispatch_match = _DISPATCH_BLOCK_RE.search(source)
+    if state_machine is None or dispatch_match is None:
+        return None
+    dispatch_block = dispatch_match.group(1)
+
+    bit32_calls = len(_BIT32_CALL_RE.findall(source))
+    bit32_density = bit32_calls / max(1, len(source) / 10_000)
+    bit32_component = min(5.0, bit32_density * 1.25)
+
+    assignments = len(re.findall(r"x\s*=", state_machine))
+    branches = len(re.findall(r"if\s+x", state_machine, re.IGNORECASE))
+    state_component = min(6.0, len(state_machine) / 160.0 + assignments * 0.9 + branches * 1.8)
+
+    opcode_comparisons = len(_OPCODE_COMPARE_RE.findall(dispatch_block))
+    opcode_component = min(9.0, opcode_comparisons / 5.5)
+
+    score = bit32_component + state_component + opcode_component
+    return round(score, 2)
+
+
+def _build_protection_profile(source: str) -> ProtectionProfile | None:
+    detector = _get_version_detector()
+    version = detector.detect(source)
+    if VersionFeature.LURAPH_V14_3_VM.value not in version.features:
+        return None
+
+    real_life_score = _estimate_real_life_score(source)
+    double_packed = detect_v14_3_double_packed_constants(source)
+    if real_life_score is None:
+        return ProtectionProfile(
+            vm_mode="full",
+            string_encryption=True,
+            double_packed_constants=double_packed,
+        )
+    return ProtectionProfile(
+        vm_mode="full",
+        real_life_score=real_life_score,
+        string_encryption=True,
+        double_packed_constants=double_packed,
+    )
 
 
 def _find_matches(source: str, filename: str, patterns: Sequence[tuple[str, str]], category: str) -> List[DetectionEvidence]:
@@ -489,6 +588,9 @@ def scan_lua(source: str, *, filename: str = "<memory>", api_client: Optional[Lu
         "limitations": limitations,
         "recommendation": recommendation,
     }
+    profile = _build_protection_profile(source)
+    if profile is not None:
+        result["profile"] = profile.to_json()
     return result
 
 
@@ -506,6 +608,8 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
     api_client: Optional[LuraphAPI] = None
     if api_key:
         api_client = LuraphAPI(api_key=api_key)
+
+    profile: Optional[Dict[str, Any]] = None
 
     for path in paths:
         try:
@@ -527,6 +631,10 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
         _merge_settings(settings_tables, known_settings, per_file.get("settings", {}))
         metadata = {**metadata, **per_file.get("metadata", {})}
         limitations = _merge_unique(limitations, per_file.get("limitations", []))
+        if profile is None:
+            profile_value = per_file.get("profile")
+            if isinstance(profile_value, dict):
+                profile = dict(profile_value)
 
     categories = sorted({item.category for item in combined})
     recommendation = _compute_recommendation(macros, {"known": known_settings}, categories)
@@ -541,6 +649,7 @@ def scan_files(paths: Iterable[Path], *, api_key: str | None = None) -> dict:
         "limitations": limitations,
         "recommendation": recommendation,
         "scanned": path_list,
+        **({"profile": profile} if profile is not None else {}),
     }
 
 

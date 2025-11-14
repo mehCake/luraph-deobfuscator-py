@@ -20,3 +20,12 @@ Luraph v14.4.1 bootstrappers end-to-end:
 
 With these components in place the project no longer lacks the critical hooks
 and validation artefacts required for safe Luraph v14.4.1 devirtualisation.
+
+## Standalone VM (v14.3) Reporting
+
+The version detector and protection scanner now cooperate to surface the
+standalone VM used by ``Obfuscated4.lua``.  When the legacy
+``luraph_deobfuscator.py`` shim analyses the script it logs a consolidated
+summary such as ``Luraph v14.3 (VM, Real Life HIGH, strings encrypted,
+double-packed constants)``, tying together the detected version, Real Life
+score, string encryption flag, and the new double-packed constant heuristic.

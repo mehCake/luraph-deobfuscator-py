@@ -29,6 +29,7 @@ from ..versions.luraph_v14_4_initv4 import (
 )
 from ..utils.luraph_vm import canonicalise_opcode_name
 from ..utils_pkg.strings import lua_placeholder_function, normalise_lua_newlines
+from version_detector import VersionFeature
 from lph_handler import extract_vm_ir
 from opcode_lifter import OpcodeLifter
 
@@ -73,6 +74,9 @@ _COMPLEX_BANNER_RE = re.compile(
     re.IGNORECASE,
 )
 _COMPLEX_BLOCK_COMMENT_RE = re.compile(r"--\[\[(?:.|\n)*?\]\]", re.DOTALL)
+
+
+_LURAPH_V14_3_VARIANT = VersionFeature.LURAPH_V14_3_VM.value
 
 
 def _should_clean_complex(prefix: Optional[str]) -> bool:
@@ -1880,6 +1884,13 @@ def _merge_iteration_metadata(
     )
     _extend_list(
         aggregate,
+        "vm_variants",
+        meta.get("vm_variants"),
+        predicate=lambda value: isinstance(value, str) and value != "",
+        transform=str,
+    )
+    _extend_list(
+        aggregate,
         "warnings",
         meta.get("warnings"),
         predicate=lambda value: bool(value),
@@ -2524,6 +2535,18 @@ def run(ctx: "Context") -> Dict[str, Any]:
     seen_outputs: Set[str] = {text}
     last_metadata: Optional[Dict[str, Any]] = None
 
+    variant_candidates: Set[str] = set()
+    if isinstance(version.features, frozenset):
+        variant_candidates.update(version.features)
+    elif isinstance(version.features, (set, list, tuple)):
+        variant_candidates.update(str(entry) for entry in version.features if entry)
+    if isinstance(current_features, frozenset):
+        variant_candidates.update(current_features)
+    if _LURAPH_V14_3_VARIANT in variant_candidates:
+        bucket = aggregated.setdefault("vm_variants", [])
+        if _LURAPH_V14_3_VARIANT not in bucket:
+            bucket.append(_LURAPH_V14_3_VARIANT)
+
     if isinstance(version.name, str) and version.name.startswith("luraph_v14_4"):
         decoded_chunks, _, chunk_meta = _iterative_initv4_decode(
             ctx,
@@ -3017,6 +3040,22 @@ def run(ctx: "Context") -> Dict[str, Any]:
             metadata["handler_payload_meta"] = dict(payload_meta_final)
         else:
             metadata["handler_payload_meta"] = {}
+
+    variants = metadata.get("vm_variants")
+    if isinstance(variants, list):
+        unique_variants: List[str] = []
+        for entry in variants:
+            if isinstance(entry, str):
+                cleaned = entry.strip()
+                if cleaned and cleaned not in unique_variants:
+                    unique_variants.append(cleaned)
+        metadata["vm_variants"] = unique_variants
+        if unique_variants:
+            metadata.setdefault("primary_vm_variant", unique_variants[0])
+            variant_bucket = ctx.vm_metadata.setdefault("variants", [])
+            for variant in unique_variants:
+                if variant not in variant_bucket:
+                    variant_bucket.append(variant)
 
     return metadata
 

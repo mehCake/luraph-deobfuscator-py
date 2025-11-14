@@ -14,13 +14,21 @@ implementation is intentionally data driven so new handlers can be added by
 augmenting ``INSTRUCTION_SIGNATURES``.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from copy import deepcopy
 
 from src.ir import VMFunction, VMInstruction
+from src.utils_pkg import ast as lua_ast
+
+from pattern_analyzer import CacheSlot, PatternAnalyzer, SerializedChunk
+from string_decryptor import (
+    StringDecoderDescriptor,
+    detect_v14_3_string_decoder,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +40,92 @@ class InstructionSignature:
 
     fields: List[str]
     modes: Mapping[str, str]
+
+
+@dataclass
+class LoaderCall:
+    """Single helper invocation recorded while modelling the VM loader."""
+
+    helper: str
+    expression: str
+    arguments: List[str] = field(default_factory=list)
+    target: Optional[str] = None
+    context: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "helper": self.helper,
+            "expression": self.expression,
+            "arguments": list(self.arguments),
+            "target": self.target,
+            "context": self.context,
+        }
+
+
+@dataclass
+class LoaderLoop:
+    """Summary of a numeric loop involved in prototype rehydration."""
+
+    loop_var: str
+    limit_helper: Optional[str]
+    operations: List[str] = field(default_factory=list)
+    body_calls: List[LoaderCall] = field(default_factory=list)
+    nested_loops: List["LoaderLoop"] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "loop_var": self.loop_var,
+            "limit_helper": self.limit_helper,
+            "operations": list(self.operations),
+            "body_calls": [call.to_dict() for call in self.body_calls],
+            "nested_loops": [loop.to_dict() for loop in self.nested_loops],
+        }
+
+
+@dataclass
+class PrototypeLoader:
+    """High level description of how serialized VM prototypes are decoded."""
+
+    helpers: Dict[str, str]
+    loops: List[LoaderLoop]
+    extra_calls: List[LoaderCall]
+    helper_usage: Dict[str, int]
+    operations: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "helpers": dict(self.helpers),
+            "loops": [loop.to_dict() for loop in self.loops],
+            "extra_calls": [call.to_dict() for call in self.extra_calls],
+            "helper_usage": dict(self.helper_usage),
+            "operations": list(self.operations),
+        }
+
+
+@dataclass
+class BootstrapIR:
+    """Aggregated bootstrap metadata for standalone v14.3 payloads."""
+
+    cache_slots: List[CacheSlot] = field(default_factory=list)
+    c3_primitives: Optional[Dict[str, Any]] = None
+    serialized_chunk: Optional[SerializedChunk] = None
+    string_decoder: Optional[StringDecoderDescriptor] = None
+    annotations: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cache_slots": [slot.to_dict() for slot in self.cache_slots],
+            "c3_primitives": deepcopy(self.c3_primitives)
+            if self.c3_primitives is not None
+            else None,
+            "serialized_chunk": asdict(self.serialized_chunk)
+            if self.serialized_chunk is not None
+            else None,
+            "string_decoder": self.string_decoder.to_dict()
+            if self.string_decoder is not None
+            else None,
+            "annotations": deepcopy(self.annotations),
+        }
 
 
 INSTRUCTION_SIGNATURES: Dict[str, InstructionSignature] = {
@@ -102,6 +196,264 @@ INSTRUCTION_SIGNATURES: Dict[str, InstructionSignature] = {
     "SETLIST": InstructionSignature(["a", "b", "c"], {"a": "register", "b": "immediate", "c": "immediate"}),
     "CLOSE": InstructionSignature(["a"], {"a": "register"}),
 }
+
+
+_HELPER_ROLES = {
+    "o": "prototype_counter",
+    "M": "table_reader",
+    "r": "instruction_slice",
+    "t3": "double_unpacker",
+    "a3": "varint_reader",
+}
+
+
+def find_vm_loader_v14_3(ast: lua_ast.Chunk) -> Optional[PrototypeLoader]:
+    """Return a :class:`PrototypeLoader` model for standalone v14.3 payloads."""
+
+    if not isinstance(ast, lua_ast.Chunk):
+        return None
+
+    helper_usage: Dict[str, int] = {name: 0 for name in _HELPER_ROLES}
+    loops, calls, operations = _analyse_block(ast.body, helper_usage)
+
+    if not loops:
+        return None
+
+    required = {"o", "M", "r"}
+    if not required <= {name for name, count in helper_usage.items() if count}:
+        return None
+
+    helpers = {
+        role: name
+        for name, role in _HELPER_ROLES.items()
+        if helper_usage.get(name)
+    }
+
+    filtered_usage = {name: count for name, count in helper_usage.items() if count}
+
+    loader = PrototypeLoader(
+        helpers=helpers,
+        loops=loops,
+        extra_calls=calls,
+        helper_usage=filtered_usage,
+        operations=operations,
+    )
+    return loader
+
+
+def _extract_source_from_metadata(ast: lua_ast.Chunk) -> Optional[str]:
+    metadata = getattr(ast, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        return None
+    for key in ("source", "raw_source", "text", "original_text"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def build_bootstrap_ir_v14_3(ast: lua_ast.Chunk) -> Optional[BootstrapIR]:
+    """Collect bootstrap metadata for standalone v14.3 VM payloads."""
+
+    if not isinstance(ast, lua_ast.Chunk):
+        return None
+
+    source = _extract_source_from_metadata(ast)
+    if not source:
+        return None
+
+    analyzer = PatternAnalyzer()
+    serialized_chunk = analyzer.locate_serialized_chunk(source)
+    if serialized_chunk is None:
+        return None
+
+    analyzer.analyze_cache_slots(source)
+    cache_slots = list(analyzer.last_cache_slots)
+
+    c3_primitives = analyzer.identify_c3_primitives(source)
+    if c3_primitives is None:
+        return None
+
+    decoder = detect_v14_3_string_decoder(source)
+    if decoder is None:
+        return None
+
+    return BootstrapIR(
+        cache_slots=cache_slots,
+        c3_primitives=c3_primitives,
+        serialized_chunk=serialized_chunk,
+        string_decoder=decoder,
+    )
+
+
+def _analyse_block(
+    statements: Sequence[lua_ast.Stmt], helper_usage: Dict[str, int]
+) -> tuple[List[LoaderLoop], List[LoaderCall], List[str]]:
+    loops: List[LoaderLoop] = []
+    calls: List[LoaderCall] = []
+    operations: List[str] = []
+
+    for stmt in statements:
+        if isinstance(stmt, lua_ast.NumericFor):
+            loop = _summarise_loop(stmt, helper_usage)
+            if (
+                loop.limit_helper
+                or loop.body_calls
+                or loop.operations
+                or loop.nested_loops
+            ):
+                loops.append(loop)
+            continue
+
+        nested_loops, stmt_calls, stmt_ops = _analyse_stmt(stmt, helper_usage)
+        loops.extend(nested_loops)
+        calls.extend(stmt_calls)
+        operations.extend(stmt_ops)
+
+    return loops, calls, operations
+
+
+def _summarise_loop(
+    loop: lua_ast.NumericFor, helper_usage: Dict[str, int]
+) -> LoaderLoop:
+    limit_helper = _helper_from_expr(loop.stop)
+    if limit_helper and limit_helper in helper_usage:
+        helper_usage[limit_helper] += 1
+
+    nested_loops, calls, operations = _analyse_block(loop.body, helper_usage)
+
+    return LoaderLoop(
+        loop_var=loop.var,
+        limit_helper=limit_helper,
+        operations=operations,
+        body_calls=calls,
+        nested_loops=nested_loops,
+    )
+
+
+def _analyse_stmt(
+    stmt: lua_ast.Stmt, helper_usage: Dict[str, int]
+) -> tuple[List[LoaderLoop], List[LoaderCall], List[str]]:
+    nested_loops: List[LoaderLoop] = []
+    calls: List[LoaderCall] = []
+    operations: List[str] = _describe_statement(stmt)
+
+    calls.extend(_collect_direct_calls(stmt, helper_usage))
+
+    if isinstance(stmt, lua_ast.If):
+        body_loops, body_calls, body_ops = _analyse_block(stmt.body, helper_usage)
+        else_loops, else_calls, else_ops = _analyse_block(stmt.orelse, helper_usage)
+        nested_loops.extend(body_loops)
+        nested_loops.extend(else_loops)
+        calls.extend(body_calls)
+        calls.extend(else_calls)
+        operations.extend(body_ops)
+        operations.extend(else_ops)
+    elif isinstance(stmt, lua_ast.While):
+        body_loops, body_calls, body_ops = _analyse_block(stmt.body, helper_usage)
+        nested_loops.extend(body_loops)
+        calls.extend(body_calls)
+        operations.extend(body_ops)
+    elif isinstance(stmt, lua_ast.DoBlock):
+        block_loops, block_calls, block_ops = _analyse_block(stmt.body, helper_usage)
+        nested_loops.extend(block_loops)
+        calls.extend(block_calls)
+        operations.extend(block_ops)
+    elif isinstance(stmt, lua_ast.FunctionDef):
+        body_loops, body_calls, body_ops = _analyse_block(stmt.body, helper_usage)
+        nested_loops.extend(body_loops)
+        calls.extend(body_calls)
+        operations.extend(body_ops)
+
+    return nested_loops, calls, operations
+
+
+def _collect_direct_calls(stmt: lua_ast.Stmt, helper_usage: Dict[str, int]) -> List[LoaderCall]:
+    calls: List[LoaderCall] = []
+
+    if isinstance(stmt, lua_ast.Assignment):
+        prefix = "local " if stmt.is_local else ""
+        for target, value in zip(stmt.targets, stmt.values):
+            helper = _helper_from_expr(value)
+            if helper is None:
+                continue
+            if helper in helper_usage:
+                helper_usage[helper] += 1
+            target_str = lua_ast.render_expr(target)
+            expression = f"{prefix}{target_str} = {lua_ast.render_expr(value)}"
+            calls.append(
+                LoaderCall(
+                    helper=helper,
+                    expression=expression,
+                    arguments=_call_arguments(value),
+                    target=target_str,
+                    context="assignment",
+                )
+            )
+    elif isinstance(stmt, lua_ast.CallStmt):
+        helper = _helper_from_expr(stmt.call)
+        if helper is not None:
+            if helper in helper_usage:
+                helper_usage[helper] += 1
+            calls.append(
+                LoaderCall(
+                    helper=helper,
+                    expression=lua_ast.render_expr(stmt.call),
+                    arguments=[lua_ast.render_expr(arg) for arg in stmt.call.args],
+                    context="call",
+                )
+            )
+    elif isinstance(stmt, lua_ast.Return):
+        for expr in stmt.values:
+            helper = _helper_from_expr(expr)
+            if helper is None:
+                continue
+            if helper in helper_usage:
+                helper_usage[helper] += 1
+            rendered = lua_ast.render_expr(expr)
+            calls.append(
+                LoaderCall(
+                    helper=helper,
+                    expression=rendered,
+                    arguments=_call_arguments(expr),
+                    context="return",
+                )
+            )
+
+    return calls
+
+
+def _describe_statement(stmt: lua_ast.Stmt) -> List[str]:
+    if isinstance(stmt, lua_ast.Assignment):
+        prefix = "local " if stmt.is_local else ""
+        return [
+            f"{prefix}{lua_ast.render_expr(target)} = {lua_ast.render_expr(value)}"
+            for target, value in zip(stmt.targets, stmt.values)
+        ]
+    if isinstance(stmt, lua_ast.CallStmt):
+        return [lua_ast.render_expr(stmt.call)]
+    if isinstance(stmt, lua_ast.Return):
+        if not stmt.values:
+            return ["return"]
+        rendered = ", ".join(lua_ast.render_expr(expr) for expr in stmt.values)
+        return [f"return {rendered}"]
+    return []
+
+
+def _helper_from_expr(expr: lua_ast.Expr) -> Optional[str]:
+    if isinstance(expr, lua_ast.Call):
+        func = expr.func
+        if isinstance(func, lua_ast.Name):
+            ident = func.ident
+            if ident in _HELPER_ROLES:
+                return ident
+    return None
+
+
+def _call_arguments(expr: lua_ast.Expr) -> List[str]:
+    if isinstance(expr, lua_ast.Call):
+        return [lua_ast.render_expr(arg) for arg in expr.args]
+    return []
 
 
 class OpcodeLifter:
@@ -375,4 +727,12 @@ class OpcodeLifter:
                 yield value
 
 
-__all__ = ["OpcodeLifter"]
+__all__ = [
+    "OpcodeLifter",
+    "PrototypeLoader",
+    "LoaderLoop",
+    "LoaderCall",
+    "find_vm_loader_v14_3",
+    "BootstrapIR",
+    "build_bootstrap_ir_v14_3",
+]

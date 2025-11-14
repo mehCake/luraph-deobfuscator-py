@@ -12,9 +12,434 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from typing import Callable, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Sequence
 
 from lua_literal_parser import LuaTable, parse_lua_expression
+
+
+@dataclass(frozen=True)
+class StringDecoderDescriptor:
+    """Description of a detected inline string decoder."""
+
+    closure_variable: str
+    invocation: str
+    gsub_alias: str
+    metatable_alias: str
+    cache_table: str
+    token_variable: str
+    token_length: int
+    local_variable_count: int
+    caches_results: bool
+
+    def to_dict(self) -> Dict[str, object]:
+        """Return a JSON-serialisable representation of the descriptor."""
+
+        return {
+            "closure_variable": self.closure_variable,
+            "invocation": self.invocation,
+            "gsub_alias": self.gsub_alias,
+            "metatable_alias": self.metatable_alias,
+            "cache_table": self.cache_table,
+            "token_variable": self.token_variable,
+            "token_length": self.token_length,
+            "local_variable_count": self.local_variable_count,
+            "caches_results": self.caches_results,
+        }
+
+
+def detect_v14_3_string_decoder(source: str) -> Optional[StringDecoderDescriptor]:
+    """Return a descriptor for the standalone v14.3 string decoder when present."""
+
+    for match in re.finditer(r"\(function\s*\(([A-Za-z_][A-Za-z0-9_]*)\)", source):
+        closure_var = match.group(1)
+        lhs_idx = match.start() - 1
+        while lhs_idx >= 0 and source[lhs_idx].isspace():
+            lhs_idx -= 1
+        if lhs_idx < 0 or source[lhs_idx] != "=":
+            continue
+        func_start = match.start() + source[match.start():].find("function")
+        if func_start == -1:
+            continue
+        function_block = _extract_function_block(source, func_start)
+        if function_block is None:
+            continue
+        body_end, params, body = function_block
+        params = [param.strip() for param in params.split(",") if param.strip()]
+        if len(params) != 1 or params[0] != closure_var:
+            continue
+
+        invocation = _extract_invocation(source, body_end)
+        if invocation is None or not invocation:
+            continue
+
+        statements = _split_top_level_statements(body)
+        if len(statements) < 2:
+            continue
+
+        assign_call = _parse_assignment_call(statements[0])
+        if assign_call is None:
+            continue
+        target, gsub_alias, gsub_args = assign_call
+        if not target or target != closure_var:
+            continue
+        gsub_params = _split_args(gsub_args)
+        if len(gsub_params) < 3:
+            continue
+        first_arg = gsub_params[0].strip()
+        if first_arg not in {closure_var, target}:
+            continue
+        if not _is_string_literal(gsub_params[1]):
+            continue
+
+        return_call = _parse_return_call(statements[1])
+        if return_call is None:
+            continue
+        return_alias, return_args = return_call
+        if return_alias != gsub_alias:
+            continue
+        return_params = _split_args(return_args)
+        if len(return_params) < 3:
+            continue
+        if return_params[0].strip() not in {closure_var, target}:
+            continue
+
+        metatable_expr = return_params[2].strip()
+        metatable_call = _parse_call_expression(metatable_expr)
+        if metatable_call is None:
+            continue
+        metatable_alias, metatable_args = metatable_call
+        mt_params = _split_args(metatable_args)
+        if len(mt_params) != 2:
+            continue
+        if mt_params[0].strip().replace(" ", "") != "{}":
+            continue
+        table_expr = mt_params[1].strip()
+        index_descriptor = _parse_metatable_index(table_expr)
+        if index_descriptor is None:
+            continue
+
+        cache_table, token_var, local_count, token_length, caches_results = index_descriptor
+        descriptor = StringDecoderDescriptor(
+            closure_variable=closure_var,
+            invocation=invocation,
+            gsub_alias=gsub_alias,
+            metatable_alias=metatable_alias,
+            cache_table=cache_table,
+            token_variable=token_var,
+            token_length=token_length,
+            local_variable_count=local_count,
+            caches_results=caches_results,
+        )
+        return descriptor
+
+    return None
+
+
+def _extract_function_block(
+    text: str, start: int
+) -> Optional[tuple[int, str, str]]:
+    if not text.startswith("function", start):
+        return None
+    pos = start + len("function")
+    pos = _skip_ws(text, pos)
+    if pos >= len(text) or text[pos] != "(":
+        return None
+    param_end = _find_matching_paren(text, pos)
+    if param_end is None:
+        return None
+    params = text[pos + 1 : param_end]
+    body_start = param_end + 1
+    depth = 1
+    i = body_start
+    while i < len(text):
+        ch = text[i]
+        if ch in "'\"":
+            i = _skip_string_literal(text, i)
+            continue
+        if text.startswith("--", i):
+            i = _skip_comment(text, i)
+            continue
+        if _is_keyword(text, i, "function"):
+            depth += 1
+            i += len("function")
+            continue
+        if _is_keyword(text, i, "end"):
+            depth -= 1
+            end_pos = i
+            i += len("end")
+            if depth == 0:
+                body = text[body_start:end_pos]
+                return i, params, body
+            continue
+        i += 1
+    return None
+
+
+def _extract_invocation(text: str, end_pos: int) -> Optional[str]:
+    pos = _skip_ws(text, end_pos)
+    if pos < len(text) and text[pos] == ")":
+        pos = _skip_ws(text, pos + 1)
+    if pos >= len(text) or text[pos] != "(":
+        return None
+    close = _find_matching_paren(text, pos)
+    if close is None:
+        return None
+    invocation = text[pos + 1 : close].strip()
+    return invocation
+
+
+def _split_top_level_statements(body: str) -> List[str]:
+    statements: List[str] = []
+    start = 0
+    paren = brace = bracket = func_depth = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in "'\"":
+            i = _skip_string_literal(body, i)
+            continue
+        if body.startswith("--", i):
+            i = _skip_comment(body, i)
+            continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren -= 1
+        elif ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace -= 1
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket -= 1
+        elif _is_keyword(body, i, "function"):
+            func_depth += 1
+            i += len("function")
+            continue
+        elif _is_keyword(body, i, "end"):
+            func_depth = max(func_depth - 1, 0)
+            i += len("end")
+            continue
+        if (
+            ch == ";"
+            and paren == 0
+            and brace == 0
+            and bracket == 0
+            and func_depth == 0
+        ):
+            segment = body[start:i].strip()
+            if segment:
+                statements.append(segment)
+            start = i + 1
+        i += 1
+    tail = body[start:].strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _parse_assignment_call(statement: str) -> Optional[tuple[str, str, str]]:
+    stmt = statement.strip()
+    if stmt.startswith("local "):
+        stmt = stmt[6:].strip()
+    if "=" not in stmt:
+        return None
+    lhs, rhs = stmt.split("=", 1)
+    target = lhs.strip()
+    call = _parse_call_expression(rhs.strip())
+    if call is None:
+        return None
+    name, args = call
+    return target, name, args
+
+
+def _parse_return_call(statement: str) -> Optional[tuple[str, str]]:
+    stmt = statement.strip()
+    if not stmt.startswith("return"):
+        return None
+    expr = stmt[len("return") :].strip()
+    call = _parse_call_expression(expr)
+    if call is None:
+        return None
+    return call
+
+
+def _parse_call_expression(expr: str) -> Optional[tuple[str, str]]:
+    stripped = expr.strip()
+    if not stripped:
+        return None
+    idx = 0
+    length = len(stripped)
+    while idx < length and _is_identifier_char(stripped[idx]):
+        idx += 1
+    if idx == 0:
+        return None
+    name = stripped[:idx]
+    idx = _skip_ws(stripped, idx)
+    if idx >= length or stripped[idx] != "(":
+        return None
+    close = _find_matching_paren(stripped, idx)
+    if close is None:
+        return None
+    args = stripped[idx + 1 : close]
+    remainder = stripped[close + 1 :].strip()
+    if remainder:
+        return None
+    return name, args
+
+
+def _parse_metatable_index(
+    expr: str,
+) -> Optional[tuple[str, str, int, int, bool]]:
+    match = re.search(r"__index\s*=\s*function", expr)
+    if not match:
+        return None
+    func_start = match.start()
+    func_pos = expr.find("function", func_start)
+    if func_pos == -1:
+        return None
+    block = _extract_function_block(expr, func_pos)
+    if block is None:
+        return None
+    _, params, body = block
+    param_list = [param.strip() for param in params.split(",") if param.strip()]
+    if len(param_list) != 2:
+        return None
+    cache_table, token_param = param_list
+    local_match = re.search(
+        r"local\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)",
+        body,
+    )
+    if not local_match:
+        return None
+    local_vars = [part.strip() for part in local_match.group(1).split(",") if part.strip()]
+    local_count = len(local_vars)
+    args_str = local_match.group(3)
+    args = _split_args(args_str)
+    if len(args) < 2:
+        return None
+    if args[0].strip() != token_param:
+        return None
+    token_length = _parse_int_literal(args[-1])
+    if token_length is None:
+        return None
+    if token_length != 5:
+        return None
+    if local_count < 5:
+        return None
+    cache_pattern = rf"\b{re.escape(cache_table)}\s*\[\s*{re.escape(token_param)}\s*\]"
+    caches_results = bool(re.search(cache_pattern + r"\s*=", body))
+    return cache_table, token_param, local_count, token_length, caches_results
+
+
+def _is_string_literal(expr: str) -> bool:
+    stripped = expr.strip()
+    return bool(stripped) and stripped[0] in {'"', "'"} and stripped[-1] == stripped[0]
+
+
+def _parse_int_literal(text: str) -> Optional[int]:
+    candidate = text.strip().lower().replace("_", "")
+    if not candidate:
+        return None
+    sign = 1
+    if candidate.startswith("-"):
+        sign = -1
+        candidate = candidate[1:]
+    base = 10
+    if candidate.startswith("0x"):
+        base = 16
+        digits = candidate[2:]
+    elif candidate.startswith("0b"):
+        base = 2
+        digits = candidate[2:]
+    elif candidate.startswith("0o"):
+        base = 8
+        digits = candidate[2:]
+    else:
+        digits = candidate
+    if not digits:
+        return None
+    try:
+        return sign * int(digits, base)
+    except ValueError:
+        return None
+
+
+def _skip_ws(text: str, pos: int) -> int:
+    length = len(text)
+    while pos < length:
+        ch = text[pos]
+        if ch in " \t\r\n":
+            pos += 1
+            continue
+        if text.startswith("--", pos):
+            pos = _skip_comment(text, pos)
+            continue
+        break
+    return pos
+
+
+def _skip_comment(text: str, pos: int) -> int:
+    pos += 2
+    while pos < len(text) and text[pos] not in "\r\n":
+        pos += 1
+    return pos
+
+
+def _find_matching_paren(text: str, start: int) -> Optional[int]:
+    if start >= len(text) or text[start] != "(":
+        return None
+    depth = 1
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if ch in "'\"":
+            i = _skip_string_literal(text, i)
+            continue
+        if text.startswith("--", i):
+            i = _skip_comment(text, i)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _skip_string_literal(text: str, start: int) -> int:
+    quote = text[start]
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _is_identifier_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _is_keyword(text: str, pos: int, keyword: str) -> bool:
+    if not text.startswith(keyword, pos):
+        return False
+    before = text[pos - 1] if pos > 0 else ""
+    after_pos = pos + len(keyword)
+    after = text[after_pos] if after_pos < len(text) else ""
+    if before and _is_identifier_char(before):
+        return False
+    if after and _is_identifier_char(after):
+        return False
+    return True
 
 
 def _looks_printable(value: str) -> bool:
@@ -383,5 +808,5 @@ class StringDecryptor:
         return pattern.sub(repl, code)
 
 
-__all__ = ["StringDecryptor"]
+__all__ = ["StringDecryptor", "StringDecoderDescriptor", "detect_v14_3_string_decoder"]
 

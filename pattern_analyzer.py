@@ -13,7 +13,7 @@ import re
 from html import escape
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Mapping, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Mapping, Union, Callable
 
 from copy import deepcopy
 
@@ -57,6 +57,63 @@ class OptimizationReport:
     concatenation_simplifications: int = 0
     eliminated_jumps: int = 0
 
+
+@dataclass
+class SerializedChunk:
+    """Descriptor for the serialized bytecode blob embedded in a payload."""
+
+    buffer_name: str
+    initial_offset: int
+    helper_functions: Dict[str, str]
+
+
+@dataclass
+class BootstrapTransition:
+    """Directed edge in the numeric ``x`` state machine."""
+
+    expression: str
+    target: Optional[int] = None
+
+
+@dataclass
+class BootstrapState:
+    """Single state discovered inside the bootstrap dispatcher."""
+
+    state_id: str
+    state_numeric: Optional[int]
+    operations: List[str]
+    transitions: List[BootstrapTransition]
+
+
+@dataclass
+class BootstrapStateMachine:
+    """Model of the numeric dispatcher used during bootstrap."""
+
+    variable: str
+    states: List[BootstrapState]
+
+
+@dataclass
+class CacheSlot:
+    """Summary of writes to a ``F3[slot]`` cache entry."""
+
+    index_literal: str
+    index_value: Optional[int]
+    expressions: List[str]
+    classification: str
+    semantic_role: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable representation of the cache slot."""
+
+        return {
+            "index_literal": self.index_literal,
+            "index_value": self.index_value,
+            "expressions": list(self.expressions),
+            "classification": self.classification,
+            "semantic_role": self.semantic_role,
+        }
+
 class PatternAnalyzer:
     """
     Advanced opcode pattern analyzer for detecting custom opcode sequences
@@ -76,6 +133,10 @@ class PatternAnalyzer:
         self.last_cfg: Optional[CFG] = None
         self.last_dfg: Optional[DFG] = None
         self.last_report: Optional[OptimizationReport] = None
+        self.last_cache_slots: List[CacheSlot] = []
+
+        # Structured metadata suitable for serialisation alongside reports.
+        self.side_band: Dict[str, Any] = {}
 
         self._branch_ops = {
             "JMPIF",
@@ -105,6 +166,12 @@ class PatternAnalyzer:
             "SHL",
             "SHR",
         }
+
+        self._state_branch_pattern = re.compile(
+            r"\bif\s+x==\s*([0-9A-Za-z_]+)\s*then",
+            re.IGNORECASE,
+        )
+        self._assignment_pattern = re.compile(r"([A-Za-z0-9_().\[\]]+)\s*=\s*")
     
     def _initialize_patterns(self):
         """Initialize known opcode patterns and their meanings."""
@@ -306,7 +373,7 @@ class PatternAnalyzer:
     def detect_encryption_patterns(self, content: str) -> List[Dict[str, Any]]:
         """Detect potential encryption/decryption patterns."""
         patterns = []
-        
+
         # XOR patterns
         xor_patterns = [
             r'(\w+)\s*=\s*(\w+)\s*\^\s*(\w+)',
@@ -339,8 +406,663 @@ class PatternAnalyzer:
                     'pattern': match.group(0),
                     'position': match.start()
                 })
-        
+
         return patterns
+
+    def locate_serialized_chunk(self, source: str) -> Optional[SerializedChunk]:
+        """Locate the serialized bytecode blob in ``source`` if recognised."""
+
+        chunk = self.locate_serialized_chunk_v14_3(source)
+        if chunk is not None:
+            return chunk
+        return None
+
+    def detect_bootstrap_state_machine(
+        self, source: str
+    ) -> Optional[BootstrapStateMachine]:
+        """Return a model of the numeric bootstrap dispatcher when recognised."""
+
+        machine = self._detect_bootstrap_state_machine_v14_3(source)
+        if machine is not None and machine.states:
+            return machine
+        return None
+
+    def analyze_cache_slots(self, source: str) -> Dict[str, Any]:
+        """Summarise writes to ``F3[...]`` cache slots and classify their roles."""
+
+        slots = self._collect_cache_slots(source)
+        self.last_cache_slots = slots
+
+        payload = {
+            "slots": [slot.to_dict() for slot in slots],
+            "slot_count": len(slots),
+        }
+
+        self.side_band["cache_slots"] = payload
+        return payload
+
+    def identify_c3_primitives(self, source: str) -> Optional[Dict[str, Any]]:
+        """Identify the ``C3`` primitive table in known payloads."""
+
+        payload = self._identify_c3_primitive_table_v14_3(source)
+        if payload is None:
+            return None
+
+        self.side_band["c3_primitives"] = payload
+        return payload
+
+    def _collect_cache_slots(self, source: str) -> List[CacheSlot]:
+        assignment_pattern = re.compile(
+            r"F3\[(?P<index>[^\]]+)\]\s*=\s*(?P<expr>[^;]+)",
+            re.IGNORECASE,
+        )
+
+        entries: Dict[str, Dict[str, Any]] = {}
+
+        for match in assignment_pattern.finditer(source):
+            index_literal = self._normalise_expression(match.group("index"))
+            expression = self._cleanup_cache_expression(match.group("expr"))
+
+            classification = self._classify_cache_expression(expression)
+
+            entry = entries.setdefault(
+                index_literal,
+                {
+                    "index_literal": index_literal,
+                    "index_value": self._try_parse_numeric_literal(index_literal),
+                    "expressions": [],
+                    "classification_counts": Counter(),
+                    "samples": {},
+                },
+            )
+
+            entry["expressions"].append(expression)
+            entry["classification_counts"][classification] += 1
+            entry["samples"].setdefault(classification, expression)
+
+        slots: List[CacheSlot] = []
+        for entry in entries.values():
+            expressions = entry["expressions"]
+            if not expressions:
+                continue
+
+            classification_counts: Counter = entry["classification_counts"]
+            classification = (
+                classification_counts.most_common(1)[0][0]
+                if classification_counts
+                else "unknown"
+            )
+            sample = entry["samples"].get(classification, expressions[0])
+
+            semantic_role = self._guess_cache_slot_role(
+                entry["index_value"], sample, classification
+            )
+
+            slots.append(
+                CacheSlot(
+                    index_literal=entry["index_literal"],
+                    index_value=entry["index_value"],
+                    expressions=expressions,
+                    classification=classification,
+                    semantic_role=semantic_role,
+                )
+            )
+
+        slots.sort(
+            key=lambda slot: (
+                slot.index_value if slot.index_value is not None else float("inf"),
+                slot.index_literal,
+            )
+        )
+
+        return slots
+
+    def _cleanup_cache_expression(self, expression: str) -> str:
+        token = expression.strip()
+        while token and token[0] == "=":
+            token = token[1:].lstrip()
+
+        token = re.sub(r"\bthen\s*$", "", token, flags=re.IGNORECASE)
+        token = re.sub(r"\bend\s*$", "", token, flags=re.IGNORECASE)
+
+        return self._normalise_expression(token)
+
+    def _classify_cache_expression(self, expression: str) -> str:
+        if not expression:
+            return "unknown"
+
+        if self._try_parse_numeric_literal(expression) is not None:
+            return "constant"
+
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expression):
+            return "passthrough"
+
+        lowered = expression.lower()
+        has_bitwise = bool(re.search(r"bit32\.|bit\.b", lowered))
+        has_table_ref = "f3[" in lowered or "F3[" in expression
+        has_helper = bool(re.search(r"\bC3\.", expression))
+        has_arithmetic = bool(re.search(r"[+\-*/%^]", expression))
+
+        if has_bitwise:
+            return "bitwise"
+        if has_arithmetic or has_helper:
+            return "arithmetic combo"
+        if has_table_ref:
+            return "table reference"
+        if "(" in expression and ")" in expression:
+            return "function"
+
+        return "computed"
+
+    def _guess_cache_slot_role(
+        self, index_value: Optional[int], expression: str, classification: str
+    ) -> str:
+        lowered = expression.lower()
+        numeric_tokens = re.findall(r"0[xX][0-9A-Fa-f_]+|0[bB][01_]+|\d+", expression)
+        numeric_values: List[int] = []
+        for token in numeric_tokens:
+            try:
+                numeric_values.append(self._parse_numeric_literal(token))
+            except ValueError:
+                continue
+
+        max_value = max((abs(value) for value in numeric_values), default=0)
+
+        if any(
+            marker in lowered
+            for marker in {"9007199254740992", "0x20000000000000", "0x1fffffffffffff"}
+        ):
+            return "double mantissa mask"
+
+        if "C3.T(" in expression and "C3.o(" in expression:
+            return "double mantissa mask"
+
+        if any(token in lowered for token in {"string.len", "string.byte", "string.sub"}):
+            return "string length limit"
+
+        if re.search(r"C3\.(?:a|b|s|z)\(", expression):
+            if any(value >= 0x7F for value in numeric_values):
+                return "string length limit"
+
+        if any(value in {0x7F, 0xFF, 0x100} for value in numeric_values):
+            return "string length limit"
+
+        if classification == "constant":
+            if max_value >= 0x1000:
+                return "threshold value"
+            return "literal constant"
+
+        if classification == "arithmetic combo":
+            if max_value >= 0x1000:
+                return "threshold value"
+            if any(value >= 0x100 for value in numeric_values):
+                return "scaled parameter"
+            return "derived value"
+
+        if classification == "bitwise":
+            return "bitmask"
+
+        if classification == "table reference":
+            return "lookup table reference"
+
+        if classification == "passthrough":
+            return "state passthrough"
+
+        return "unknown"
+
+    def _identify_c3_primitive_table_v14_3(
+        self, source: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return ordered mapping for the standalone v14.3 ``C3`` primitives."""
+
+        if "protected using Luraph Obfuscator v14.3" not in source:
+            return None
+
+        table_pattern = re.compile(
+            r"\{[^{}]*string\.unpack[^{}]*bit32\.[^{}]*table\.[^{}]*\}",
+            re.DOTALL,
+        )
+
+        for match in table_pattern.finditer(source):
+            literal = match.group(0)
+            entries = self._parse_c3_primitive_entries(literal)
+            if not entries:
+                continue
+
+            modules = {entry["module"] for entry in entries}
+            if not {"bit32", "string"} <= modules:
+                continue
+            if "table" not in modules:
+                continue
+
+            payload = {
+                "count": len(entries),
+                "entries": entries,
+                "modules": sorted(modules),
+            }
+            return payload
+
+        return None
+
+    def _parse_c3_primitive_entries(self, literal: str) -> List[Dict[str, Any]]:
+        literal = literal.strip()
+        if not literal.startswith("{") or not literal.endswith("}"):
+            return []
+
+        body = literal[1:-1]
+        fields = self._split_table_fields(body)
+
+        entries: List[Dict[str, Any]] = []
+
+        for field in fields:
+            if "=" not in field:
+                continue
+
+            key_part, value_part = field.split("=", 1)
+            key_part = key_part.strip()
+            value_part = value_part.strip()
+
+            if not key_part or not value_part:
+                continue
+
+            if not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", value_part
+            ):
+                continue
+
+            module, symbol = value_part.split(".", 1)
+
+            slot_type = "key"
+            slot_literal = key_part
+            slot_value = key_part
+            accessor: str
+            entry: Dict[str, Any]
+
+            if key_part.startswith("[") and key_part.endswith("]"):
+                slot_type = "index"
+                slot_value = key_part[1:-1].strip()
+                accessor = f"C3[{slot_value}]" if slot_value else "C3[]"
+                index_value = self._try_parse_numeric_literal(slot_value)
+                entry = {
+                    "slot": slot_value,
+                    "slot_literal": slot_literal,
+                    "slot_type": slot_type,
+                    "accessor": accessor,
+                    "builtin": value_part,
+                    "module": module,
+                    "symbol": symbol,
+                }
+                if index_value is not None:
+                    entry["index_value"] = index_value
+            else:
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_part):
+                    continue
+                accessor = f"C3.{key_part}"
+                entry = {
+                    "slot": key_part,
+                    "slot_literal": slot_literal,
+                    "slot_type": slot_type,
+                    "accessor": accessor,
+                    "builtin": value_part,
+                    "module": module,
+                    "symbol": symbol,
+                }
+
+            entry["position"] = len(entries)
+            entries.append(entry)
+
+        return entries
+
+    def _split_table_fields(self, body: str) -> List[str]:
+        fields: List[str] = []
+        token: List[str] = []
+        depth = 0
+        in_string = False
+        escape = False
+        quote_char = ""
+
+        for ch in body:
+            if in_string:
+                token.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote_char:
+                    in_string = False
+                continue
+
+            if ch in {'"', "'"}:
+                in_string = True
+                quote_char = ch
+                token.append(ch)
+            elif ch in "([{":
+                depth += 1
+                token.append(ch)
+            elif ch in ")]}":
+                depth = max(0, depth - 1)
+                token.append(ch)
+            elif ch == "," and depth == 0:
+                field = "".join(token).strip()
+                if field:
+                    fields.append(field)
+                token = []
+            else:
+                token.append(ch)
+
+        tail = "".join(token).strip()
+        if tail:
+            fields.append(tail)
+
+        return fields
+
+    def locate_serialized_chunk_v14_3(self, source: str) -> Optional[SerializedChunk]:
+        """Return metadata for the standalone Luraph v14.3 VM serializer."""
+
+        if "9007199254740992" not in source:
+            return None
+
+        state_match = re.search(
+            r"local\s+[A-Za-z0-9_,]+\s*=\s*\(9007199254740992\)", source
+        )
+        if not state_match:
+            return None
+
+        region_start = max(0, state_match.start() - 1024)
+        region_end = min(len(source), state_match.end() + 4096)
+        region = source[region_start:region_end]
+
+        format_call_pattern = re.compile(
+            r"I\(\s*(['\"])((?:\\.|(?!\1).)+)\1\s*,\s*([A-Za-z0-9_]+)\s*,\s*t"
+        )
+
+        def match_format(body: str, predicate: Callable[[str], bool]) -> Optional[str]:
+            for fmt_match in format_call_pattern.finditer(body):
+                fmt = fmt_match.group(2)
+                if predicate(fmt):
+                    return fmt_match.group(3)
+            return None
+
+        header_match = re.search(
+            r"\bo\s*=\s*\(function\(\)(?P<body>.*?)end\)", region, re.DOTALL
+        )
+        if not header_match:
+            return None
+        header_body = header_match.group("body")
+        buffer_name = match_format(header_body, lambda fmt: "<I\\52" in fmt)
+        if not buffer_name:
+            return None
+
+        double_match = re.search(
+            r"\bt3\s*=\s*function\(\)(?P<body>.*?)end;", region, re.DOTALL
+        )
+        if not double_match:
+            return None
+        double_body = double_match.group("body")
+        double_buffer = match_format(
+            double_body, lambda fmt: "\\z" in fmt and "\\56" in fmt
+        )
+        if double_buffer != buffer_name:
+            return None
+
+        varint_match = re.search(
+            r"\ba3\s*=\s*\(function\(\)(?P<body>.*?)end\)", region, re.DOTALL
+        )
+        if not varint_match:
+            return None
+        varint_body = varint_match.group("body")
+        if not re.search(
+            rf"b\(\s*{re.escape(buffer_name)}\s*,\s*t\s*,\s*t\s*\)", varint_body
+        ):
+            return None
+        if "0X7F" not in varint_body.upper():
+            return None
+
+        table_match = re.search(
+            r"\bM\s*=\s*\(function\(\)(?P<body>.*?)end\)", region, re.DOTALL
+        )
+        if not table_match:
+            return None
+        table_body = table_match.group("body")
+        table_buffer = match_format(table_body, lambda fmt: "<\\d" in fmt)
+        if table_buffer != buffer_name:
+            return None
+
+        slice_match = re.search(
+            r"\br\s*=\s*\(function\(\)(?P<body>.*?)end\)", region, re.DOTALL
+        )
+        if not slice_match:
+            return None
+        slice_body = slice_match.group("body")
+        if not re.search(
+            rf"N\(\s*{re.escape(buffer_name)}\s*,\s*t-Y\s*,\s*t-0[Xx]0*1\s*\)",
+            slice_body,
+        ):
+            return None
+
+        offset_match = re.search(
+            r"\bt\s*=\s*(0[Xx][0-9A-Fa-f_]+|0[Bb][01_]+|\d+)\s*;", source
+        )
+        if not offset_match:
+            return None
+
+        offset_literal = offset_match.group(1)
+        initial_offset = self._parse_numeric_literal(offset_literal)
+
+        helpers = {
+            "o": "o",
+            "t3": "t3",
+            "a3": "a3",
+            "M": "M",
+            "r": "r",
+        }
+
+        return SerializedChunk(
+            buffer_name=buffer_name,
+            initial_offset=initial_offset,
+            helper_functions=helpers,
+        )
+
+    def _detect_bootstrap_state_machine_v14_3(
+        self, source: str
+    ) -> Optional[BootstrapStateMachine]:
+        if "protected using Luraph Obfuscator v14.3" not in source:
+            return None
+
+        if "if x==" not in source:
+            return None
+
+        states: List[BootstrapState] = []
+        search_pos = 0
+
+        while True:
+            branch_match = self._state_branch_pattern.search(source, search_pos)
+            if not branch_match:
+                break
+
+            state_literal = branch_match.group(1)
+            body, branch_end = self._extract_branch_body(source, branch_match.end())
+            if body is None:
+                search_pos = branch_match.end()
+                continue
+
+            operations, transitions = self._summarise_state_body(body)
+            state_numeric = self._try_parse_numeric_literal(state_literal)
+
+            states.append(
+                BootstrapState(
+                    state_id=state_literal,
+                    state_numeric=state_numeric,
+                    operations=operations,
+                    transitions=transitions,
+                )
+            )
+            search_pos = branch_end
+
+        if len(states) < 2:
+            return None
+
+        return BootstrapStateMachine(variable="x", states=states)
+
+    def _extract_branch_body(
+        self, source: str, start_index: int
+    ) -> Tuple[Optional[str], int]:
+        body_start = start_index
+
+        keyword_pattern = re.compile(
+            r"\b(if|elseif|else|end|function|while|for|repeat|until|do)\b",
+            re.IGNORECASE,
+        )
+
+        stack: List[str] = []
+        position = body_start
+
+        while True:
+            keyword_match = keyword_pattern.search(source, position)
+            if keyword_match is None:
+                return None, position
+
+            token = keyword_match.group(1).lower()
+
+            if token in {"if", "function", "while", "for", "do"}:
+                stack.append("end")
+                position = keyword_match.end()
+                continue
+
+            if token == "repeat":
+                stack.append("until")
+                position = keyword_match.end()
+                continue
+
+            if token in {"elseif", "else"} and not stack:
+                body_end = keyword_match.start()
+                return source[body_start:body_end], keyword_match.start()
+
+            if token == "end":
+                if stack:
+                    stack.pop()
+                    position = keyword_match.end()
+                    continue
+                body_end = keyword_match.start()
+                return source[body_start:body_end], keyword_match.end()
+
+            if token == "until":
+                if stack and stack[-1] == "until":
+                    stack.pop()
+                    position = keyword_match.end()
+                    continue
+                if not stack:
+                    body_end = keyword_match.start()
+                    return source[body_start:body_end], keyword_match.end()
+
+            position = keyword_match.end()
+
+    def _summarise_state_body(
+        self, body: str
+    ) -> Tuple[List[str], List[BootstrapTransition]]:
+        operations: List[str] = []
+        transitions: List[BootstrapTransition] = []
+
+        statements = [stmt.strip() for stmt in body.split(";") if stmt.strip()]
+
+        for statement in statements:
+            if statement in {"end", "else", "elseif"}:
+                continue
+
+            lower = statement.lower()
+            if lower in {"continue", "break"}:
+                transitions.append(BootstrapTransition(expression=statement))
+                continue
+
+            assignments = self._extract_assignments_from_statement(statement)
+            if not assignments:
+                operations.append(statement)
+                continue
+
+            for lhs, rhs in assignments:
+                rhs = self._normalise_expression(rhs)
+                if lhs == "x":
+                    transitions.append(
+                        BootstrapTransition(
+                            expression=rhs,
+                            target=self._try_parse_numeric_literal(rhs),
+                        )
+                    )
+                else:
+                    operations.append(f"{lhs}={rhs}")
+
+        return operations, transitions
+
+    def _extract_assignments_from_statement(
+        self, statement: str
+    ) -> List[Tuple[str, str]]:
+        assignments: List[Tuple[str, str]] = []
+        position = 0
+        while True:
+            match = self._assignment_pattern.search(statement, position)
+            if not match:
+                break
+
+            lhs = match.group(1).strip()
+            rhs_start = match.end()
+            next_match = self._assignment_pattern.search(statement, rhs_start)
+            if next_match:
+                rhs = statement[rhs_start:next_match.start()].strip()
+                position = next_match.start()
+            else:
+                rhs = statement[rhs_start:].strip()
+                position = len(statement)
+
+            if "==" in rhs or lhs.endswith("=="):
+                continue
+
+            assignments.append((lhs, rhs))
+
+        return assignments
+
+    def _try_parse_numeric_literal(self, literal: str) -> Optional[int]:
+        token = self._normalise_expression(literal)
+
+        if not token:
+            return None
+
+        numeric_pattern = re.compile(
+            r"^[+-]?(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|\d+)$"
+        )
+        if numeric_pattern.match(token):
+            try:
+                return self._parse_numeric_literal(token)
+            except ValueError:
+                return None
+
+        return None
+
+    def _normalise_expression(self, expression: str) -> str:
+        token = expression.strip()
+        while token.startswith("(") and token.endswith(")"):
+            depth = 0
+            balanced = True
+            for index, ch in enumerate(token):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and index != len(token) - 1:
+                        balanced = False
+                        break
+            if balanced and depth == 0:
+                token = token[1:-1].strip()
+            else:
+                break
+        return token
+
+    @staticmethod
+    def _parse_numeric_literal(literal: str) -> int:
+        token = literal.replace("_", "")
+        try:
+            return int(token, 0)
+        except ValueError:
+            return int(token, 10)
 
     def generate_upcode_table(
         self,
