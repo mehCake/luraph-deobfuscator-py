@@ -29,8 +29,11 @@ metadata and does NOT guess.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union, List, Mapping
+
+import re
+from collections import Counter, defaultdict
 
 Number = Union[int, float]
 
@@ -117,6 +120,11 @@ class CacheSlotInfo:
     simplified_value: Optional[Number] = None
     dependencies: Set[int] = field(default_factory=set)
     notes: str = ""
+    used_in_string_decoder: bool = False
+    used_in_serialized_data: bool = False
+    used_in_vm_core: bool = False
+    rarely_referenced: bool = False
+    reference_contexts: Dict[str, int] = field(default_factory=dict)
 
     def record_expression(self, expr: Expression) -> None:
         """
@@ -139,6 +147,11 @@ class CacheSlotInfo:
             "simplified_value": self.simplified_value,
             "dependencies": sorted(self.dependencies),
             "notes": self.notes,
+            "used_in_string_decoder": self.used_in_string_decoder,
+            "used_in_serialized_data": self.used_in_serialized_data,
+            "used_in_vm_core": self.used_in_vm_core,
+            "rarely_referenced": self.rarely_referenced,
+            "reference_contexts": dict(self.reference_contexts),
         }
 
 
@@ -431,3 +444,327 @@ def build_slot_info_from_assignments(
         info.record_expression(expr)
 
     return slots
+
+
+# ---------------------------------------------------------------------------
+# Runtime annotation pass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RuntimeIRAnnotationSummary:
+    """Summary information produced by :class:`RuntimeIRAnnotationPass`."""
+
+    constant_cache_label: Optional[str]
+    constant_cache_slot_count: int
+    primitive_table_label: Optional[str]
+    primitive_table_entry_count: Optional[int]
+    control_state_machine: Optional[str]
+    slot_usage: Dict[int, Dict[str, Any]]
+
+
+class RuntimeIRAnnotationPass:
+    """Annotate runtime structures discovered during bootstrap lifting."""
+
+    _DEFAULT_CACHE_NAME = "F3"
+    _RARE_KEYWORDS = {
+        "fallback",
+        "rare",
+        "panic",
+        "error",
+        "guard",
+        "debug",
+        "unused",
+        "telemetry",
+        "assert",
+        "fail",
+        "trap",
+    }
+
+    def run(self, bootstrap: Any, vm_entry: Any) -> RuntimeIRAnnotationSummary:
+        runtime_annotations = self._ensure_runtime_container(bootstrap)
+        constant_cache_info = self._annotate_constant_cache(runtime_annotations, bootstrap, vm_entry)
+        primitive_info = self._annotate_primitive_table(runtime_annotations, bootstrap)
+        control_variable = self._annotate_control_state(runtime_annotations, vm_entry)
+
+        slot_usage = constant_cache_info.get("slot_usage", {})
+        summary_slot_usage = {
+            index: {
+                "notes": info.notes,
+                "used_in_string_decoder": info.used_in_string_decoder,
+                "used_in_serialized_data": info.used_in_serialized_data,
+                "used_in_vm_core": info.used_in_vm_core,
+                "rarely_referenced": info.rarely_referenced,
+                "reference_contexts": dict(info.reference_contexts),
+            }
+            for index, info in slot_usage.items()
+        }
+
+        return RuntimeIRAnnotationSummary(
+            constant_cache_label=constant_cache_info.get("label"),
+            constant_cache_slot_count=constant_cache_info.get("slot_count", 0),
+            primitive_table_label=primitive_info.get("label"),
+            primitive_table_entry_count=primitive_info.get("entry_count"),
+            control_state_machine=control_variable,
+            slot_usage=summary_slot_usage,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_runtime_container(self, bootstrap: Any) -> Dict[str, Any]:
+        annotations = getattr(bootstrap, "annotations", None)
+        if not isinstance(annotations, dict):
+            annotations = {}
+            setattr(bootstrap, "annotations", annotations)
+        runtime = annotations.setdefault("runtime", {})
+        return runtime
+
+    def _annotate_constant_cache(
+        self,
+        runtime_annotations: Dict[str, Any],
+        bootstrap: Any,
+        vm_entry: Any,
+    ) -> Dict[str, Any]:
+        slots_info = self._analyse_slot_usage(bootstrap, vm_entry)
+        slot_usage_payload = {
+            str(index): info.to_debug_dict()
+            for index, info in sorted(slots_info.items())
+        }
+
+        slot_count = len(getattr(bootstrap, "cache_slots", []) or [])
+        payload = {
+            "label": "constant cache",
+            "slot_count": slot_count,
+            "slot_usage": slots_info,
+            "slot_usage_payload": slot_usage_payload,
+            "rare_slots": [index for index, info in slots_info.items() if info.rarely_referenced],
+        }
+
+        runtime_annotations["constant_cache"] = {
+            "label": payload["label"],
+            "slot_count": payload["slot_count"],
+            "slot_usage": slot_usage_payload,
+            "rare_slots": payload["rare_slots"],
+        }
+
+        return payload
+
+    def _annotate_primitive_table(
+        self, runtime_annotations: Dict[str, Any], bootstrap: Any
+    ) -> Dict[str, Any]:
+        primitives = getattr(bootstrap, "c3_primitives", None)
+        entry_count: Optional[int]
+        if isinstance(primitives, Mapping):
+            entry_count = primitives.get("count")
+            if entry_count is None:
+                entries = primitives.get("entries")
+                if isinstance(entries, (list, tuple, set)):
+                    entry_count = len(entries)
+        else:
+            entry_count = None
+
+        payload = {
+            "label": "primitive operations table",
+            "entry_count": entry_count,
+        }
+
+        runtime_annotations["primitive_operations"] = {
+            "label": payload["label"],
+            "entry_count": payload["entry_count"],
+        }
+        return payload
+
+    def _annotate_control_state(self, runtime_annotations: Dict[str, Any], vm_entry: Any) -> Optional[str]:
+        entry_annotations = getattr(vm_entry, "annotations", None)
+        if not isinstance(entry_annotations, dict):
+            entry_annotations = {}
+            setattr(vm_entry, "annotations", entry_annotations)
+        runtime_entry = entry_annotations.setdefault("runtime", {})
+
+        control_var = self._extract_control_variable(vm_entry)
+        runtime_entry["control_state_machine"] = {"variable": control_var}
+        return control_var
+
+    def _extract_control_variable(self, vm_entry: Any) -> Optional[str]:
+        if isinstance(getattr(vm_entry, "control_variable", None), str):
+            return vm_entry.control_variable
+
+        captures = getattr(vm_entry, "captures", None)
+        if isinstance(captures, Mapping):
+            for key in ("state", "control", "dispatcher", "state_machine"):
+                value = captures.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    def _analyse_slot_usage(self, bootstrap: Any, vm_entry: Any) -> Dict[int, CacheSlotInfo]:
+        cache_name = getattr(vm_entry, "constant_cache_name", self._DEFAULT_CACHE_NAME)
+        if not isinstance(cache_name, str) or not cache_name:
+            cache_name = self._DEFAULT_CACHE_NAME
+
+        slots: Dict[int, CacheSlotInfo] = {}
+        for slot in getattr(bootstrap, "cache_slots", []) or []:
+            index = self._normalise_slot_index(slot)
+            if index is None:
+                continue
+            notes = getattr(slot, "semantic_role", "")
+            info = CacheSlotInfo(index=index, notes=notes)
+            slots[index] = info
+
+        context_fragments = self._collect_reference_fragments(bootstrap, vm_entry)
+        pattern = self._build_reference_pattern(cache_name)
+        context_counters: Dict[int, Counter] = defaultdict(Counter)
+
+        for context_name, fragments in context_fragments.items():
+            for fragment in fragments:
+                for index in self._find_referenced_slots(fragment, pattern):
+                    if index not in slots:
+                        slots[index] = CacheSlotInfo(index=index, notes="inferred reference")
+                    context_counters[index][context_name] += 1
+
+        for index, info in slots.items():
+            counters = context_counters.get(index, Counter())
+            info.reference_contexts = dict(counters)
+            info.used_in_string_decoder = counters.get("string_decoder", 0) > 0
+            info.used_in_serialized_data = counters.get("serialized_data", 0) > 0
+            info.used_in_vm_core = counters.get("vm_core", 0) > 0
+
+            context_names = {name for name, count in counters.items() if count}
+            total_hits = sum(counters.values())
+            if context_names and context_names <= {"rare_branch"}:
+                info.rarely_referenced = True
+            elif total_hits <= 1 and not (
+                info.used_in_string_decoder
+                or info.used_in_serialized_data
+                or info.used_in_vm_core
+            ):
+                info.rarely_referenced = True
+            else:
+                info.rarely_referenced = False
+
+        return slots
+
+    def _normalise_slot_index(self, slot: Any) -> Optional[int]:
+        index = getattr(slot, "index_value", None)
+        if isinstance(index, int):
+            return index
+
+        literal = getattr(slot, "index_literal", None)
+        if isinstance(literal, str) and literal:
+            parsed = self._parse_numeric_token(literal)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _collect_reference_fragments(self, bootstrap: Any, vm_entry: Any) -> Dict[str, List[str]]:
+        fragments: Dict[str, List[str]] = {
+            "string_decoder": [],
+            "serialized_data": [],
+            "vm_core": [],
+            "rare_branch": [],
+        }
+
+        string_decoder = getattr(bootstrap, "string_decoder", None)
+        if string_decoder is not None:
+            fragments["string_decoder"].extend(self._flatten_to_strings(string_decoder))
+
+        serialized = getattr(bootstrap, "serialized_chunk", None)
+        if serialized is not None:
+            fragments["serialized_data"].extend(self._flatten_to_strings(serialized))
+
+        captures = getattr(vm_entry, "captures", None)
+        if isinstance(captures, Mapping):
+            for name, value in captures.items():
+                target = "rare_branch" if self._is_rare_context(name, value) else "vm_core"
+                fragments[target].extend(self._flatten_to_strings(value))
+
+        handlers = getattr(vm_entry, "handlers", None)
+        if handlers is not None:
+            fragments["vm_core"].extend(self._flatten_to_strings(handlers))
+
+        operations = getattr(vm_entry, "operations", None)
+        if operations is not None:
+            fragments["vm_core"].extend(self._flatten_to_strings(operations))
+
+        return fragments
+
+    def _flatten_to_strings(self, value: Any) -> List[str]:
+        strings: List[str] = []
+        visited: Set[int] = set()
+
+        def _walk(obj: Any) -> None:
+            if isinstance(obj, str):
+                strings.append(obj)
+                return
+
+            obj_id = id(obj)
+            if obj_id in visited:
+                return
+            visited.add(obj_id)
+
+            if obj is None:
+                return
+
+            if isinstance(obj, Mapping):
+                for key, val in obj.items():
+                    _walk(key)
+                    _walk(val)
+                return
+
+            if isinstance(obj, (list, tuple, set, frozenset)):
+                for item in obj:
+                    _walk(item)
+                return
+
+            if is_dataclass(obj):
+                for field_info in fields(obj):
+                    _walk(getattr(obj, field_info.name))
+                return
+
+            if hasattr(obj, "__dict__"):
+                _walk(vars(obj))
+                return
+
+            strings.append(str(obj))
+
+        _walk(value)
+        return strings
+
+    def _is_rare_context(self, name: Any, value: Any) -> bool:
+        text_components = []
+        if isinstance(name, str):
+            text_components.append(name)
+        if isinstance(value, str):
+            text_components.append(value)
+        elif isinstance(value, Mapping):
+            text_components.extend(str(key) for key in value.keys())
+
+        combined = " ".join(component.lower() for component in text_components)
+        return any(keyword in combined for keyword in self._RARE_KEYWORDS)
+
+    def _build_reference_pattern(self, cache_name: str) -> re.Pattern[str]:
+        pattern = rf"\b{re.escape(cache_name)}\s*\[\s*(0x[0-9a-fA-F_]+|\d+)\s*\]"
+        return re.compile(pattern)
+
+    def _find_referenced_slots(self, text: str, pattern: re.Pattern[str]) -> List[int]:
+        matches: List[int] = []
+        for match in pattern.finditer(text):
+            token = match.group(1)
+            value = self._parse_numeric_token(token)
+            if value is not None:
+                matches.append(value)
+        return matches
+
+    def _parse_numeric_token(self, token: str) -> Optional[int]:
+        cleaned = token.replace("_", "").strip()
+        if not cleaned:
+            return None
+        base = 10
+        if cleaned.lower().startswith("0x"):
+            base = 16
+        try:
+            return int(cleaned, base)
+        except ValueError:
+            return None
