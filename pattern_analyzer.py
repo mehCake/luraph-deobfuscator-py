@@ -11,9 +11,9 @@ import json
 import logging
 import re
 from html import escape
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Mapping, Union, Callable
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Mapping, Union, Callable, Sequence
 
 from copy import deepcopy
 
@@ -59,12 +59,161 @@ class OptimizationReport:
 
 
 @dataclass
-class SerializedChunk:
-    """Descriptor for the serialized bytecode blob embedded in a payload."""
+class Constant:
+    """Typed wrapper around prototype constant entries."""
+
+    kind: str
+    value: Any
+    raw_value: Any = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:  # pragma: no cover - debugging helper
+        return {
+            "kind": self.kind,
+            "value": self.value,
+            "raw_value": self.raw_value,
+            "metadata": dict(self.metadata),
+        }
+
+
+def infer_constant_kind(value: Any) -> str:
+    """Best-effort guess of a constant's Lua type."""
+
+    if isinstance(value, Constant):
+        return value.kind
+
+    if isinstance(value, bool):
+        return "boolean"
+
+    if value is None:
+        return "nil"
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+
+    if isinstance(value, str):
+        return "string"
+
+    if isinstance(value, (bytes, bytearray)):
+        return "bytes"
+
+    if isinstance(value, MappingABC):
+        return "table"
+
+    if isinstance(value, IterableABC) and not isinstance(value, (str, bytes, bytearray)):
+        return "table"
+
+    return type(value).__name__
+
+
+def make_constant(
+    value: Any,
+    *,
+    kind: Optional[str] = None,
+    raw_value: Any = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Constant:
+    """Return a :class:`Constant` while preserving metadata when possible."""
+
+    if isinstance(value, Constant):
+        if kind and value.kind != kind:
+            value.kind = kind
+        if raw_value is not None:
+            value.raw_value = raw_value
+        if metadata:
+            value.metadata.update(metadata)
+        return value
+
+    resolved_kind = kind or infer_constant_kind(value)
+    stored_metadata = dict(metadata or {})
+    return Constant(kind=resolved_kind, value=value, raw_value=raw_value, metadata=stored_metadata)
+
+
+@dataclass
+class SerializedPrototype:
+    """Raw prototype payload extracted from the serialized chunk."""
+
+    constants: List[Any]
+    instructions: List[Any]
+    prototypes: List["SerializedPrototype"] = field(default_factory=list)
+
+
+@dataclass
+class SerializedChunkDescriptor:
+    """Metadata describing where the serialized VM chunk lives."""
 
     buffer_name: str
     initial_offset: int
     helper_functions: Dict[str, str]
+
+    def __post_init__(self) -> None:
+        self.helper_functions = dict(self.helper_functions)
+
+
+@dataclass
+class SerializedChunk:
+    """High-level model of the serialized VM payload."""
+
+    descriptor: SerializedChunkDescriptor
+    prototype_count: int = 0
+    prototypes: List[SerializedPrototype] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.descriptor, SerializedChunkDescriptor):
+            if isinstance(self.descriptor, Mapping):
+                self.descriptor = SerializedChunkDescriptor(**self.descriptor)
+            else:
+                raise TypeError("descriptor must be a SerializedChunkDescriptor")
+        self.prototypes = list(self.prototypes)
+        if not self.prototype_count:
+            self.prototype_count = len(self.prototypes)
+
+    @property
+    def buffer_name(self) -> str:
+        return self.descriptor.buffer_name
+
+    @property
+    def initial_offset(self) -> int:
+        return self.descriptor.initial_offset
+
+    @property
+    def helper_functions(self) -> Dict[str, str]:
+        return self.descriptor.helper_functions
+
+    def to_descriptor(self) -> SerializedChunkDescriptor:
+        return SerializedChunkDescriptor(
+            buffer_name=self.descriptor.buffer_name,
+            initial_offset=self.descriptor.initial_offset,
+            helper_functions=dict(self.descriptor.helper_functions),
+        )
+
+
+@dataclass
+class PrimitiveTableInfo:
+    """Captured parameters used by the v14.3 primitive helpers."""
+
+    token_width: Optional[int] = None
+    base_offset: Optional[int] = None
+    radix: Optional[int] = None
+    weights: List[int] = field(default_factory=list)
+    accumulator_expression: str = ""
+    alphabet_literal: Optional[str] = None
+    xor_pairs: List[Tuple[str, str]] = field(default_factory=list)
+    shift_counts: Dict[str, List[str]] = field(default_factory=dict)
+    key_schedule_slots: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "token_width": self.token_width,
+            "base_offset": self.base_offset,
+            "radix": self.radix,
+            "weights": list(self.weights),
+            "accumulator_expression": self.accumulator_expression,
+            "alphabet_literal": self.alphabet_literal,
+            "xor_pairs": [list(pair) for pair in self.xor_pairs],
+            "shift_counts": {key: list(values) for key, values in self.shift_counts.items()},
+            "key_schedule_slots": list(self.key_schedule_slots),
+        }
 
 
 @dataclass
@@ -409,7 +558,9 @@ class PatternAnalyzer:
 
         return patterns
 
-    def locate_serialized_chunk(self, source: str) -> Optional[SerializedChunk]:
+    def locate_serialized_chunk(
+        self, source: str
+    ) -> Optional[SerializedChunkDescriptor]:
         """Locate the serialized bytecode blob in ``source`` if recognised."""
 
         chunk = self.locate_serialized_chunk_v14_3(source)
@@ -450,6 +601,18 @@ class PatternAnalyzer:
 
         self.side_band["c3_primitives"] = payload
         return payload
+
+    def identify_primitive_table_info(
+        self, source: str
+    ) -> Optional[PrimitiveTableInfo]:
+        """Recover primitive helper parameters for supported payloads."""
+
+        info = self._build_primitive_table_info_v14_3(source)
+        if info is None:
+            return None
+
+        self.side_band["primitive_table_info"] = info.to_dict()
+        return info
 
     def _collect_cache_slots(self, source: str) -> List[CacheSlot]:
         assignment_pattern = re.compile(
@@ -644,6 +807,244 @@ class PatternAnalyzer:
 
         return None
 
+    def _build_primitive_table_info_v14_3(
+        self, source: str
+    ) -> Optional[PrimitiveTableInfo]:
+        if "protected using Luraph Obfuscator v14.3" not in source:
+            return None
+
+        descriptor = self._extract_token_math_descriptor_v14_3(source)
+        if descriptor is None:
+            return None
+
+        info = PrimitiveTableInfo(
+            token_width=descriptor.get("token_width"),
+            base_offset=descriptor.get("base_offset"),
+            radix=descriptor.get("radix"),
+            weights=descriptor.get("weights", []),
+            accumulator_expression=descriptor.get("expression", ""),
+            alphabet_literal=descriptor.get("alphabet_literal"),
+        )
+
+        info.xor_pairs = self._collect_helper_pairs_v14_3(source, "C3.u", limit=3)
+        info.shift_counts = self._collect_shift_argument_payloads_v14_3(source)
+        info.key_schedule_slots = self._collect_key_schedule_slots_v14_3(source)
+        return info
+
+    def _extract_token_math_descriptor_v14_3(
+        self, source: str
+    ) -> Optional[Dict[str, Any]]:
+        pattern = re.compile(
+            r"local\s+(?P<byte_locals>[A-Za-z0-9_,\s]+)=\s*"
+            r"(?P<byte_helper>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<byte_args>[^)]*)\)\s*;\s*"
+            r"local\s+(?P<accum_var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<accum_expr>[^;]+);\s*"
+            r"(?P<result_var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            r"(?P<alphabet_helper>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<alphabet_args>[^)]*)\)",
+            re.DOTALL,
+        )
+
+        match = pattern.search(source)
+        if not match:
+            return None
+
+        byte_args = self._split_argument_list(match.group("byte_args"))
+        if len(byte_args) < 3:
+            return None
+
+        token_width = self._try_parse_numeric_literal(byte_args[2])
+        accumulator_expr = match.group("accum_expr").strip()
+        alphabet_args = self._split_argument_list(match.group("alphabet_args"))
+        alphabet_literal = alphabet_args[0].strip() if alphabet_args else None
+
+        weights, offsets = self._parse_token_accumulator(accumulator_expr)
+        base_offset = offsets[0] if offsets else None
+        radix = self._infer_radix(weights)
+
+        return {
+            "token_width": token_width,
+            "base_offset": base_offset,
+            "radix": radix,
+            "weights": weights,
+            "expression": accumulator_expr,
+            "alphabet_literal": alphabet_literal,
+        }
+
+    def _parse_token_accumulator(self, expression: str) -> Tuple[List[int], List[int]]:
+        weights: List[int] = []
+        offsets: List[int] = []
+        for part in expression.split("+"):
+            part = part.strip()
+            if not part:
+                continue
+            match = re.fullmatch(
+                r"\(\s*[A-Za-z_][A-Za-z0-9_]*\s*-\s*([^)]+?)\s*\)\s*(?:\*\s*([^)]+))?",
+                part,
+            )
+            if not match:
+                continue
+            offset_literal, weight_literal = match.groups()
+            offset_value = self._try_parse_numeric_literal(offset_literal)
+            if offset_value is not None:
+                offsets.append(offset_value)
+            weight_value = 1
+            if weight_literal:
+                parsed = self._try_parse_numeric_literal(weight_literal)
+                if parsed is not None:
+                    weight_value = parsed
+            weights.append(weight_value)
+        return weights, offsets
+
+    def _infer_radix(self, weights: Sequence[int]) -> Optional[int]:
+        if len(weights) < 2 or not weights[0]:
+            return None
+
+        ratios: Set[int] = set()
+        for previous, current in zip(weights, weights[1:]):
+            if previous == 0 or current % previous != 0:
+                return None
+            ratios.add(current // previous)
+
+        if len(ratios) != 1:
+            return None
+
+        radix = ratios.pop()
+        if radix <= 1:
+            return None
+        return radix
+
+    def _collect_helper_pairs_v14_3(
+        self, source: str, helper: str, limit: int
+    ) -> List[Tuple[str, str]]:
+        calls = self._collect_helper_argument_lists(source, helper, limit)
+        pairs: List[Tuple[str, str]] = []
+        for args in calls:
+            if len(args) >= 2:
+                pairs.append((args[0].strip(), args[1].strip()))
+        return pairs
+
+    def _collect_shift_argument_payloads_v14_3(
+        self, source: str
+    ) -> Dict[str, List[str]]:
+        payload: Dict[str, List[str]] = {}
+        helper_map = {
+            "lshift": "C3.a",
+            "rshift": "C3.s",
+            "lrotate": "C3.b",
+            "rrotate": "C3._",
+        }
+
+        for label, helper in helper_map.items():
+            args_lists = self._collect_helper_argument_lists(source, helper, limit=4)
+            if not args_lists:
+                continue
+            counts = [args[1].strip() for args in args_lists if len(args) >= 2]
+            if counts:
+                payload[label] = counts
+        return payload
+
+    def _collect_key_schedule_slots_v14_3(self, source: str) -> List[str]:
+        marker = "N(u,0x5)"
+        end_idx = source.find(marker)
+        if end_idx == -1:
+            return []
+
+        snippet = source[max(0, end_idx - 2000) : end_idx]
+        pattern = re.compile(r"([Ff]3)\s*\[\s*([^\]]+)\s*\]")
+        slots: List[str] = []
+        seen: Set[str] = set()
+
+        for match in pattern.finditer(snippet):
+            literal = f"{match.group(1)}[{match.group(2).strip()}]"
+            if literal in seen:
+                continue
+            seen.add(literal)
+            slots.append(literal)
+            if len(slots) >= 12:
+                break
+        return slots
+
+    def _collect_helper_argument_lists(
+        self, source: str, helper: str, limit: int
+    ) -> List[List[str]]:
+        pattern = re.compile(rf"{re.escape(helper)}\s*\(")
+        calls: List[List[str]] = []
+        start = 0
+        while len(calls) < limit:
+            match = pattern.search(source, start)
+            if not match:
+                break
+            open_idx = match.end() - 1
+            segment = self._extract_parenthesised_segment(source, open_idx)
+            if segment is None:
+                break
+            args_text, close_idx = segment
+            calls.append(self._split_argument_list(args_text))
+            start = close_idx
+        return calls
+
+    def _split_argument_list(self, args: str) -> List[str]:
+        args = args.strip()
+        if not args:
+            return []
+
+        values: List[str] = []
+        depth = 0
+        start = 0
+        index = 0
+        while index < len(args):
+            ch = args[index]
+            if ch in {"'", '"'}:
+                index = self._skip_string_literal(args, index)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                values.append(args[start:index].strip())
+                start = index + 1
+            index += 1
+
+        tail = args[start:].strip()
+        if tail:
+            values.append(tail)
+        return values
+
+    def _extract_parenthesised_segment(
+        self, text: str, open_index: int
+    ) -> Optional[Tuple[str, int]]:
+        if open_index >= len(text) or text[open_index] != "(":
+            return None
+
+        depth = 0
+        index = open_index
+        while index < len(text):
+            ch = text[index]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[open_index + 1 : index], index + 1
+            elif ch in {"'", '"'}:
+                index = self._skip_string_literal(text, index)
+                continue
+            index += 1
+        return None
+
+    def _skip_string_literal(self, text: str, start: int) -> int:
+        quote = text[start]
+        index = start + 1
+        while index < len(text):
+            ch = text[index]
+            if ch == "\\":
+                index += 2
+                continue
+            if ch == quote:
+                return index + 1
+            index += 1
+        return len(text)
+
     def _parse_c3_primitive_entries(self, literal: str) -> List[Dict[str, Any]]:
         literal = literal.strip()
         if not literal.startswith("{") or not literal.endswith("}"):
@@ -756,7 +1157,9 @@ class PatternAnalyzer:
 
         return fields
 
-    def locate_serialized_chunk_v14_3(self, source: str) -> Optional[SerializedChunk]:
+    def locate_serialized_chunk_v14_3(
+        self, source: str
+    ) -> Optional[SerializedChunkDescriptor]:
         """Return metadata for the standalone Luraph v14.3 VM serializer."""
 
         if "9007199254740992" not in source:
@@ -857,7 +1260,7 @@ class PatternAnalyzer:
             "r": "r",
         }
 
-        return SerializedChunk(
+        return SerializedChunkDescriptor(
             buffer_name=buffer_name,
             initial_offset=initial_offset,
             helper_functions=helpers,

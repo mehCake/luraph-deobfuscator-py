@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any, Iterable, Optional
 
 # Add src directory to path so we can import the internal modules when the
 # script is executed from the repository root.
@@ -19,6 +21,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 try:
     from deobfuscator import LuaDeobfuscator
+    from pattern_analyzer import (
+        Constant,
+        SerializedChunk,
+        SerializedChunkDescriptor,
+        SerializedPrototype,
+        infer_constant_kind,
+        make_constant,
+    )
+    from src.versions import v14_3_loader
     from utils import create_output_path, setup_logging, validate_file
 except ImportError as e:  # pragma: no cover - import-time guard
     print(f"Error importing modules: {e}")
@@ -172,6 +183,252 @@ def dump_bootstrap_summary(analysis: dict, logger: logging.Logger | None = None)
         )
 
 
+def _version_tokens(value: Any) -> list[str]:
+    tokens: list[str] = []
+    if value is None:
+        return tokens
+    if isinstance(value, str):
+        tokens.append(value)
+        return tokens
+    if isinstance(value, Mapping):
+        for key in ("name", "label", "version", "detected_version", "variant"):
+            if key in value:
+                tokens.extend(_version_tokens(value[key]))
+        major = value.get("major")
+        minor = value.get("minor")
+        if major is not None:
+            if minor is not None:
+                tokens.append(f"{major}.{minor}")
+            else:
+                tokens.append(str(major))
+        features = value.get("features")
+        if isinstance(features, (list, tuple, set)):
+            for feature in features:
+                tokens.extend(_version_tokens(feature))
+        return tokens
+    if hasattr(value, "name"):
+        tokens.extend(_version_tokens(getattr(value, "name")))
+    if hasattr(value, "major") and hasattr(value, "minor"):
+        try:
+            tokens.append(f"{getattr(value, 'major')}.{getattr(value, 'minor')}")
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if isinstance(value, (list, tuple, set)):
+        for entry in value:
+            tokens.extend(_version_tokens(entry))
+        return tokens
+    tokens.append(str(value))
+    return tokens
+
+
+def _analysis_is_v14_3(analysis: Mapping[str, Any]) -> bool:
+    version_hints: list[Any] = []
+    for key in ("version", "detected_version", "primary_vm_variant"):
+        if key in analysis:
+            version_hints.append(analysis[key])
+    for key in ("vm_variants", "version_features"):
+        if key in analysis and isinstance(analysis[key], Sequence) and not isinstance(
+            analysis[key], (str, bytes, bytearray)
+        ):
+            version_hints.extend(list(analysis[key]))
+    for hint in version_hints:
+        for token in _version_tokens(hint):
+            lowered = token.lower()
+            if "14.3" in lowered or "14_3" in lowered:
+                return True
+    return False
+
+
+def _coerce_constant_entry(value: Any) -> Constant:
+    if isinstance(value, Constant):
+        return value
+    if isinstance(value, Mapping) and "value" in value:
+        metadata = value.get("metadata") if isinstance(value.get("metadata"), Mapping) else {}
+        kind = value.get("kind")
+        raw_value = value.get("raw_value")
+        inferred_kind = kind or infer_constant_kind(value.get("value"))
+        return Constant(
+            kind=inferred_kind,
+            value=value.get("value"),
+            raw_value=raw_value,
+            metadata=dict(metadata),
+        )
+    return make_constant(value)
+
+
+def _coerce_serialized_prototype(value: Any) -> Optional[SerializedPrototype]:
+    if isinstance(value, SerializedPrototype):
+        return value
+    if isinstance(value, Mapping):
+        constants_raw = value.get("constants") or []
+        instructions_raw = value.get("instructions") or []
+        prototypes_raw = value.get("prototypes") or []
+        constants = [_coerce_constant_entry(entry) for entry in constants_raw]
+        instructions = list(instructions_raw)
+        prototypes = []
+        for child in prototypes_raw:
+            coerced = _coerce_serialized_prototype(child)
+            if coerced is not None:
+                prototypes.append(coerced)
+        return SerializedPrototype(
+            constants=constants,
+            instructions=instructions,
+            prototypes=prototypes,
+        )
+    return None
+
+
+def _coerce_serialized_chunk(value: Any) -> Optional[SerializedChunk]:
+    if isinstance(value, SerializedChunk):
+        return value
+    if isinstance(value, Mapping):
+        descriptor_value = value.get("descriptor")
+        if isinstance(descriptor_value, SerializedChunkDescriptor):
+            descriptor = descriptor_value
+        elif isinstance(descriptor_value, Mapping):
+            try:
+                descriptor = SerializedChunkDescriptor(**descriptor_value)
+            except Exception:  # pragma: no cover - defensive
+                return None
+        else:
+            return None
+        prototypes = []
+        for entry in value.get("prototypes", []) or []:
+            proto = _coerce_serialized_prototype(entry)
+            if proto is not None:
+                prototypes.append(proto)
+        prototype_count = value.get("prototype_count") or len(prototypes)
+        return SerializedChunk(
+            descriptor=descriptor,
+            prototype_count=prototype_count,
+            prototypes=prototypes,
+        )
+    return None
+
+
+def _extract_serialized_chunk(analysis: Mapping[str, Any]) -> Optional[SerializedChunk]:
+    def _from_candidate(candidate: Any) -> Optional[SerializedChunk]:
+        if candidate is None:
+            return None
+        return _coerce_serialized_chunk(candidate)
+
+    for key in ("serialized_chunk_model", "serialized_chunk", "chunk"):
+        chunk = _from_candidate(analysis.get(key))
+        if chunk is not None:
+            return chunk
+
+    bootstrap = analysis.get("bootstrap")
+    if bootstrap is not None:
+        for key in ("serialized_chunk_model", "serialized_chunk", "chunk"):
+            candidate = None
+            if isinstance(bootstrap, Mapping):
+                candidate = bootstrap.get(key)
+            else:
+                candidate = getattr(bootstrap, key, None)
+            chunk = _from_candidate(candidate)
+            if chunk is not None:
+                return chunk
+
+    return None
+
+
+def _attach_v14_3_serialized_chunk(
+    analysis: Mapping[str, Any] | None,
+    source: str,
+    *,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Populate ``analysis`` with a serialized chunk extracted directly from *source*."""
+
+    if not isinstance(analysis, Mapping):
+        return
+    if not _analysis_is_v14_3(analysis):
+        return
+    if _extract_serialized_chunk(analysis) is not None:
+        return
+
+    log = logger or logging.getLogger(__name__)
+    try:
+        descriptor, data = v14_3_loader.extract_v14_3_serialized_chunk_bytes_from_source(
+            source
+        )
+        chunk = v14_3_loader.build_v14_3_serialized_chunk_from_bytes(descriptor, data)
+    except Exception as exc:  # pragma: no cover - extraction is best-effort
+        log.debug("v14.3 serialized chunk extraction failed: %s", exc)
+        return
+
+    if isinstance(analysis, dict):
+        analysis.setdefault("serialized_chunk", chunk)
+        analysis.setdefault("serialized_chunk_model", chunk)
+        bootstrap = analysis.setdefault("bootstrap", {})
+        if isinstance(bootstrap, dict):
+            bootstrap.setdefault("serialized_chunk", chunk)
+            bootstrap.setdefault("serialized_chunk_model", chunk)
+
+def _string_preview(value: str, limit: int = 64) -> str:
+    escaped = value.encode("unicode_escape", errors="backslashreplace").decode("ascii")
+    if len(escaped) > limit:
+        escaped = escaped[: limit - 3] + "..."
+    return f'"{escaped}"'
+
+
+def _format_constant_preview(constant: Constant) -> str:
+    value = constant.value
+    if value is None:
+        return "nil"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return _string_preview(value)
+    if isinstance(value, (bytes, bytearray)):
+        preview = value[:16].hex()
+        if len(value) > 16:
+            preview += "..."
+        return f"0x{preview}"
+    return str(value)
+
+
+def dump_v14_3_constants(
+    analysis: Mapping[str, Any] | None, logger: logging.Logger | None = None
+) -> bool:
+    """Print the decoded constant pools for v14.3 prototypes."""
+
+    if not isinstance(analysis, Mapping):
+        return False
+
+    log = logger or logging.getLogger(__name__)
+    if not _analysis_is_v14_3(analysis):
+        return False
+
+    chunk = _extract_serialized_chunk(analysis)
+    if chunk is None:
+        log.warning(
+            "dump_v14_3_constants: serialized chunk metadata unavailable; "
+            "rerun analysis with bootstrap extraction enabled"
+        )
+        return False
+
+    def _walk_prototypes(proto: SerializedPrototype, label: str, depth: int) -> None:
+        indent = "  " * depth
+        print(f"{indent}Prototype {label} (constants: {len(proto.constants)})")
+        if not proto.constants:
+            print(f"{indent}  (no constants)")
+        for index, entry in enumerate(proto.constants):
+            constant = entry if isinstance(entry, Constant) else make_constant(entry)
+            preview = _format_constant_preview(constant)
+            print(f"{indent}  [{index:02d}] {constant.kind:<7} {preview}")
+        for child_index, child in enumerate(proto.prototypes):
+            _walk_prototypes(child, f"{label}.{child_index}", depth + 1)
+
+    print("\n" + "=" * 60)
+    print("V14.3 CONSTANT TABLE")
+    print("=" * 60)
+    for proto_index, prototype in enumerate(chunk.prototypes):
+        _walk_prototypes(prototype, str(proto_index), 0)
+
+    return True
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create command line argument parser."""
     parser = argparse.ArgumentParser(
@@ -203,6 +460,14 @@ Examples:
             "After analysis, print a compact summary of any bootstrap/VM "
             "metadata (state machines, constant cache, helper table, "
             "prototype loader layout)."
+        ),
+    )
+    parser.add_argument(
+        "--dump-constants",
+        action="store_true",
+        help=(
+            "After analysis, print decoded v14.3 prototype constants "
+            "(index, type, preview)."
         ),
     )
     parser.add_argument(
@@ -286,6 +551,7 @@ def main() -> int:
             logger.info("Analyzing code...")
             try:
                 analysis = deobfuscator.analyze_code(code)
+                _attach_v14_3_serialized_chunk(analysis, code, logger=logger)
 
                 print("\n" + "=" * 60)
                 print("ANALYSIS RESULTS")
@@ -331,6 +597,9 @@ def main() -> int:
                 if args.dump_bootstrap:
                     dump_bootstrap_summary(analysis, logger)
 
+                if args.dump_constants:
+                    dump_v14_3_constants(analysis, logger)
+
                 print("=" * 60)
             except Exception as e:  # pragma: no cover - analysis failure
                 logger.error("Analysis failed: %s", e)
@@ -343,10 +612,14 @@ def main() -> int:
             logger.info("Starting deobfuscation process...")
             try:
                 analysis = deobfuscator.analyze_code(code)
+                _attach_v14_3_serialized_chunk(analysis, code, logger=logger)
 
                 # Optionally emit the bootstrap/VM summary before rewriting.
                 if args.dump_bootstrap:
                     dump_bootstrap_summary(analysis, logger)
+
+                if args.dump_constants:
+                    dump_v14_3_constants(analysis, logger)
 
                 if not analysis.get("obfuscated", False):
                     logger.info("Code appears clean, no deobfuscation needed")

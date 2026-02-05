@@ -367,3 +367,20 @@ def test_identify_c3_primitives_extracts_v14_3_mapping():
     assert keyed["Y"]["builtin"] == "table.create"
 
     assert entries[-1]["builtin"] == "bit32.band"
+
+
+def test_identify_primitive_table_info_extracts_token_math():
+    analyzer = PatternAnalyzer()
+    source = Path("Obfuscated4.lua").read_text(encoding="utf8")
+
+    info = analyzer.identify_primitive_table_info(source)
+
+    assert info is not None, "Expected primitive table info to be recovered"
+    assert info.token_width == 5
+    assert info.base_offset == 33
+    assert info.radix == 85
+    assert info.weights[:3] == [1, 0x55, 0x55 * 0x55]
+    assert info.alphabet_literal and info.alphabet_literal.startswith("\"")
+    assert info.xor_pairs, "At least one xor pair should be recorded"
+    assert "lshift" in info.shift_counts
+    assert analyzer.side_band.get("primitive_table_info", {}).get("token_width") == 5
