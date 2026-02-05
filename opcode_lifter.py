@@ -17,6 +17,7 @@ augmenting ``INSTRUCTION_SIGNATURES``.
 from dataclasses import dataclass, field, asdict
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 from copy import deepcopy
@@ -24,7 +25,13 @@ from copy import deepcopy
 from src.ir import VMFunction, VMInstruction
 from src.utils_pkg import ast as lua_ast
 
-from pattern_analyzer import CacheSlot, PatternAnalyzer, SerializedChunk
+from pattern_analyzer import (
+    CacheSlot,
+    PatternAnalyzer,
+    PrimitiveTableInfo,
+    SerializedChunk,
+    SerializedChunkDescriptor,
+)
 from string_decryptor import (
     StringDecoderDescriptor,
     detect_v14_3_string_decoder,
@@ -83,6 +90,26 @@ class LoaderLoop:
 
 
 @dataclass
+class LoaderStep:
+    """High-level action recovered from the loader control-flow."""
+
+    kind: str
+    helper: Optional[str] = None
+    target: Optional[str] = None
+    expression: Optional[str] = None
+    loop_var: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "helper": self.helper,
+            "target": self.target,
+            "expression": self.expression,
+            "loop_var": self.loop_var,
+        }
+
+
+@dataclass
 class PrototypeLoader:
     """High level description of how serialized VM prototypes are decoded."""
 
@@ -91,6 +118,7 @@ class PrototypeLoader:
     extra_calls: List[LoaderCall]
     helper_usage: Dict[str, int]
     operations: List[str] = field(default_factory=list)
+    steps: List[LoaderStep] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -99,6 +127,7 @@ class PrototypeLoader:
             "extra_calls": [call.to_dict() for call in self.extra_calls],
             "helper_usage": dict(self.helper_usage),
             "operations": list(self.operations),
+            "steps": [step.to_dict() for step in self.steps],
         }
 
 
@@ -108,7 +137,8 @@ class BootstrapIR:
 
     cache_slots: List[CacheSlot] = field(default_factory=list)
     c3_primitives: Optional[Dict[str, Any]] = None
-    serialized_chunk: Optional[SerializedChunk] = None
+    primitive_table_info: Optional[PrimitiveTableInfo] = None
+    serialized_chunk: Optional[SerializedChunkDescriptor] = None
     string_decoder: Optional[StringDecoderDescriptor] = None
     annotations: Dict[str, Any] = field(default_factory=dict)
 
@@ -117,6 +147,9 @@ class BootstrapIR:
             "cache_slots": [slot.to_dict() for slot in self.cache_slots],
             "c3_primitives": deepcopy(self.c3_primitives)
             if self.c3_primitives is not None
+            else None,
+            "primitive_table_info": self.primitive_table_info.to_dict()
+            if self.primitive_table_info is not None
             else None,
             "serialized_chunk": asdict(self.serialized_chunk)
             if self.serialized_chunk is not None
@@ -206,6 +239,15 @@ _HELPER_ROLES = {
     "a3": "varint_reader",
 }
 
+_HELPER_NAMES = tuple(_HELPER_ROLES.keys())
+
+_FOR_HEADER_RE = re.compile(
+    r"for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^,;]+?)\s*,\s*([^,;]+?)(?:\s*,\s*([^d;]+?))?\s*do",
+    re.IGNORECASE,
+)
+
+_TOKEN_RE = re.compile(r"\b(for|function|if|repeat|while|end|until)\b", re.IGNORECASE)
+
 
 def find_vm_loader_v14_3(ast: lua_ast.Chunk) -> Optional[PrototypeLoader]:
     """Return a :class:`PrototypeLoader` model for standalone v14.3 payloads."""
@@ -231,12 +273,15 @@ def find_vm_loader_v14_3(ast: lua_ast.Chunk) -> Optional[PrototypeLoader]:
 
     filtered_usage = {name: count for name, count in helper_usage.items() if count}
 
+    steps = _derive_loader_steps(loops, calls, operations)
+
     loader = PrototypeLoader(
         helpers=helpers,
         loops=loops,
         extra_calls=calls,
         helper_usage=filtered_usage,
         operations=operations,
+        steps=steps,
     )
     return loader
 
@@ -274,16 +319,49 @@ def build_bootstrap_ir_v14_3(ast: lua_ast.Chunk) -> Optional[BootstrapIR]:
     if c3_primitives is None:
         return None
 
+    primitive_info = analyzer.identify_primitive_table_info(source)
+    if primitive_info is None:
+        return None
+
     decoder = detect_v14_3_string_decoder(source)
     if decoder is None:
         return None
+    decoder.attach_primitive_table_info(primitive_info)
 
-    return BootstrapIR(
+    loader_summary: Optional[Dict[str, Any]] = None
+    loader_ast = _build_loader_ast_from_source(source)
+    if loader_ast is not None:
+        loader_model = find_vm_loader_v14_3(loader_ast)
+        if loader_model is not None:
+            loader_summary = _summarise_loader_for_annotations(loader_model)
+
+    state_machine = analyzer.detect_bootstrap_state_machine(source)
+    vm_entry_summary: Optional[Dict[str, Any]] = None
+    if state_machine is not None:
+        vm_entry_summary = {
+            "control_variable": state_machine.variable,
+            "state_count": len(state_machine.states),
+            "states": [state.state_id for state in state_machine.states[:5]],
+        }
+
+    bootstrap = BootstrapIR(
         cache_slots=cache_slots,
         c3_primitives=c3_primitives,
+        primitive_table_info=primitive_info,
         serialized_chunk=serialized_chunk,
         string_decoder=decoder,
     )
+
+    annotations = getattr(bootstrap, "annotations", None)
+    if not isinstance(annotations, dict):
+        annotations = {}
+        bootstrap.annotations = annotations
+    if loader_summary:
+        annotations["loader"] = loader_summary
+    if vm_entry_summary:
+        annotations["vm_entry"] = vm_entry_summary
+
+    return bootstrap
 
 
 def _analyse_block(
@@ -304,6 +382,12 @@ def _analyse_block(
             ):
                 loops.append(loop)
             continue
+
+        if isinstance(stmt, lua_ast.While):
+            loop = _promote_while_loop(stmt, helper_usage)
+            if loop is not None:
+                loops.append(loop)
+                continue
 
         nested_loops, stmt_calls, stmt_ops = _analyse_stmt(stmt, helper_usage)
         loops.extend(nested_loops)
@@ -329,6 +413,64 @@ def _summarise_loop(
         body_calls=calls,
         nested_loops=nested_loops,
     )
+
+
+def _promote_while_loop(
+    loop: lua_ast.While, helper_usage: Dict[str, int]
+) -> Optional[LoaderLoop]:
+    var_name, limit_expr = _extract_loop_descriptor(loop.test)
+    if var_name is None:
+        return None
+
+    if not _has_trivial_increment(loop.body, var_name):
+        return None
+
+    limit_helper = _helper_from_expr(limit_expr) if limit_expr is not None else None
+    if limit_helper and limit_helper in helper_usage:
+        helper_usage[limit_helper] += 1
+
+    nested_loops, calls, operations = _analyse_block(loop.body, helper_usage)
+
+    return LoaderLoop(
+        loop_var=var_name,
+        limit_helper=limit_helper,
+        operations=operations,
+        body_calls=calls,
+        nested_loops=nested_loops,
+    )
+
+
+def _extract_loop_descriptor(
+    expr: lua_ast.Expr,
+) -> tuple[Optional[str], Optional[lua_ast.Expr]]:
+    if isinstance(expr, lua_ast.BinOp) and expr.op in {"<", "<=", ">", ">="}:
+        left_name = _name_from_expr(expr.left)
+        right_name = _name_from_expr(expr.right)
+        if left_name and not right_name:
+            return left_name, expr.right
+        if right_name and not left_name:
+            return right_name, expr.left
+    return None, None
+
+
+def _has_trivial_increment(body: Sequence[lua_ast.Stmt], var_name: str) -> bool:
+    for stmt in body:
+        if not isinstance(stmt, lua_ast.Assignment):
+            continue
+        for target, value in zip(stmt.targets, stmt.values):
+            if not isinstance(target, lua_ast.Name) or target.ident != var_name:
+                continue
+            if isinstance(value, lua_ast.BinOp) and value.op in {"+", "-"}:
+                if _name_from_expr(value.left) == var_name:
+                    if isinstance(value.right, lua_ast.Literal):
+                        return True
+    return False
+
+
+def _name_from_expr(expr: lua_ast.Expr) -> Optional[str]:
+    if isinstance(expr, lua_ast.Name):
+        return expr.ident
+    return None
 
 
 def _analyse_stmt(
@@ -456,6 +598,340 @@ def _call_arguments(expr: lua_ast.Expr) -> List[str]:
     return []
 
 
+def _derive_loader_steps(
+    loops: Sequence[LoaderLoop],
+    extra_calls: Sequence[LoaderCall],
+    operations: Sequence[str],
+) -> List[LoaderStep]:
+    steps: List[LoaderStep] = []
+    for loop in loops:
+        steps.extend(_steps_from_loop(loop))
+    steps.extend(_steps_from_calls(extra_calls))
+    if not steps and operations:
+        # Best-effort extraction for straight-line loaders where helpers are
+        # invoked outside of recognised loops.
+        # We scan for helper names in the textual descriptions to map back to
+        # high level actions.
+        for entry in operations:
+            lowered = entry.lower()
+            if "m()" in lowered or "m(" in lowered:
+                steps.append(
+                    LoaderStep(
+                        kind="read_constant_array",
+                        helper="M",
+                        expression=entry,
+                    )
+                )
+            if "r(" in lowered:
+                steps.append(
+                    LoaderStep(
+                        kind="read_opcode_array",
+                        helper="r",
+                        expression=entry,
+                    )
+                )
+    return _squash_redundant_steps(steps)
+
+
+def _steps_from_loop(loop: LoaderLoop) -> List[LoaderStep]:
+    steps = _steps_from_calls(loop.body_calls, loop.loop_var)
+    for nested in loop.nested_loops:
+        steps.extend(_steps_from_loop(nested))
+    return steps
+
+
+def _steps_from_calls(
+    calls: Sequence[LoaderCall], loop_var: Optional[str] = None
+) -> List[LoaderStep]:
+    steps: List[LoaderStep] = []
+    for call in calls:
+        step = _step_from_call(call, loop_var)
+        if step is not None:
+            steps.append(step)
+    return steps
+
+
+def _step_from_call(
+    call: LoaderCall, loop_var: Optional[str]
+) -> Optional[LoaderStep]:
+    helper = call.helper
+    target = call.target or ""
+    target_lower = target.lower()
+    kind: Optional[str] = None
+
+    if helper == "r":
+        kind = "read_opcode_array"
+    elif helper == "M":
+        if "proto" in target_lower or "child" in target_lower:
+            kind = "read_child_prototype"
+        else:
+            kind = "read_constant_array"
+    elif helper == "a3":
+        kind = "read_length_field"
+    elif helper == "t3":
+        kind = "decode_double_constants"
+    elif helper == "o":
+        kind = "read_prototype_count"
+
+    if kind is None:
+        return None
+
+    return LoaderStep(
+        kind=kind,
+        helper=helper,
+        target=call.target,
+        expression=call.expression,
+        loop_var=loop_var,
+    )
+
+
+def _squash_redundant_steps(steps: Sequence[LoaderStep]) -> List[LoaderStep]:
+    simplified: List[LoaderStep] = []
+    last_key: Optional[tuple[str, Optional[str], Optional[str]]] = None
+    for step in steps:
+        key = (step.kind, step.target, step.loop_var)
+        if last_key == key:
+            continue
+        simplified.append(step)
+        last_key = key
+    return simplified
+
+
+def _sanitize_numeric_literal(text: str) -> str:
+    return text.replace("_", "")
+
+
+def _parse_expression(expr: str) -> lua_ast.Expr:
+    expr = expr.strip()
+    if not expr:
+        return lua_ast.Literal(None)
+    if expr.endswith(")"):
+        for helper in _HELPER_NAMES:
+            prefix = f"{helper}("
+            if expr.startswith(prefix):
+                args = _split_arguments(expr[len(prefix) : -1])
+                return lua_ast.Call(
+                    lua_ast.Name(helper),
+                    [_parse_expression(arg) for arg in args],
+                )
+    table_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\[(.+)\]", expr)
+    if table_match:
+        table = lua_ast.Name(table_match.group(1))
+        key_expr = _parse_expression(table_match.group(2))
+        return lua_ast.TableAccess(table, key_expr)
+    literal = _sanitize_numeric_literal(expr)
+    try:
+        if literal.lower().startswith(("0x", "0b")):
+            return lua_ast.Literal(int(literal, 0))
+        return lua_ast.Literal(int(literal, 10))
+    except ValueError:
+        pass
+    return lua_ast.Name(expr.strip())
+
+
+def _split_arguments(argument_text: str) -> List[str]:
+    args: List[str] = []
+    token: List[str] = []
+    depth = 0
+    for ch in argument_text:
+        if ch in "({[":
+            depth += 1
+            token.append(ch)
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+            token.append(ch)
+        elif ch == "," and depth == 0:
+            arg = "".join(token).strip()
+            if arg:
+                args.append(arg)
+            token = []
+        else:
+            token.append(ch)
+    tail = "".join(token).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _find_call_end(text: str, start: int) -> int:
+    depth = 0
+    index = start
+    while index < len(text):
+        ch = text[index]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return len(text)
+
+
+def _clean_statement(statement: str) -> str:
+    stmt = statement.strip()
+    if not stmt:
+        return stmt
+    for keyword in ("then", "else", "elseif"):
+        pattern = re.compile(rf"\b{keyword}\b", re.IGNORECASE)
+        stmt = pattern.sub(";", stmt)
+    stmt = stmt.replace("end", "")
+    return stmt.strip()
+
+
+def _parse_statements(text: str) -> List[lua_ast.Stmt]:
+    statements: List[lua_ast.Stmt] = []
+    token: List[str] = []
+    depth = 0
+    for ch in text:
+        if ch in "({[":
+            depth += 1
+            token.append(ch)
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+            token.append(ch)
+        elif ch == ";" and depth == 0:
+            candidate = "".join(token).strip()
+            if candidate:
+                statements.append(candidate)
+            token = []
+        else:
+            token.append(ch)
+    tail = "".join(token).strip()
+    if tail:
+        statements.append(tail)
+
+    parsed: List[lua_ast.Stmt] = []
+    for raw in statements:
+        stmt = _clean_statement(raw)
+        if not stmt:
+            continue
+        for helper in _HELPER_NAMES:
+            marker = f"{helper}("
+            index = stmt.find(marker)
+            if index == -1:
+                continue
+            paren = stmt.find("(", index)
+            if paren == -1:
+                continue
+            end = _find_call_end(stmt, paren)
+            call_text = stmt[index:end]
+            call_expr = _parse_expression(call_text)
+            prefix = stmt[:index].strip()
+            if prefix.startswith("return"):
+                parsed.append(lua_ast.Return([call_expr]))
+                break
+            lhs, sep, _ = prefix.rpartition("=")
+            if sep:
+                target_text = lhs.strip()
+                is_local = False
+                if target_text.startswith("local "):
+                    is_local = True
+                    target_text = target_text[len("local ") :].strip()
+                target_expr = _parse_expression(target_text)
+                parsed.append(
+                    lua_ast.Assignment(
+                        targets=[target_expr],
+                        values=[call_expr],
+                        is_local=is_local,
+                    )
+                )
+            else:
+                parsed.append(lua_ast.CallStmt(call_expr))
+            break
+    return parsed
+
+
+def _extract_block(text: str, start: int) -> tuple[Optional[str], int]:
+    depth = 1
+    position = start
+    while True:
+        match = _TOKEN_RE.search(text, position)
+        if match is None:
+            return None, position
+        keyword = match.group(1).lower()
+        if keyword in {"for", "function", "if", "repeat", "while"}:
+            depth += 1
+        elif keyword in {"end", "until"}:
+            depth -= 1
+            if depth == 0:
+                return text[start:match.start()], match.end()
+        position = match.end()
+
+
+def _parse_block(text: str) -> List[lua_ast.Stmt]:
+    statements: List[lua_ast.Stmt] = []
+    cursor = 0
+    while cursor < len(text):
+        match = _FOR_HEADER_RE.search(text, cursor)
+        if match is None:
+            statements.extend(_parse_statements(text[cursor:]))
+            break
+        if match.start() > cursor:
+            statements.extend(_parse_statements(text[cursor:match.start()]))
+        body, end_index = _extract_block(text, match.end())
+        if body is None:
+            cursor = match.end()
+            continue
+        start_expr = _parse_expression(match.group(2))
+        stop_expr = _parse_expression(match.group(3))
+        step_expr = _parse_expression(match.group(4) or "1")
+        loop_body = _parse_block(body)
+        if loop_body:
+            statements.append(
+                lua_ast.NumericFor(
+                    var=match.group(1),
+                    start=start_expr,
+                    stop=stop_expr,
+                    step=step_expr,
+                    body=loop_body,
+                )
+            )
+        cursor = end_index
+    return statements
+
+
+def _build_loader_ast_from_source(source: str) -> Optional[lua_ast.Chunk]:
+    if not isinstance(source, str) or not source:
+        return None
+    region_start = source.find("P=(0X6c)")
+    if region_start == -1:
+        region_start = 0
+    section = source[region_start:]
+    statements = _parse_block(section)
+    if not statements:
+        return None
+    return lua_ast.Chunk(body=statements)
+
+
+def _summarise_loader_for_annotations(loader: PrototypeLoader) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "helpers": dict(loader.helpers),
+        "steps": [step.kind for step in loader.steps],
+        "prototype_count": 0,
+        "has_constant_reader": False,
+        "has_instruction_reader": False,
+        "has_child_loader": False,
+    }
+    counter_name = loader.helpers.get("prototype_counter")
+    if counter_name:
+        summary["prototype_count"] = max(loader.helper_usage.get(counter_name, 0), 0)
+    if not summary["prototype_count"]:
+        summary["prototype_count"] = len(loader.loops) or len(summary["steps"]) or 0
+    summary["has_constant_reader"] = any(
+        step.kind == "read_constant_array" for step in loader.steps
+    )
+    summary["has_instruction_reader"] = any(
+        step.kind == "read_opcode_array" for step in loader.steps
+    )
+    summary["has_child_loader"] = any(
+        step.kind == "read_child_prototype" for step in loader.steps
+    )
+    if summary["prototype_count"] == 0 and summary["has_child_loader"]:
+        summary["prototype_count"] = 1
+    return summary
+
+
 class OpcodeLifter:
     """Translate version specific bytecode into canonical VM instructions."""
 
@@ -563,6 +1039,7 @@ class OpcodeLifter:
         signature = INSTRUCTION_SIGNATURES.get(opcode)
 
         aux: Dict[str, Any] = {}
+        constant_refs: List[int] = []
         if signature:
             for field in signature.fields:
                 mode = signature.modes.get(field)
@@ -571,6 +1048,8 @@ class OpcodeLifter:
                     if mode == "const":
                         index = data[field]
                         aux[f"{field}_index"] = index
+                        if isinstance(index, int):
+                            constant_refs.append(index)
                         if isinstance(index, int) and 0 <= index < len(constants):
                             aux[f"const_{field}"] = constants[index]
                     elif mode == "immediate":
@@ -602,6 +1081,7 @@ class OpcodeLifter:
             b=data.get("b"),
             c=data.get("c"),
             aux=aux,
+            constant_refs=constant_refs,
         ), data
 
     def _build_token_map(
@@ -732,6 +1212,7 @@ __all__ = [
     "PrototypeLoader",
     "LoaderLoop",
     "LoaderCall",
+    "LoaderStep",
     "find_vm_loader_v14_3",
     "BootstrapIR",
     "build_bootstrap_ir_v14_3",

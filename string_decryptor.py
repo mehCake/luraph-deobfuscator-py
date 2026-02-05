@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence
+import struct
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from pattern_analyzer import Constant, PrimitiveTableInfo, SerializedChunk
 from lua_literal_parser import LuaTable, parse_lua_expression
 
 
@@ -31,6 +35,10 @@ class StringDecoderDescriptor:
     token_length: int
     local_variable_count: int
     caches_results: bool
+    primitive_table_info: Optional[PrimitiveTableInfo] = field(
+        default=None, compare=False
+    )
+    context: Dict[str, Any] = field(default_factory=dict, compare=False)
 
     def to_dict(self) -> Dict[str, object]:
         """Return a JSON-serialisable representation of the descriptor."""
@@ -45,7 +53,65 @@ class StringDecoderDescriptor:
             "token_length": self.token_length,
             "local_variable_count": self.local_variable_count,
             "caches_results": self.caches_results,
+            "primitive_table_info": self.primitive_table_info.to_dict()
+            if self.primitive_table_info is not None
+            else None,
+            "context": dict(self.context),
         }
+
+    def attach_primitive_table_info(self, info: PrimitiveTableInfo) -> None:
+        """Link primitive table metadata so downstream decoders can reuse it."""
+
+        object.__setattr__(self, "primitive_table_info", info)
+        context = dict(self.context)
+        context.update(
+            {
+                "primitive_token_width": info.token_width,
+                "primitive_base_offset": info.base_offset,
+                "primitive_radix": info.radix,
+            }
+        )
+        object.__setattr__(self, "context", context)
+
+
+@dataclass
+class StringTable:
+    """Mapping of encoded tokens to their decoded plaintext."""
+
+    entries: Dict[str, str] = field(default_factory=dict)
+
+    def add(self, token: str, decoded: str) -> None:
+        if token not in self.entries:
+            self.entries[token] = decoded
+
+    def lookup(self, token: str) -> Optional[tuple[str, str]]:
+        """Return the canonical token plus decoded string if available."""
+
+        if not token:
+            return None
+
+        if token in self.entries:
+            return token, self.entries[token]
+
+        normalised = _normalise_v14_3_token(token)
+        if normalised and normalised in self.entries:
+            return normalised, self.entries[normalised]
+
+        return None
+
+    def __len__(self) -> int:  # pragma: no cover - convenience wrapper
+        return len(self.entries)
+
+    def __contains__(self, token: object) -> bool:  # pragma: no cover - passthrough
+        return token in self.entries
+
+    def decoded_strings(self) -> List[str]:
+        """Return decoded strings in insertion order."""
+
+        return list(self.entries.values())
+
+    def to_dict(self) -> Dict[str, str]:  # pragma: no cover - used for JSON emission
+        return dict(self.entries)
 
 
 def detect_v14_3_string_decoder(source: str) -> Optional[StringDecoderDescriptor]:
@@ -134,6 +200,354 @@ def detect_v14_3_string_decoder(source: str) -> Optional[StringDecoderDescriptor
         return descriptor
 
     return None
+
+
+def decode_string_v14_3(
+    token: str,
+    *,
+    descriptor: Optional[StringDecoderDescriptor] = None,
+    primitive_table: Optional[PrimitiveTableInfo] = None,
+) -> str:
+    """Decode a v14.3 token using the captured loader metadata."""
+
+    table_info, token_width, base_offset = _resolve_v14_3_decoder_inputs(
+        descriptor,
+        primitive_table,
+    )
+
+    token = _normalise_v14_3_token(token)
+    if not token:
+        return ""
+
+    weights = _derive_v14_3_weights(table_info, token_width)
+    packer, chunk_size = _build_v14_3_pack_function(table_info.alphabet_literal)
+    if chunk_size <= 0:
+        raise ValueError("invalid packer configuration recovered from metadata")
+
+    pieces: List[str] = []
+    stride = token_width
+    for offset in range(0, len(token), stride):
+        chunk = token[offset : offset + stride]
+        if len(chunk) != stride:
+            raise ValueError("token length is not a multiple of the decoder width")
+        value = _compute_v14_3_chunk_index(
+            chunk,
+            base_offset=base_offset,
+            weights=weights,
+            radix=table_info.radix,
+        )
+        pieces.append(packer(value))
+
+    return "".join(pieces)
+
+
+def build_v14_3_string_table(
+    chunk: SerializedChunk,
+    descriptor: StringDecoderDescriptor,
+    *,
+    primitive_table: Optional[PrimitiveTableInfo] = None,
+    debug_output_path: Optional[Path] = None,
+) -> StringTable:
+    """Collect and decode all tokens referenced by ``chunk``."""
+
+    table_info, token_width, base_offset = _resolve_v14_3_decoder_inputs(
+        descriptor,
+        primitive_table,
+    )
+
+    encoded_tokens = _collect_v14_3_tokens_from_chunk(
+        chunk,
+        token_width=token_width,
+        base_offset=base_offset,
+        radix=table_info.radix,
+    )
+
+    string_table = StringTable()
+    for token in encoded_tokens:
+        decoded = decode_string_v14_3(
+            token,
+            descriptor=descriptor,
+            primitive_table=table_info,
+        )
+        string_table.add(token, decoded)
+
+    if debug_output_path is not None:
+        _write_decoded_strings_debug(string_table, debug_output_path)
+
+    return string_table
+
+
+def _compute_v14_3_chunk_index(
+    chunk: str,
+    *,
+    base_offset: int,
+    weights: Sequence[int],
+    radix: Optional[int],
+) -> int:
+    digits = [ord(ch) - base_offset for ch in chunk]
+    if any(d < 0 for d in digits):
+        raise ValueError("token contains characters below the allowed alphabet")
+    if radix is not None and any(d >= radix for d in digits):
+        raise ValueError("token contains digits outside the primitive table radix")
+
+    if len(weights) < len(digits):
+        raise ValueError("weight table shorter than token width")
+
+    value = 0
+    for weight, digit in zip(weights, reversed(digits)):
+        value += weight * digit
+    return value
+
+
+def _resolve_v14_3_decoder_inputs(
+    descriptor: Optional[StringDecoderDescriptor],
+    primitive_table: Optional[PrimitiveTableInfo],
+) -> tuple[PrimitiveTableInfo, int, int]:
+    if descriptor is None:
+        raise ValueError("descriptor must be provided for v14.3 decoding")
+
+    table_info = primitive_table or descriptor.primitive_table_info
+    if table_info is None:
+        raise ValueError(
+            "primitive_table metadata is required – attach PrimitiveTableInfo before decoding"
+        )
+
+    token_width = table_info.token_width or descriptor.token_length
+    if not token_width or token_width <= 0:
+        raise ValueError("token width is missing from descriptor metadata")
+
+    base_offset = (
+        table_info.base_offset
+        or descriptor.context.get("primitive_base_offset")
+        or _infer_base_offset_from_expression(table_info.accumulator_expression)
+    )
+    if base_offset is None:
+        raise ValueError("primitive table base offset is not available")
+
+    return table_info, token_width, base_offset
+
+
+def _collect_v14_3_tokens_from_chunk(
+    chunk: SerializedChunk,
+    *,
+    token_width: int,
+    base_offset: int,
+    radix: Optional[int],
+) -> List[str]:
+    ordered: Dict[str, None] = {}
+
+    def visit_prototype(proto) -> None:
+        for constant in getattr(proto, "constants", []) or []:
+            _collect_v14_3_tokens_from_value(
+                constant,
+                ordered,
+                token_width=token_width,
+                base_offset=base_offset,
+                radix=radix,
+            )
+        for child in getattr(proto, "prototypes", []) or []:
+            visit_prototype(child)
+
+    for prototype in getattr(chunk, "prototypes", []) or []:
+        visit_prototype(prototype)
+
+    return list(ordered.keys())
+
+
+def _collect_v14_3_tokens_from_value(
+    value: Any,
+    registry: Dict[str, None],
+    *,
+    token_width: int,
+    base_offset: int,
+    radix: Optional[int],
+) -> None:
+    if isinstance(value, Constant):
+        _collect_v14_3_tokens_from_value(
+            value.value,
+            registry,
+            token_width=token_width,
+            base_offset=base_offset,
+            radix=radix,
+        )
+        return
+
+    if isinstance(value, str):
+        token = _normalise_v14_3_token(value)
+        if token and _looks_like_v14_3_token(
+            token,
+            token_width=token_width,
+            base_offset=base_offset,
+            radix=radix,
+        ):
+            registry.setdefault(token, None)
+        return
+
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            _collect_v14_3_tokens_from_value(
+                key,
+                registry,
+                token_width=token_width,
+                base_offset=base_offset,
+                radix=radix,
+            )
+            _collect_v14_3_tokens_from_value(
+                nested,
+                registry,
+                token_width=token_width,
+                base_offset=base_offset,
+                radix=radix,
+            )
+        return
+
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        for entry in value:
+            _collect_v14_3_tokens_from_value(
+                entry,
+                registry,
+                token_width=token_width,
+                base_offset=base_offset,
+                radix=radix,
+            )
+
+
+def _looks_like_v14_3_token(
+    token: str,
+    *,
+    token_width: int,
+    base_offset: int,
+    radix: Optional[int],
+) -> bool:
+    if len(token) < token_width or len(token) % token_width != 0:
+        return False
+
+    alpha_only = True
+    for ch in token:
+        digit = ord(ch) - base_offset
+        if digit < 0:
+            return False
+        if radix is not None and digit >= radix:
+            return False
+        if not ch.isalpha():
+            alpha_only = False
+
+    if alpha_only and len(token) == token_width:
+        return False
+
+    return True
+
+
+def _write_decoded_strings_debug(table: StringTable, target_path: Path) -> None:
+    resolved_target = target_path.resolve()
+    out_root = (Path("out")).resolve()
+    try:
+        resolved_target.relative_to(out_root)
+    except ValueError as exc:
+        raise ValueError("debug_output_path must be inside the out/ directory") from exc
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered_strings = list(dict.fromkeys(table.decoded_strings()))
+    payload = {"strings": ordered_strings}
+    target_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _derive_v14_3_weights(
+    info: PrimitiveTableInfo, token_width: int
+) -> Sequence[int]:
+    weights = list(info.weights)
+    if len(weights) >= token_width:
+        return weights[:token_width]
+
+    radix = info.radix
+    if radix is None or radix <= 1:
+        raise ValueError("primitive table does not specify enough weights or a radix")
+
+    if not weights:
+        weights.append(1)
+
+    while len(weights) < token_width:
+        weights.append(weights[-1] * radix)
+
+    return weights[:token_width]
+
+
+def _infer_base_offset_from_expression(expression: str) -> Optional[int]:
+    if not expression:
+        return None
+
+    candidates = re.findall(r"-\s*([A-Za-z0-9_xXoObB]+)", expression)
+    for literal in candidates:
+        value = _parse_int_literal(literal)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalise_v14_3_token(token: str) -> str:
+    if not token:
+        return ""
+    return "".join(ch for ch in token if not ch.isspace())
+
+
+def _build_v14_3_pack_function(
+    literal: Optional[str],
+) -> tuple[Callable[[int], str], int]:
+    if not literal:
+        raise ValueError("pack format literal missing from primitive table metadata")
+
+    pack_literal = _materialise_pack_literal(literal)
+    fmt, byte_size = _parse_pack_literal(pack_literal)
+    mask = (1 << (byte_size * 8)) - 1
+
+    def packer(value: int) -> str:
+        bounded = value & mask
+        packed = struct.pack(fmt, bounded)
+        return packed.decode("latin-1")
+
+    return packer, byte_size
+
+
+def _materialise_pack_literal(literal: str) -> str:
+    literal = literal.strip()
+    if literal and literal[0] in {'"', "'"}:
+        parsed = parse_lua_expression(literal)
+        if not isinstance(parsed, str):
+            raise ValueError("alphabet literal does not evaluate to a string")
+        literal = parsed
+
+    def repl(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    return re.sub(r"\\u\{([0-9A-Fa-f]+)\}", repl, literal)
+
+
+def _parse_pack_literal(literal: str) -> tuple[str, int]:
+    if len(literal) < 3:
+        raise ValueError("pack literal is too short")
+    endian = literal[0]
+    if endian not in {"<", ">", "="}:
+        raise ValueError(f"unsupported endian specifier {endian!r}")
+    type_char = literal[1]
+    size_part = literal[2:]
+    if not size_part.isdigit():
+        raise ValueError("pack literal size is not numeric")
+    size = int(size_part, 10)
+    signed = type_char.islower()
+    type_char = type_char.lower()
+    code_map = {
+        1: ("b" if signed else "B"),
+        2: ("h" if signed else "H"),
+        4: ("i" if signed else "I"),
+        8: ("q" if signed else "Q"),
+    }
+    if size not in code_map:
+        raise ValueError(f"unsupported pack literal size {size}")
+    fmt = f"{endian}{code_map[size]}"
+    return fmt, size
 
 
 def _extract_function_block(
@@ -808,5 +1222,12 @@ class StringDecryptor:
         return pattern.sub(repl, code)
 
 
-__all__ = ["StringDecryptor", "StringDecoderDescriptor", "detect_v14_3_string_decoder"]
+__all__ = [
+    "StringDecryptor",
+    "StringDecoderDescriptor",
+    "detect_v14_3_string_decoder",
+    "decode_string_v14_3",
+    "StringTable",
+    "build_v14_3_string_table",
+]
 

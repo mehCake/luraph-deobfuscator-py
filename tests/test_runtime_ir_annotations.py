@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 from opcode_lifter import BootstrapIR
-from pattern_analyzer import CacheSlot, SerializedChunk
+from pattern_analyzer import CacheSlot, SerializedChunk, SerializedChunkDescriptor
 from string_decryptor import StringDecoderDescriptor
 
 from src.passes.runtime_ir_annotations import RuntimeIRAnnotationPass
@@ -109,9 +109,11 @@ def test_runtime_ir_annotation_pass_tracks_f3_usage_contexts() -> None:
             caches_results=True,
         ),
         serialized_chunk=SerializedChunk(
-            buffer_name="payload",
-            initial_offset=0,
-            helper_functions={"reader": "return F3[2]"},
+            descriptor=SerializedChunkDescriptor(
+                buffer_name="payload",
+                initial_offset=0,
+                helper_functions={"reader": "return F3[2]"},
+            )
         ),
     )
 

@@ -33,6 +33,7 @@ class VMInstruction:
     pc: int = 0
     offset: Optional[int] = None
     ir: Dict[str, Any] = field(default_factory=dict)
+    constant_refs: List[int] = field(default_factory=list)
 
 
 @dataclass
