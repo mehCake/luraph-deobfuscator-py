@@ -1,6 +1,6 @@
 # Lua Deobfuscator (Active development is still ongoing—expect rapid changes as the toolkit matures.)
 # Dev #ishowgoat on discord
-# For questions and answers go to my discord server: discord.gg/ScqDg85hsP
+# For questions and answers go to my discord server: discord.gg/2JXEB8JKXX
 
 
 Utilities for decoding Lua scripts obfuscated with Luraph/Luarmor styles.  The
