@@ -1,1 +1,0 @@
-return {{pc=1,opnum=4,A=1,B=0,C=0,raw={nil,nil,4,0,nil,1,0,0}},{pc=2,opnum=0,A=2,B=1,C=nil,raw={nil,nil,0,0,nil,2,1}},{pc=3,opnum=28,A=2,B=2,C=1,raw={nil,nil,28,0,nil,2,2,1}},{pc=4,opnum=30,A=0,B=0,C=0,raw={nil,nil,30,0,nil,0,0,0}}}
